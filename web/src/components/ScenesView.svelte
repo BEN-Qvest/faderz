@@ -214,7 +214,7 @@
   }
   .tag {
     visibility: hidden;
-    font-size: 9.5px;
+    font-size: 10px;
     font-weight: 700;
     letter-spacing: 0.08em;
     color: var(--accent-ink);
@@ -269,6 +269,14 @@
       grid-template-columns: minmax(0, 1fr);
       overflow: auto;
       scrollbar-gutter: stable;
+    }
+  }
+  /* A phone in landscape: two stretched rows would leave the scene list
+     no height at all, so each section takes its own and the view
+     scrolls. */
+  @media (max-width: 1000px) and (max-height: 500px) {
+    .view {
+      grid-auto-rows: max-content;
     }
   }
 </style>

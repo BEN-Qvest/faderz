@@ -39,12 +39,13 @@
   const flag = (key: 'dim' | 'cut' | 'mono' | 'talkbackDim') => mixer.value<boolean>(monitorPath(key));
 </script>
 
-<section class="monitor" aria-label="Monitor">
+<section class="monitor" id="monitor" tabindex="-1" aria-label="Monitor">
   <div class="panel-title" title={shape.monitorOutputs.map((o) => `${o.name} (${o.layout})`).join(', ')}>Monitor</div>
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <div
     class="listen"
     class:active={listening.length > 0}
+    class:afl={listenMode === 'AFL'}
     aria-live="polite"
     role="status"
     tabindex={listening.length > 0 ? 0 : -1}
@@ -148,6 +149,10 @@
     background: var(--listen);
     color: #1a1200;
   }
+  .listen.active.afl {
+    background: var(--afl);
+    color: var(--afl-ink);
+  }
   .listen span {
     white-space: nowrap;
     overflow: hidden;
@@ -159,7 +164,7 @@
     gap: 3px;
   }
   .sources .key {
-    font-size: 9.5px;
+    font-size: 10px;
     letter-spacing: 0.02em;
     padding: 0 3px;
     white-space: nowrap;

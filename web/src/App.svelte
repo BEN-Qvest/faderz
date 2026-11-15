@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { MediaQuery } from 'svelte/reactivity';
   import { getMixer } from './lib/state/mixer.svelte';
   import { setTheme, type Theme } from './lib/theme';
   import MixerView from './components/MixerView.svelte';
@@ -7,14 +8,20 @@
   import AfvView from './components/AfvView.svelte';
   import ScenesView from './components/ScenesView.svelte';
   import SetupView from './components/SetupView.svelte';
-  import Detail from './components/Detail.svelte';
   import StatusArea from './components/StatusArea.svelte';
   import Consoles from './components/Consoles.svelte';
   import StatusBar from './components/StatusBar.svelte';
   import AheadBanner from './components/AheadBanner.svelte';
   import { tip } from './lib/tip';
+  import NoticeLine from './components/NoticeLine.svelte';
+  import LockKey from './components/LockKey.svelte';
+  import Users from './components/Users.svelte';
+  import TouchInfo from './components/TouchInfo.svelte';
+  import CommitBanner from './components/CommitBanner.svelte';
 
   const mixer = getMixer();
+  /** A phone in landscape: notices move from the status bar into the header. */
+  const short = new MediaQuery('max-height: 500px');
   const toneOn = $derived(!!mixer.state?.tone.on && (mixer.state?.tone.targets.length ?? 0) > 0);
   const toneText = $derived.by(() => {
     const t = mixer.state?.tone;
@@ -28,6 +35,7 @@
     const max = mixer.state?.metering.zones.truePeakMax;
     if (max !== undefined) mixer.meters.truePeakMax = max;
   });
+  const commitable = $derived(mixer.status.replicas.find((r) => r.id === mixer.status.primaryReplica)?.commitable ?? true);
 
   const VIEWS = [
     { id: 'mixer', label: 'Mixer' },
@@ -40,19 +48,42 @@
   type View = (typeof VIEWS)[number]['id'];
   let view = $state<View>('mixer');
   let selected = $state<string | null>(null);
+  /** Processing section to show first when a strip's chip selected the channel. */
+  let section = $state<string | null>(null);
   let theme = $state<Theme>((document.documentElement.dataset['theme'] as Theme) ?? 'dark');
 
+  /** Moves focus to a region; on a narrow screen the masters open first. */
+  function skip(e: MouseEvent, id: string): void {
+    e.preventDefault();
+    document.dispatchEvent(new CustomEvent('faderz:show-masters'));
+    requestAnimationFrame(() => document.getElementById(id)?.focus());
+  }
   function toggleTheme(): void {
     theme = theme === 'dark' ? 'light' : 'dark';
     setTheme(theme);
   }
-  function select(id: string): void {
-    selected = selected === id ? null : id;
+  /** Selecting never closes: a second press on the selected strip keeps it; CLOSE or Escape closes. */
+  function select(id: string, to: string | null = null): void {
+    selected = id;
+    section = to;
+  }
+  /** Closes the processing panel and gives focus back to the head of what it showed. */
+  function close(): void {
+    const id = selected;
+    selected = null;
+    if (id) requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-channel="${id}"] .head, [data-master="${id}"] .head`)?.focus({ preventScroll: true }));
   }
 </script>
 
 <div class="app">
-  <header class="top">
+  <!-- Skip links: shown when focused, over the header, moving nothing. -->
+  {#if view === 'mixer'}
+    <div class="skip" role="navigation" aria-label="Skip links">
+      <a href="#mixer-masters" onclick={(e) => skip(e, 'mixer-masters')}>Skip to masters</a>
+      <a href="#monitor" onclick={(e) => skip(e, 'monitor')}>Skip to monitor</a>
+    </div>
+  {/if}
+  <header class="top" class:desk-locked={mixer.deskLock}>
     <div class="brand" aria-label="faderz"><i></i>faderz</div>
     <select class="view-menu" aria-label="View" value={view} onchange={(e) => (view = (e.currentTarget as HTMLSelectElement).value as View)}>
       {#each VIEWS as v (v.id)}<option value={v.id}>{v.label}</option>{/each}
@@ -63,8 +94,15 @@
       {/each}
     </nav>
     <div class="right">
+      <!-- Free header space: the commit banner when it is up, otherwise
+           the notices on a short screen. It grows into the room the fixed
+           items leave, so what it shows moves none of them. -->
+      <div class="mid">
+        {#if mixer.shape && !commitable}<CommitBanner />{:else if short.current}<NoticeLine />{/if}
+      </div>
       <Consoles />
       <StatusArea />
+      <Users />
       <!-- Reserved: shown or not, the tone lamp moves nothing. -->
       <span class="tone-slot">
         <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
@@ -72,7 +110,8 @@
           >TONE<span class="sr-only">{toneOn ? ` on: ${toneText}` : ''}</span></span
         >
       </span>
-      <button class="key" onclick={toggleTheme} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>
+      <LockKey />
+      <button class="key theme" onclick={toggleTheme} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>
         {theme === 'dark' ? 'LIGHT' : 'DARK'}
       </button>
     </div>
@@ -84,7 +123,7 @@
     {#if !mixer.shape || !mixer.state}
       <div class="waiting" role="status">Connecting to the mixer...</div>
     {:else if view === 'mixer'}
-      <MixerView {selected} onselect={select} />
+      <MixerView {selected} {section} onselect={select} onclose={close} />
     {:else if view === 'routing'}
       <RoutingView />
     {:else if view === 'aux'}
@@ -104,15 +143,11 @@
       </div>
     {/snippet}
     </svelte:boundary>
-    {#if view === 'mixer' && selected && mixer.state}
-      {#key selected}
-        <Detail id={selected} onclose={() => (selected = null)} />
-      {/key}
-    {/if}
   </main>
 
 
   <StatusBar />
+  <TouchInfo />
 </div>
 
 <style>
@@ -178,9 +213,11 @@
     font-size: 13px;
     font-weight: 600;
   }
-  /* Phones: the views are a menu, so the header stays one row with the
-     connection state in view. */
-  @media (max-width: 700px) {
+  /* Below 1024 px the view tabs, the brand name and the right group do
+     not fit one row: the views are a menu and the brand its mark, so the
+     header stays one row, within the screen, with the connection state in
+     view. */
+  @media (max-width: 1023px) {
     nav {
       display: none;
     }
@@ -192,6 +229,36 @@
       gap: 0;
     }
   }
+  /* Phones: a locked desk's key takes the theme key's room (LockKey). */
+  @media (max-width: 700px) {
+    .desk-locked .theme {
+      display: none;
+    }
+  }
+  /* Short screens (a phone in landscape): one header row of 36 px with
+     the view menu, the notices and the connection state; the status bar
+     is gone, so the faders get the height. */
+  @media (max-height: 500px) {
+    .top {
+      height: 36px;
+      min-height: 36px;
+      gap: 8px;
+    }
+    nav {
+      display: none;
+    }
+    .view-menu {
+      display: block;
+    }
+    .brand {
+      font-size: 0;
+      gap: 0;
+    }
+    .right {
+      flex: 1 1 0;
+      min-width: 0;
+    }
+  }
   .tab:hover {
     color: var(--text);
   }
@@ -201,6 +268,27 @@
   }
   /* The right group fills the rest of the header and packs its items at
      its end: an item that appears or grows at its start moves nothing. */
+  .skip {
+    position: absolute;
+  }
+  .skip a {
+    position: absolute;
+    left: -10000px;
+    top: 4px;
+    z-index: 100;
+    padding: 6px 10px;
+    border-radius: 3px;
+    background: var(--panel);
+    color: var(--text);
+    border: 2px solid var(--focus);
+  }
+  .skip a:focus {
+    left: 8px;
+  }
+  .mid {
+    flex: 1 1 0;
+    min-width: 0;
+  }
   .right {
     flex: 1 0 auto;
     display: flex;
@@ -258,5 +346,32 @@
     place-items: center;
     height: 100%;
     color: var(--text-dim);
+  }
+  /* The narrowest phones: the brand mark and the theme key go (the theme
+     stays as set) and the gaps narrow, so the view menu, quorum, link,
+     tone lamp and a locked desk's key fit 320 px. Last in the sheet: it
+     overrides the rules above. */
+  @media (max-width: 389px) {
+    .top {
+      gap: 4px;
+      padding: 0 4px;
+    }
+    .brand,
+    .theme {
+      display: none;
+    }
+    .right {
+      gap: 4px;
+    }
+    .tone-slot {
+      width: 36px;
+    }
+    .view-menu {
+      font-size: 11px;
+    }
+    .tone {
+      padding: 0 3px;
+      letter-spacing: 0;
+    }
   }
 </style>

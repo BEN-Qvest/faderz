@@ -1,6 +1,7 @@
 <script lang="ts">
   import { getMixer } from '../lib/state/mixer.svelte';
   import { FADER_MARKS, FADER_OFF_DB, dbToPosition, dragDb, formatDb, keyStepDb, stepDb } from '../lib/audio/db';
+  import { tip } from '../lib/tip';
 
   interface Props {
     path: string;
@@ -44,11 +45,12 @@
     });
   }
 
-  const isFine = (e: PointerEvent | KeyboardEvent) => e.shiftKey || e.ctrlKey || e.metaKey;
+  const isFine = (e: PointerEvent | KeyboardEvent) => mixer.fine || e.shiftKey || e.ctrlKey || e.metaKey;
 
   function pointerdown(e: PointerEvent): void {
     if (e.button !== 0) return;
     e.preventDefault();
+    if (mixer.refuseIfHeld(path)) return;
     const el = e.currentTarget as HTMLElement;
     el.setPointerCapture(e.pointerId);
     el.focus({ preventScroll: true });
@@ -110,6 +112,7 @@
         return;
     }
     e.preventDefault();
+    if (mixer.refuseIfHeld(path)) return;
     mixer.touch(path);
     if (next !== value) mixer.set(path, next);
     if (keyRelease) clearTimeout(keyRelease);
@@ -148,7 +151,8 @@
     aria-valuemax={10}
     aria-valuenow={value}
     aria-valuetext={`${formatDb(value)} dB${foreign ? `, held by ${ownerName}` : ''}`}
-    title={foreign ? `Held by ${ownerName}` : 'Drag; Shift for fine; arrows step, Alt+0 for 0 dB, Alt+End closes'}
+    title={foreign ? undefined : 'Drag; Shift for fine; arrows step, Alt+0 for 0 dB, Alt+End closes'}
+    use:tip={foreign ? `Held by ${ownerName}` : ''}
     onpointerdown={pointerdown}
     onpointermove={pointermove}
     onpointerup={pointerup}
@@ -160,7 +164,7 @@
   >
     <div class="slot"></div>
     {#if owner}
-      <span class="owner" class:mine data-testid="owner" data-owner-kind={owner.kind}>{ownerName}</span>
+      <span class="owner" class:mine data-testid="owner" data-owner-kind={owner.kind}>{mixer.ownerShort(owner)}</span>
     {/if}
     {#each FADER_MARKS as mark (mark)}
       <i class="tick" class:unity={mark === 0} style:bottom="calc({dbToPosition(mark)} * (100% - 34px) + 17px)"></i>
@@ -178,9 +182,14 @@
     min-height: 120px;
     gap: 2px;
   }
+  @media (max-height: 500px) {
+    .fader {
+      min-height: 90px;
+    }
+  }
   .scale {
     position: relative;
-    width: 20px;
+    width: 16px;
     flex: none;
   }
   .scale span {
@@ -191,9 +200,9 @@
        layerization. */
     height: 1em;
     margin-bottom: -0.5em;
-    font-family: var(--font-num);
-    font-size: 8.5px;
-    color: var(--text-faint);
+    font-family: var(--font-ui);
+    font-size: 10px;
+    color: var(--text-dim);
     line-height: 1;
   }
   .scale span.unity {
@@ -211,19 +220,20 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     pointer-events: none;
-    font-size: 8px;
-    line-height: 11px;
+    font-size: 10px;
+    line-height: 12px;
     padding: 0 2px;
     border-radius: 2px;
     background: var(--owned);
     color: #fff;
   }
   .owner.mine {
-    background: var(--accent);
+    background: var(--on);
+    color: var(--on-ink);
   }
   .track {
     position: relative;
-    width: 30px;
+    width: 28px;
     flex: none;
     cursor: ns-resize;
     touch-action: none;
@@ -282,8 +292,8 @@
     background: #10141a;
   }
   .cap.mine {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent), 0 2px 4px rgba(0, 0, 0, 0.45);
+    border-color: var(--on);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--on) 70%, transparent), 0 2px 4px rgba(0, 0, 0, 0.45);
   }
   .cap.foreign {
     border-color: var(--owned);

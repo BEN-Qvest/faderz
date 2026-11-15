@@ -8,37 +8,69 @@
     label: string;
     left?: string;
     right?: string;
+    /** -1 keeps it out of the tab order where another place edits the same pan. */
+    tabindex?: number;
   }
-  let { path, label, left = 'L', right = 'R' }: Props = $props();
+  let { path, label, left = 'L', right = 'R', tabindex = 0 }: Props = $props();
   const mixer = getMixer();
   const value = $derived(mixer.value<number>(path) ?? 0);
 
-  let drag: { x: number; v: number; id: number; w: number } | null = null;
+  /** A finger must rest this long before a pan moves: brushing it on the way to PFL or MUTE does nothing. */
+  const TOUCH_HOLD_MS = 300;
+  let drag: { x: number; v: number; id: number; w: number; armed: boolean } | null = null;
+  let arming = $state(false);
+  let armTimer: ReturnType<typeof setTimeout> | null = null;
   let keyRelease: ReturnType<typeof setTimeout> | null = null;
 
   function down(e: PointerEvent): void {
     if (e.button !== 0) return;
     e.preventDefault();
+    if (mixer.refuseIfHeld(path)) return;
     const el = e.currentTarget as HTMLElement;
     el.setPointerCapture(e.pointerId);
     el.focus({ preventScroll: true });
-    drag = { x: e.clientX, v: value, id: e.pointerId, w: el.clientWidth };
-    mixer.touch(path);
+    const touch = e.pointerType === 'touch';
+    drag = { x: e.clientX, v: value, id: e.pointerId, w: el.clientWidth, armed: !touch };
+    if (touch) {
+      arming = true;
+      armTimer = setTimeout(() => {
+        armTimer = null;
+        arming = false;
+        if (!drag) return;
+        // Travel counts from where the finger rests once armed.
+        drag = { ...drag, armed: true };
+        mixer.touch(path);
+      }, TOUCH_HOLD_MS);
+    } else {
+      mixer.touch(path);
+    }
   }
   function move(e: PointerEvent): void {
     if (!drag || e.pointerId !== drag.id) return;
-    const scale = e.shiftKey ? 0.1 : 1;
+    if (!drag.armed) {
+      // Moving before the hold ends is a swipe past the pan: give up.
+      if (Math.abs(e.clientX - drag.x) > 6) disarm();
+      return;
+    }
+    const scale = e.shiftKey || mixer.fine ? 0.1 : 1;
     const v = Math.max(-1, Math.min(1, drag.v + ((e.clientX - drag.x) / drag.w) * 2 * scale));
     const r = Math.round(v * 100) / 100;
     if (r !== value) mixer.set(path, r);
   }
+  function disarm(): void {
+    if (armTimer) clearTimeout(armTimer);
+    armTimer = null;
+    arming = false;
+    drag = null;
+  }
   function up(e: PointerEvent): void {
     if (!drag || e.pointerId !== drag.id) return;
-    drag = null;
-    mixer.release(path);
+    const armed = drag.armed;
+    disarm();
+    if (armed) mixer.release(path);
   }
   function key(e: KeyboardEvent): void {
-    const step = e.shiftKey ? 0.01 : 0.05;
+    const step = e.shiftKey || mixer.fine ? 0.01 : 0.05;
     let v: number | null = null;
     if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') v = value - step;
     else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') v = value + step;
@@ -48,6 +80,7 @@
     else if (e.key === '0' && e.altKey) v = 0;
     if (v === null) return;
     e.preventDefault();
+    if (mixer.refuseIfHeld(path)) return;
     mixer.touch(path);
     const next = Math.round(Math.max(-1, Math.min(1, v)) * 100) / 100;
     if (next !== value) mixer.set(path, next);
@@ -69,14 +102,15 @@
 <div
   class="pan"
   role="slider"
-  tabindex="0"
+  {tabindex}
   aria-disabled={mixer.locked}
   aria-label={label}
   aria-valuemin={-1}
   aria-valuemax={1}
   aria-valuenow={value}
   aria-valuetext={formatPan(value, left, right)}
-  title="Drag; Shift for fine; arrows step, Alt+0 centres, Alt+Home/End for full left/right"
+  class:arming
+  title="Drag; on touch, rest the finger a moment first; Shift for fine; arrows step, Alt+0 centres, Alt+Home/End for full left/right"
   onpointerdown={down}
   onpointermove={move}
   onpointerup={up}
@@ -107,7 +141,14 @@
     touch-action: none;
     border-radius: 2px;
   }
-
+  @media (pointer: coarse) {
+    .pan {
+      height: 28px;
+    }
+  }
+  .arming .bar {
+    border-color: var(--text-dim);
+  }
   .centre {
     position: absolute;
     left: 50%;

@@ -97,9 +97,14 @@ export class MixerStore {
     return this.status.outbox;
   }
 
+  /** FINE latch: faders, pans and parameters move at a tenth of their travel, as with Shift held. */
+  fine = $state(false);
+  /** The operator locked this screen: it shows everything and changes nothing. */
+  deskLock = $state(false);
   /** Why write controls are disabled and send nothing (link not transmitting, or no quorum and no ready standby), or null. */
   readonly lockReason = $derived(writesLockReason(this.status));
-  readonly locked = $derived(this.lockReason !== null);
+  /** Write controls are disabled and send nothing: for lockReason, or the desk is locked. */
+  readonly locked = $derived(this.lockReason !== null || this.deskLock);
 
   // ---- reading -----------------------------------------------------------
 
@@ -136,6 +141,16 @@ export class MixerStore {
     return `${principal}${kind} ${handleTag(owner.handle)}`;
   }
 
+  /**
+   * An owner in a form that fits a small slot: "you", a console's name, or
+   * the handle tag other screens show for a session.
+   */
+  ownerShort(owner: Owner): string {
+    if (this.isMine(owner)) return 'you';
+    const c = owner.kind === 'console' ? this.state?.consoles.find((x) => x.handle === owner.handle) : undefined;
+    return c ? c.name : handleTag(owner.handle);
+  }
+
   // ---- writing -----------------------------------------------------------
 
   set(path: string, value: unknown): void {
@@ -149,6 +164,19 @@ export class MixerStore {
     if (this.locked || this.held.has(path)) return;
     this.held.add(path);
     this.post({ type: 'touch', path });
+  }
+
+  /**
+   * A gesture on a control another session holds: nothing is sent, the
+   * control flashes and the notice names the holder, at once rather than
+   * after a refused round trip. Returns true when the control is held.
+   */
+  refuseIfHeld(path: string): boolean {
+    const owner = this.ownerOf(path);
+    if (owner === null || this.isMine(owner)) return false;
+    this.conflicts.set(path, Date.now());
+    this.notify('conflict', `${describePath(path, this.shape)} is held by ${this.ownerLabel(owner)}`, path);
+    return true;
   }
 
   /** Sent also while locked: it ends a touch made before, and changes no value. */

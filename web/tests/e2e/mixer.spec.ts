@@ -1,9 +1,12 @@
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { handleTag, ownerHandle } from '../../src/lib/net/handle';
+import { engineLamp } from '../../src/lib/counters';
+import { CONSOLE_SESSIONS } from '../../dev/mock/shape';
 import {
   REPLICAS,
   RawClient,
   audit,
+  commands,
   debug,
   dragFader,
   fader,
@@ -16,6 +19,16 @@ import {
   settled,
   uiFontLoaded,
 } from './support';
+
+/** RESET takes a one second hold. */
+async function holdReset(page: Page, master: string): Promise<void> {
+  const key = page.locator(`[data-master="${master}"]`).getByRole('button', { name: 'Reset loudness, hold for one second' });
+  const box = (await key.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.waitForTimeout(1100);
+  await page.mouse.up();
+}
 
 test.beforeEach(async ({ request }) => resetMock(request));
 test.afterEach(async ({ request }) => resetMock(request));
@@ -172,7 +185,7 @@ test('arms and confirms a scene store and delete from the keyboard alone, within
   await expect(page.getByText(name)).toBeHidden();
 });
 
-test('refuses a fader held by another session with 409 and shows its value and owner', async ({ page, baseURL, request }) => {
+test('refuses a fader held by another session at the gesture and shows its value and owner', async ({ page, baseURL, request }) => {
   const frames: string[] = [];
   page.on('websocket', (ws) => ws.on('framereceived', (f) => typeof f.payload === 'string' && frames.push(f.payload)));
   await live(page);
@@ -192,6 +205,23 @@ test('refuses a fader held by another session with 409 and shows its value and o
     await dragFader(page, path, 40);
     await expect(notice).toHaveCount(1);
     await expect(notice.locator('.count')).toBeVisible();
+    // The held fader refuses the gesture itself: no write left this client,
+    // and the strip names the holder in words.
+    expect((await commands(request)).filter((c) => c.path === path && c.type === 'set')).toEqual([]);
+    // The strip shows the tag in full; the label is in the tooltip.
+    const holder = page.getByTestId('holder-ch4');
+    await expect(holder).toHaveText(tag);
+    expect(await holder.locator('span').evaluate((e) => e.scrollWidth <= e.clientWidth)).toBe(true);
+    await expect(holder).toHaveAccessibleName(`Fader held by web client ${tag}`);
+    // The keyboard reaches the full label on the fader, not on an extra stop.
+    await expect(holder).toHaveJSProperty('tabIndex', -1);
+    const track = page.locator('[role="slider"][data-path="/channels/ch4/fader"]');
+    await track.focus();
+    await page.keyboard.press('Shift+Tab');
+    await page.keyboard.press('Tab');
+    await expect(track).toBeFocused();
+    await expect(page.getByRole('tooltip')).toHaveText(`Held by web client ${tag}`);
+    await expect(track).toHaveAttribute('aria-valuetext', new RegExp(`held by web client ${tag}$`));
     // The notice sits in the status bar, clear of the monitor and masters.
     const box = (await notice.boundingBox())!;
     const monitor = (await page.getByRole('region', { name: 'Monitor' }).boundingBox())!;
@@ -244,6 +274,7 @@ test('switches to the light theme and works at tablet width', async ({ page }) =
   const width = await page.evaluate(() => document.documentElement.scrollWidth);
   expect(width).toBeLessThanOrEqual(1024);
   await expect(page.getByRole('button', { name: 'Pres 1 mute' })).toBeVisible();
+  await page.getByRole('button', { name: 'MASTERS' }).click();
   await expect(page.locator('[data-master="pgm51"]')).toBeVisible();
 });
 
@@ -349,9 +380,9 @@ test('sets the LFE send and the stereo image of a channel from the processing pa
   await page.locator('[data-channel="ch1"] .head').click();
   await expect(page.getByLabel('LFE', { exact: true })).toBeVisible();
   await patch(request, '/channels/ch1/pan/lfe', -12);
-  await expect(page.locator('input[data-path="/channels/ch1/pan/lfe"]')).toHaveAttribute('aria-valuetext', '-12.0');
+  await expect(page.locator('[role="slider"][data-path="/channels/ch1/pan/lfe"]')).toHaveAttribute('aria-valuetext', '-12.0');
   // On the fader taper, as the Aux view's send levels: -12 dB sits at 47.5 % of the travel.
-  await expect(page.locator('input[data-path="/channels/ch1/pan/lfe"]')).toHaveValue('475');
+  await expect(page.locator('[role="slider"][data-path="/channels/ch1/pan/lfe"]')).toHaveAttribute('aria-valuenow', /^4[78]$/);
   await patch(request, '/channels/ch1/pan/lfe', -90);
 });
 
@@ -498,21 +529,44 @@ test('ends a held talk when its view is left during the press', async ({ page, r
   await patch(request, '/mixMinus/mm1/interrupt/source', null);
 });
 
-test('ends a latched talk when the page is hidden', async ({ page, request }) => {
+test('ends a latched talk when the page is hidden and says so on return, moving nothing', async ({ page, request }) => {
   // A mouse hold over a tab switch gets no blur on Safari. Playwright
   // cannot hide a headless page or fire a real pagehide without leaving
   // it, so the page reports itself hidden and fires visibilitychange.
+  await page.addInitScript(() => {
+    const w = window as unknown as { __shift: number };
+    w.__shift = 0;
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries() as unknown as Array<{ value: number }>) w.__shift += e.value;
+    }).observe({ type: 'layout-shift', buffered: true });
+  });
+  const visibility = (state: 'hidden' | 'visible') =>
+    page.evaluate((v) => {
+      Object.defineProperty(document, 'visibilityState', { value: v, configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    }, state);
   const { talk, active } = await talkKey(page, request);
   await talk.click();
   await expect(talk).toHaveAccessibleName('N-1 Phone 1 talk, latched');
   expect(await active()).toBe(true);
-  await page.evaluate(() => {
-    Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });
-    document.dispatchEvent(new Event('visibilitychange'));
-  });
+  await visibility('hidden');
   await expect.poll(active).toBe(false);
   await expect.poll(async () => (await serverState(request)).owners[TALK_OWNER]).toBeUndefined();
   await expect(talk).toHaveAccessibleName('N-1 Phone 1 talk');
+  // Back on the page: a notice says the talk ended and why.
+  const text = 'N-1 Phone 1 talk ended: the page was hidden';
+  const notice = page.getByTestId('notice');
+  await expect(page.getByText(text)).toHaveCount(0);
+  await visibility('visible');
+  await expect(notice).toContainText(text);
+  // It takes the fixed notice line: nothing on the page moved, from load on.
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+  expect(await page.evaluate(() => (window as unknown as { __shift: number }).__shift)).toBe(0);
+  // Cut off or not, its whole text is in a tooltip that the keyboard reaches.
+  await notice.focus();
+  await page.keyboard.press('Shift+Tab');
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('tooltip')).toHaveText(text);
   await patch(request, '/mixMinus/mm1/interrupt/source', null);
 });
 
@@ -706,7 +760,7 @@ test('latches a true-peak over on a master until RESET, however short it was', a
   await expect(lamp).toHaveClass(/over/);
   await page.waitForTimeout(500);
   await expect(lamp).toHaveClass(/over/);
-  await page.locator('[data-master="pgm20"]').getByRole('button', { name: 'RESET' }).click();
+  await holdReset(page, 'pgm20');
   await expect(lamp).not.toHaveClass(/over/);
   await patch(request, '/tone/level', -18);
   await patch(request, '/tone/targets', []);
@@ -730,7 +784,7 @@ test('shows a channel true peak only on channels with a direct out', async ({ pa
 test('reads the highest true peak since RESET, not the last tenth of a second', async ({ page, request }) => {
   await live(page);
   const tp = page.getByTestId('tp-pgm20');
-  await page.locator('[data-master="pgm20"]').getByRole('button', { name: 'RESET' }).click();
+  await holdReset(page, 'pgm20');
   await patch(request, '/tone/level', 0);
   await patch(request, '/tone/targets', ['pgm20']);
   await patch(request, '/tone/on', true);
@@ -739,7 +793,7 @@ test('reads the highest true peak since RESET, not the last tenth of a second', 
   await expect(tp).toHaveText(/^\s*-?0\.\d$/);
   await page.waitForTimeout(1500);
   await expect(tp).toHaveText(/^\s*-?0\.\d$/);
-  await page.locator('[data-master="pgm20"]').getByRole('button', { name: 'RESET' }).click();
+  await holdReset(page, 'pgm20');
   await expect(tp).not.toHaveText(/^\s*-?0\.\d$/);
   await patch(request, '/tone/level', -18);
   await patch(request, '/tone/targets', []);
@@ -761,7 +815,7 @@ test('a RESET on one screen clears the true-peak over on every screen', async ({
   // as it would on a desk; a RESET while the momentary level is at its
   // maximum shows only in integrated and LRA (unit tests).
   await page.waitForTimeout(600);
-  await page.locator('[data-master="pgm20"]').getByRole('button', { name: 'RESET' }).click();
+  await holdReset(page, 'pgm20');
   await expect(page.getByTestId('tp-over-pgm20')).not.toHaveClass(/over/);
   await expect(page2.getByTestId('tp-over-pgm20')).not.toHaveClass(/over/);
   await expect(page2.getByTestId('tp-pgm20')).not.toHaveText(/^\s*-?0\.\d$/);
@@ -884,4 +938,462 @@ test('Escape in a typed field restores its value and leaves the processing panel
   await panel.getByRole('button', { name: 'Close processing' }).focus();
   await page.keyboard.press('Escape');
   await expect(panel).toBeHidden();
+});
+
+test('keeps the processing panel open on a second press and steps to the next and previous channel', async ({ page }) => {
+  await live(page);
+  const head = (id: string) => page.locator(`[data-channel="${id}"] .head`);
+  const panel = (name: string) => page.getByRole('region', { name: `${name} processing` });
+  await head('ch1').click();
+  await expect(panel('Pres 1')).toBeVisible();
+  await head('ch1').click();
+  await expect(panel('Pres 1')).toBeVisible();
+  await expect(head('ch1')).toHaveAttribute('aria-pressed', 'true');
+  await page.getByRole('button', { name: 'Next channel' }).click();
+  await expect(panel('Pres 2')).toBeVisible();
+  await expect(head('ch2')).toHaveAttribute('aria-pressed', 'true');
+  await expect(head('ch1')).toHaveAttribute('aria-pressed', 'false');
+  await page.getByRole('button', { name: 'Previous channel' }).click();
+  await expect(panel('Pres 1')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Previous channel' })).toBeDisabled();
+  await page.getByRole('button', { name: 'Close processing' }).click();
+  await expect(panel('Pres 1')).toHaveCount(0);
+});
+
+test('locks the desk with a hold so nothing on the screen changes the mixer, and marks recall-safe strips', async ({ page, request }) => {
+  await live(page);
+  const lock = page.getByTestId('desk-lock');
+  // Its text tells it from the red LOCK of a link that sends no commands.
+  await expect(lock).toHaveText('LOCK DESK');
+  // A press shorter than the hold does nothing.
+  await lock.click();
+  await expect(lock).toHaveAttribute('aria-pressed', 'false');
+  const box = (await lock.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.waitForTimeout(700);
+  await page.mouse.up();
+  await expect(lock).toHaveAttribute('aria-pressed', 'true');
+  await expect(lock).toHaveText('LOCKED');
+  const mute = page.getByRole('button', { name: 'Pres 1 mute' });
+  const before = (await serverState(request)).state.channels['ch1']!.mute;
+  await mute.click({ force: true });
+  await page.waitForTimeout(500);
+  expect((await serverState(request)).state.channels['ch1']!.mute).toBe(before);
+  await expect(mute).toHaveAttribute('aria-disabled', 'true');
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.waitForTimeout(700);
+  await page.mouse.up();
+  await expect(lock).toHaveAttribute('aria-pressed', 'false');
+  await expect(mute).toHaveAttribute('aria-disabled', 'false');
+
+  await patch(request, '/recallSafe/ch3', ['fader', 'mute']);
+  await expect(page.getByTestId('iso-ch3')).toBeVisible();
+  // The groups are in the head's tooltip and accessible name, which the
+  // keyboard and a long touch reach as well as a hover.
+  const head = page.locator('[data-channel="ch3"] .head');
+  await expect(head).toHaveAccessibleName(/, recall safe: fader, mute$/);
+  await expect(head).toHaveAttribute('data-tip', 'Guest 1 (Studio mic 3); recall safe: fader, mute');
+  await head.focus();
+  await page.keyboard.press('Shift+Tab');
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('tooltip')).toHaveText('Guest 1 (Studio mic 3); recall safe: fader, mute');
+  await patch(request, '/recallSafe/ch3', []);
+  await expect(page.getByTestId('iso-ch3')).toBeHidden();
+});
+
+test('labels the channel meter in dBFS on its outer side, apart from the fader scale', async ({ page }) => {
+  await page.addInitScript(() => {
+    const seen: Array<{ text: string; x: number; y: number }> = [];
+    (window as unknown as { __labels: typeof seen }).__labels = seen;
+    const fill = CanvasRenderingContext2D.prototype.fillText;
+    CanvasRenderingContext2D.prototype.fillText = function (text: string, x: number, y: number, max?: number) {
+      const m = this.getTransform();
+      seen.push({ text, x: x * m.a / devicePixelRatio, y: y * m.d / devicePixelRatio });
+      return max === undefined ? fill.call(this, text, x, y) : fill.call(this, text, x, y, max);
+    };
+  });
+  await live(page);
+  const meter = (await page.locator('[data-meter="channels/ch1"]').boundingBox())!;
+  const canvas = (await page.locator('.mixer > .meter-layer').boundingBox())!;
+  await expect
+    .poll(() =>
+      page.evaluate(
+        ({ m, c }) =>
+          [...new Set((window as unknown as { __labels: Array<{ text: string; x: number; y: number }> }).__labels
+            .filter((l) => l.x + c.x >= m.x + m.width - 17 && l.x + c.x <= m.x + m.width && l.y + c.y >= m.y && l.y + c.y <= m.y + m.height)
+            .map((l) => l.text))].sort(),
+        { m: meter, c: canvas },
+      ),
+    )
+    .toEqual(['-18', '-40', '-9', '0']);
+});
+
+test('moves faders at a tenth of their travel while FINE is lit, without a modifier key', async ({ page, request }) => {
+  await live(page);
+  await patch(request, '/channels/ch2/fader', 0);
+  await expect(page.getByTestId('fader-value-ch2')).toHaveText(formatDb(0));
+  await page.getByRole('button', { name: 'FINE' }).click();
+  await dragFader(page, '/channels/ch2/fader', 100);
+  await settled(page);
+  const fine = await fader(request, 'ch2');
+  expect(fine).toBeLessThan(0);
+  expect(fine).toBeGreaterThan(-1.5);
+  await page.getByRole('button', { name: 'FINE' }).click();
+  await dragFader(page, '/channels/ch2/fader', 100);
+  await settled(page);
+  expect(await fader(request, 'ch2')).toBeLessThan(fine - 3);
+});
+
+test('opens processing at the section of a strip chip and assigns a bus from the strip with a hold', async ({ page, request }) => {
+  await live(page);
+  await page.getByRole('button', { name: 'Guest 1 Gate,', exact: false }).click();
+  const panel = page.getByRole('region', { name: 'Guest 1 processing' });
+  await expect(panel).toBeVisible();
+  await expect(panel.getByRole('heading', { name: 'Gate' })).toBeInViewport();
+
+  const chip = page.locator('[data-path="/channels/ch1/routes/pgm51"]');
+  const before = (await serverState(request)).state.channels['ch1']!.routes['pgm51'];
+  await chip.click();
+  await page.waitForTimeout(400);
+  expect((await serverState(request)).state.channels['ch1']!.routes['pgm51']).toBe(before);
+  const box = (await chip.boundingBox())!;
+  expect(box.height + 6).toBeGreaterThanOrEqual(24);
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.waitForTimeout(700);
+  await page.mouse.up();
+  await expect.poll(async () => (await serverState(request)).state.channels['ch1']!.routes['pgm51']).toBe(!before);
+  await expect(chip).toHaveAttribute('aria-pressed', String(!before));
+});
+
+test('shows the source under the channel name and colours the scribble strip from the processing panel', async ({ page, request }) => {
+  await live(page);
+  const head = page.locator('[data-channel="ch3"] .head');
+  await expect(head.locator('.source')).toHaveText('Studio mic 3');
+  const name = (await head.locator('.name').evaluate((el) => parseFloat(getComputedStyle(el).fontSize)));
+  expect(name).toBeGreaterThanOrEqual(15);
+  const before = (await head.boundingBox())!.height;
+  await head.click();
+  await page.getByRole('radiogroup', { name: 'Guest 1 strip colour' }).getByRole('radio', { name: 'red' }).click();
+  await expect(head).toHaveAttribute('data-color', 'red');
+  await expect.poll(async () => (await serverState(request)).state.channels['ch3']!.color).toBe('red');
+  expect((await head.boundingBox())!.height).toBe(before);
+  await page.getByRole('radiogroup', { name: 'Guest 1 strip colour' }).getByRole('radio', { name: 'No colour' }).click();
+  await expect.poll(async () => (await serverState(request)).state.channels['ch3']!.color).toBe('none');
+});
+
+test('shows one engine lamp in the status bar and the counters only on request', async ({ page }) => {
+  await live(page);
+  const lamp = page.getByTestId('engine');
+  await expect(lamp).toHaveText(/ENGINE (OK|WARN \d+)/);
+  const width = (await lamp.boundingBox())!.width;
+  await expect(page.locator('footer.bar')).not.toContainText('deadline_miss');
+  await lamp.click();
+  const counters = page.getByRole('region', { name: 'Engine counters' });
+  // Every total is listed in the panel: none is cut.
+  for (const name of ['deadline_miss', 'overrun_skipped_samples', 'input_late_blocks', 'input_wait_timeout', 'command_late', 'afv_late']) {
+    await expect(counters).toContainText(name);
+  }
+  await lamp.click();
+  await expect(counters).toHaveCount(0);
+  expect((await lamp.boundingBox())!.width).toBe(width);
+  // OK and WARN with any count, two digits and capped ones included, give
+  // the lamp one width and fit its text: a change moves nothing.
+  const sizes = await lamp.evaluate((b, texts) => {
+    const text = b.querySelector<HTMLElement>('.fixed')!;
+    const was = text.textContent;
+    const out = texts.map((t) => {
+      text.textContent = t;
+      return { w: b.getBoundingClientRect().width, fits: text.scrollWidth <= text.getBoundingClientRect().width + 0.5 };
+    });
+    text.textContent = was;
+    return out;
+  }, [0, 3, 12, 99, 250].map(engineLamp));
+  for (const s of sizes) expect(s).toEqual({ w: width, fits: true });
+});
+
+test('lights PFL amber and every generic on key in the neutral colour, with no lit OFF key', async ({ page, request }) => {
+  await live(page);
+  await patch(request, '/channels/ch1/routes/pgm51', true);
+  await patch(request, '/channels/ch1/solo', 'pfl');
+  const bg = (sel: string) => page.locator(sel).first().evaluate((el) => getComputedStyle(el).backgroundColor);
+  const token = (name: string) =>
+    page.evaluate((n) => {
+      const probe = document.createElement('i');
+      probe.style.color = `var(${n})`;
+      document.body.append(probe);
+      const c = getComputedStyle(probe).color;
+      probe.remove();
+      return c;
+    }, name);
+  await expect(page.getByRole('button', { name: 'Pres 1 PFL' })).toHaveAttribute('aria-pressed', 'true');
+  expect(await bg('[data-channel="ch1"] .key.pfl')).toBe(await token('--listen'));
+  expect(await bg('[data-path="/channels/ch1/routes/pgm51"]')).toBe(await token('--on'));
+  expect(await token('--on')).not.toBe(await token('--accent'));
+  await page.locator('[data-channel="ch1"] .head').click();
+  const panel = page.getByRole('region', { name: 'Pres 1 processing' });
+  await expect(panel.getByRole('button', { name: 'off', exact: true })).toHaveCount(0);
+  await panel.getByRole('button', { name: 'pfl', exact: true }).click();
+  await expect.poll(async () => (await serverState(request)).state.channels['ch1']!.solo).toBe('off');
+});
+
+test('writes the tally on the strip in words: PGM, PVW, and CLOSED when the AFV gate holds the channel down', async ({ page, request }) => {
+  await live(page);
+  const tally = (sources: Record<string, string>) =>
+    request.put('/api/v1/afv/tally', { headers: { 'X-Samplez-Request': '1', 'Content-Type': 'application/json' }, data: { sources } });
+  await tally({ CAM1: 'program', CAM2: 'preview', CAM3: 'off' });
+  await expect(page.getByTestId('tally-ch13')).toHaveText(/^\s*PGM CAM1\s*$/);
+  await expect(page.getByTestId('tally-ch14')).toHaveText(/^\s*PVW CAM2\s*$/);
+  await expect.poll(async () => (await serverState(request)).state.afv['ch15']!.open).toBe(false);
+  await expect(page.getByTestId('tally-ch15')).toHaveText(/^\s*CLOSED CAM3\s*$/);
+  await expect(page.getByTestId('tally-ch15')).not.toHaveCSS('text-decoration-line', 'line-through');
+});
+
+test('says in the header that changes are not committing while the serving replica has no quorum', async ({ page, request }) => {
+  test.setTimeout(60_000);
+  await live(page);
+  const banner = page.getByTestId('commit-banner');
+  await expect(banner).toHaveCount(0);
+  const strip = (await page.locator('[data-channel="ch1"]').boundingBox())!;
+  const primary = (await debug(page, 'primaryReplica'))!;
+  for (const r of REPLICAS.filter((x) => x !== primary)) expect((await request.post(`/__mock/replicas/${r}/partition`)).ok()).toBe(true);
+  await expect(banner).toBeVisible();
+  await expect(banner).toContainText('CHANGES NOT COMMITTING');
+  await expect(banner).toContainText('audio continues');
+  // In the header: nothing under it moved, and the controls stay reachable.
+  expect((await banner.boundingBox())!.y).toBeLessThan(strip.y);
+  expect(await page.locator('[data-channel="ch1"]').boundingBox()).toEqual(strip);
+  for (const r of REPLICAS) await request.post(`/__mock/replicas/${r}/restore`);
+  await expect(banner).toHaveCount(0);
+});
+
+test('moves a processing parameter by the drag distance and never jumps it to the touch point', async ({ page, request }) => {
+  await live(page);
+  await patch(request, '/channels/ch1/gate/threshold', -40);
+  await page.locator('[data-channel="ch1"] .head').click();
+  const slider = page.locator('[role="slider"][data-path="/channels/ch1/gate/threshold"]');
+  await expect(slider).toHaveAttribute('aria-valuetext', '-40 dB');
+  const box = (await slider.boundingBox())!;
+  // Press at the far right end and let go without moving: nothing changes.
+  await page.mouse.move(box.x + box.width - 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.up();
+  await page.waitForTimeout(300);
+  expect((await serverState(request)).state.channels['ch1']!.gate.threshold).toBe(-40);
+  // A drag of a tenth of the width moves the value by a tenth of the range (80 dB).
+  await page.mouse.move(box.x + 10, box.y + box.height / 2);
+  await page.mouse.down();
+  for (let i = 1; i <= 4; i++) await page.mouse.move(box.x + 10 + (box.width / 10) * (i / 4), box.y + box.height / 2);
+  await page.mouse.up();
+  await settled(page);
+  const v = (await serverState(request)).state.channels['ch1']!.gate.threshold;
+  expect(v).toBeGreaterThan(-33);
+  expect(v).toBeLessThan(-31);
+});
+
+test('resets a running loudness measurement only after a one second hold', async ({ page }) => {
+  await live(page);
+  const resets: string[] = [];
+  page.on('request', (r) => {
+    if (r.method() === 'POST' && r.url().endsWith('/loudness/reset')) resets.push(r.postData() ?? '');
+  });
+  const key = page.locator('[data-master="pgm20"]').getByRole('button', { name: 'Reset loudness, hold for one second' });
+  await key.click();
+  await page.waitForTimeout(400);
+  expect(resets).toEqual([]);
+  const box = (await key.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.waitForTimeout(1200);
+  await page.mouse.up();
+  await expect.poll(() => resets.length).toBe(1);
+  expect(JSON.parse(resets[0]!)).toEqual({ ids: ['pgm20'] });
+});
+
+test('keeps replica detail out of the sightline behind one connection lamp', async ({ page }) => {
+  await live(page);
+  const primary = (await debug(page, 'primaryReplica'))!;
+  await expect(page.locator(`[data-replica="${primary}"]`)).toBeHidden();
+  await expect(page.getByTestId('meter-replica')).toBeHidden();
+  await page.getByRole('button', { name: /^Connection LIVE, details$/ }).click();
+  const details = page.getByRole('region', { name: 'Connection details' });
+  await expect(details).toBeVisible();
+  await expect(details).toContainText(String(await debug(page, 'revision')).slice(0, 1));
+  await expect(page.locator(`[data-replica="${primary}"]`)).toBeVisible();
+  await page.getByRole('button', { name: /^Connection LIVE, details$/ }).click();
+  await expect(details).toBeHidden();
+});
+
+test('keeps a strip to five tab stops and skips to the masters and the monitor', async ({ page, baseURL }) => {
+  await live(page);
+  // The first tab stop of the page is the skip link, shown when focused.
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('link', { name: 'Skip to masters' })).toBeFocused();
+  await expect(page.getByRole('link', { name: 'Skip to masters' })).toBeInViewport();
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('region', { name: 'Masters' })).toBeFocused();
+  await page.getByRole('link', { name: 'Skip to monitor' }).focus();
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('region', { name: 'Monitor' })).toBeFocused();
+
+  // Five controls, then the VCA row of a strip in a VCA: its tooltip
+  // names the VCAs and the effective gain, so it stays reachable. Pres 1
+  // is in VCA PRES. Another session holds its fader: the holder slot adds
+  // no stop.
+  const other = await RawClient.open(baseURL!);
+  expect((await other.command({ type: 'touch', path: '/channels/ch1/fader' })).type).toBe('delta');
+  await expect(page.getByTestId('holder-ch1')).not.toHaveText('');
+  await page.locator('[data-channel="ch1"] .head').focus();
+  const stops: string[] = [];
+  for (let i = 0; i < 12; i++) {
+    stops.push(
+      await page.evaluate(() => {
+        const el = document.activeElement as HTMLElement | null;
+        if (!el?.closest('[data-channel="ch1"]')) return 'outside';
+        return el.classList.contains('head') ? 'head' : el.classList.contains('vca') ? 'vca' : (el.getAttribute('aria-label') ?? '');
+      }),
+    );
+    await page.keyboard.press('Tab');
+  }
+  await other.command({ type: 'release', path: '/channels/ch1/fader' });
+  other.close();
+  expect(stops.filter((s) => s !== 'outside')).toEqual(['head', 'Pres 1 PFL', 'Pres 1 AFL', 'Pres 1 mute', 'Pres 1 fader', 'vca']);
+  await expect(page.getByRole('region', { name: 'Channel strips' })).toBeVisible();
+});
+
+test('lists the consoles and every other session with what it holds, each once', async ({ page, baseURL }) => {
+  await live(page);
+  const other = await RawClient.open(baseURL!);
+  // A control surface that holds a fader is a console row, not a session.
+  const surface = await RawClient.open(baseURL!, 'console', CONSOLE_SESSIONS['mcu-1']!);
+  try {
+    await other.command({ type: 'touch', path: '/channels/ch4/fader' });
+    await surface.command({ type: 'touch', path: '/channels/ch5/fader' });
+    const key = page.getByRole('button', { name: /^USERS/ });
+    // Two connected surfaces and one web client.
+    await expect(key).toHaveText('USERS  3');
+    await key.click();
+    const panel = page.getByRole('region', { name: 'Users' });
+    await expect(panel).toBeVisible();
+    await expect(panel).toContainText('This screen');
+    // Named by the tag of its handle, never by its session id.
+    await expect(panel.getByTestId('user')).toHaveCount(1);
+    await expect(panel.getByTestId('user')).toContainText(`web client ${handleTag(ownerHandle(other.session))}`);
+    await expect(panel.getByTestId('user')).toContainText('holds Guest 2 fader');
+    await expect(panel).toContainText(handleTag(ownerHandle(await debug(page, 'session'))));
+    await expect(panel.getByTestId('console').filter({ hasText: 'MCU Pro' })).toContainText('holds Guest 3 fader');
+  } finally {
+    await other.command({ type: 'release', path: '/channels/ch4/fader' });
+    await surface.command({ type: 'release', path: '/channels/ch5/fader' });
+    other.close();
+    surface.close();
+  }
+});
+
+test('steps banks with [ and ], jumps to a channel by name or number, and spills a VCA', async ({ page, request }) => {
+  await live(page);
+  const scrollLeft = () => page.locator('.scroller').evaluate((el) => el.scrollLeft);
+  await page.locator('body').press(']');
+  await expect(page.getByRole('button', { name: '9-16' })).toHaveAttribute('aria-pressed', 'true');
+  await page.locator('body').press('[');
+  await expect(page.getByRole('button', { name: '1-8' })).toHaveAttribute('aria-pressed', 'true');
+
+  const jump = page.getByRole('textbox', { name: /^Jump to a channel/ });
+  await jump.fill('amb 1');
+  await jump.press('Enter');
+  await expect.poll(scrollLeft).toBe(12 * 86);
+  await jump.fill('3');
+  await jump.press('Enter');
+  await expect.poll(scrollLeft).toBe(2 * 86);
+  await jump.fill('nothing like this');
+  await jump.press('Enter');
+  await expect(jump).toHaveClass(/miss/);
+
+  const members = (await serverState(request)).state.vcas['vca2']!.members;
+  const name = (await serverState(request)).shape.vcas.find((v) => v.id === 'vca2')!.name;
+  await page.getByRole('button', { name: `Spill VCA ${name}: show only its members` }).click();
+  await expect(page.getByTestId('spill')).toBeVisible();
+  await expect(page.locator('.strips .strip')).toHaveCount(members.length);
+  await page.getByTestId('spill').click();
+  await expect(page.locator('.strips .strip')).toHaveCount((await serverState(request)).shape.channels.length);
+});
+
+test('jumps, steps banks and follows a surface among the strips of a spilled VCA', async ({ page, request }) => {
+  // Every channel but the first two: positions on the strips are two less
+  // than in the shape.
+  const channels = (await serverState(request)).shape.channels.map((c) => c.id);
+  await patch(request, '/vcas/vca2/members', channels.slice(2));
+  try {
+    await live(page);
+    const scroller = page.locator('.scroller');
+    const scrolledTo = (strip: number) =>
+      expect
+        .poll(() => scroller.evaluate((el, x) => `${el.scrollLeft} of ${Math.min(x, el.scrollWidth - el.clientWidth)}`, strip * 86), { message: `strip ${strip}` })
+        .toMatch(/^(\d+) of \1$/);
+    await page.getByRole('button', { name: /^Spill VCA .*: show only its members$/ }).nth(1).click();
+    await expect(page.locator('.strips .strip')).toHaveCount(channels.length - 2);
+    const jump = page.getByRole('textbox', { name: /^Jump to a channel/ });
+    // Channel 12 is the tenth strip shown.
+    await jump.fill('12');
+    await jump.press('Enter');
+    await scrolledTo(9);
+    await expect(jump).not.toHaveClass(/miss/);
+    // Channel 1 is not a member: a miss, and nothing scrolls.
+    await jump.fill('1');
+    await jump.press('Enter');
+    await expect(jump).toHaveClass(/miss/);
+    await scrolledTo(9);
+    await jump.blur();
+    await page.locator('body').press('[');
+    await scrolledTo(0);
+    await page.locator('body').press(']');
+    await scrolledTo(8);
+    // The surface banks to channel 17: the first member there is strip 15.
+    await page.getByRole('button', { name: 'FOLLOW' }).click();
+    expect((await request.post('/__mock/consoles/mcu-1/bank?offset=16')).ok()).toBe(true);
+    await scrolledTo(14);
+  } finally {
+    await request.post('/__mock/consoles/mcu-1/bank?offset=0');
+    await patch(request, '/vcas/vca2/members', ['ch3', 'ch4', 'ch5', 'ch6']);
+  }
+});
+
+test('opens processing over the strips with the masters and monitor reachable, and moves focus in and back', async ({ page }) => {
+  await live(page);
+  const head = page.locator('[data-channel="ch1"] .head');
+  await head.focus();
+  await page.keyboard.press('Enter');
+  const panel = page.getByRole('region', { name: 'Pres 1 processing' });
+  await expect(panel).toBeVisible();
+  await expect(panel.getByRole('heading', { name: 'Pres 1' })).toBeFocused();
+  // Nothing of the masters or the monitor lies under the panel.
+  for (const target of [page.getByRole('slider', { name: 'PGM 5.1 fader' }), page.getByRole('button', { name: 'CUT', exact: true })]) {
+    const box = (await target.boundingBox())!;
+    const hit = await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.closest('.detail') !== null, { x: box.x + box.width / 2, y: box.y + box.height / 2 });
+    expect(hit).toBe(false);
+  }
+  await page.keyboard.press('Escape');
+  await expect(panel).toHaveCount(0);
+  await expect(head).toBeFocused();
+});
+
+test('puts an aux on the channel faders and gives the faders back on EXIT', async ({ page, request }) => {
+  await live(page);
+  await patch(request, '/channels/ch2/sends/aux1/level', -20);
+  const faderBefore = await fader(request, 'ch2');
+  const strip = (await page.locator('[data-channel="ch2"]').boundingBox())!;
+  await page.getByRole('combobox', { name: 'Sends on faders' }).selectOption({ label: 'IFB 1' });
+  await expect(page.getByTestId('sends-on-faders')).toBeVisible();
+  await expect(page.getByTestId('fader-value-ch2')).toHaveText(formatDb(-20));
+  await dragFader(page, '/channels/ch2/sends/aux1/level', -60);
+  await settled(page);
+  const send = (await serverState(request)).state.channels['ch2']!.sends['aux1']!.level;
+  expect(send).toBeGreaterThan(-20);
+  expect(await fader(request, 'ch2')).toBe(faderBefore);
+  expect(await page.locator('[data-channel="ch2"]').boundingBox()).toEqual(strip);
+  await page.getByTestId('sends-on-faders').click();
+  await expect(page.getByRole('slider', { name: 'Pres 2 fader' })).toBeVisible();
+  await expect(page.getByTestId('fader-value-ch2')).toHaveText(formatDb(faderBefore));
 });

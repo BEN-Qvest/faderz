@@ -54,6 +54,7 @@ restores replicas. The same controls answer JSON under `/__mock`:
 | `GET /__mock/commands` | every command outcome, REST included |
 | `POST /__mock/audit/reset` | clears both command logs |
 | `POST /__mock/drop-clients` | closes every socket |
+| `POST /__mock/consoles/<id>/bank?offset=<n>` | moves that console's bank to start at channel index `n` |
 | `POST /__mock/skip-revision` | advances the revision without a delta |
 | `POST /__mock/rewind?by=<n>` | rolls the cluster back `n` revisions, as a restore from an older backup would: a new epoch and every socket closed, so a client that held state reconnects with the old epoch and gets a snapshot of the new one |
 
@@ -110,6 +111,9 @@ the link shows AHEAD, a banner over the view names both revisions,
 nothing is retried, and TAKE CLUSTER STATE loads the cluster's snapshot.
 
 Every write control is `aria-disabled` and sends nothing while the link transmits no commands (connecting, offline, failing over, ahead), when the status area shows LOCK, and while the serving replica cannot commit and no standby is ready, when the client stays connected and the status area shows NO Q; either one names the reason in its title (`src/lib/state/writes.ts`). A command answered 503 (not applied), unanswered when a snapshot answers a hello or resync sent after it or answers none, or unanswered when its connection fails, is sent again with its id; otherwise one without an answer is not sent again, as the server answers every command it reads. One still unanswered 3 s after it was issued is dropped with a notice, and its control shows the committed value again.
+The LOCK DESK key in the header does the same on one screen: a 0.5 s
+hold locks it, another unlocks it. A phone shows the key only while
+the desk is locked.
 
 Each screen latches true-peak overs and holds the maximum true peak
 (the TP readout of a master) from the meter frames it receives, so a
@@ -169,16 +173,31 @@ than 0.3 s it talks until released; a shorter tap latches it on. Only
 a release on the key latches: a cancelled touch, a lost pointer or
 focus leaving the key during the press ends the talk, and so does
 leaving the view, or the page going hidden or away, while the key is
-held or latched. A press on a lit
+held or latched; back on the page, a notice says the talk ended and
+why. A press on a lit
 key stops the talk, whichever screen lit it; one another session holds
 is stopped there, and the screen names the holder. A latch stopped
 while writes are locked stays shown until the server reports the talk
 off.
 
-A label cut off for lack of room, such as a long channel name or the
-status-bar counters, shows its full text in a tooltip: after a short
-hover, on keyboard focus (Tab to it) and on a touch held for 0.5 s;
-Escape closes it.
+A label cut off for lack of room, such as a long channel name, shows
+its full text in a tooltip: after a short hover, on keyboard focus (Tab
+to it) and on a touch held for 0.5 s; Escape closes it.
+
+In the mixer, `[` and `]` step to the previous and next bank, the Jump
+field takes a strip number or the start of a channel name, FOLLOW keeps
+the strips on the first connected surface's bank, and a press on a VCA
+master's name shows only that VCA's members until EXIT. "Sends on
+faders" puts one aux on the channel faders: each fader then sets that
+channel's send level to the aux, under a band in the sends colour,
+until SOF ... - EXIT.
+
+A strip has five tab stops: its head (select), PFL, AFL, MUTE and the
+fader, and after them its VCA row while it is in a VCA, whose tooltip
+names the VCAs and the effective gain; its chips and pan are edited in
+the processing panel. The first
+tab stops of the mixer are the skip links to the masters and the
+monitor.
 
 Typed values (the readout of every processing parameter, delay, the
 Setup view) are written on Enter or when the field is left, and Escape
@@ -187,5 +206,11 @@ restores the current value. Parameters take units: `2.5k` or `2.5 kHz`,
 in the selected unit (ms, frames at the shape's frame rate, or
 samples) or with a suffix: `40ms`, `2f`, `1.5s`, `1920smp`; the arrow
 keys step one unit, Shift a tenth. Matrix grids move with the arrow keys.
+The slider of a parameter or a send level moves by the distance dragged,
+from where it was, and never jumps to the touch point; its arrows step a
+hundredth of its travel, Page Up and Page Down a tenth, and every press
+moves the value by at least one step of its resolution.
 
-With a pointer: drag a fader, hold Shift (or Ctrl) for fine travel.
+With a pointer: drag a fader, hold Shift (or Ctrl) for fine travel; the
+FINE key in the bank bar latches fine travel for faders and pans, for
+touch screens. A double-click does nothing to a fader.

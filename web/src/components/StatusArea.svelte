@@ -5,6 +5,7 @@
   import { TRANSMITTING, type LinkState } from '../lib/sync/machines';
 
   const mixer = getMixer();
+  let open = $state(false);
   let now = $state(Date.now());
   onMount(() => {
     const t = setInterval(() => (now = Date.now()), 500);
@@ -22,11 +23,6 @@
     Offline: 'OFFLINE',
   };
   const status = $derived(mixer.status);
-  let chipsWidth = $state(0);
-  let reserve = $state(0);
-  $effect(() => {
-    if (chipsWidth > reserve) reserve = chipsWidth;
-  });
   const failover = $derived(
     status.failover && mixer.failoverAt !== null && now - mixer.failoverAt < 8000 ? status.failover : null,
   );
@@ -44,30 +40,8 @@
 </script>
 
 <!-- Every slot has a fixed size and keeps it when its text changes or
-     empties; the replica chips, whose count follows the cluster, come
-     first, so in the right-aligned header they move nothing else. -->
+     empties. The replica chips are in the connection details. -->
 <div class="status" aria-label="Connection" data-testid="status">
-  <!-- The chips empty while the link reconnects: the box keeps the widest
-       it has been, so the consoles before it never move. -->
-  <div class="replicas" aria-label="Replicas" data-testid="replicas" bind:clientWidth={chipsWidth} style:min-width={`${reserve}px`}>
-    {#each status.replicas as r (r.id)}
-      <span
-        class="replica"
-        class:serving={role(r.id) === 'primary'}
-        class:standby={role(r.id) === 'standby'}
-        class:ready={role(r.id) === 'standby' && status.standby === 'Ready'}
-        class:down={!r.healthy}
-        class:nocommit={r.healthy && !r.commitable}
-        title={describe(r)}
-        data-replica={r.id}
-        data-role={role(r.id)}
-        data-healthy={r.healthy}
-        data-commitable={r.commitable}
-      >
-        {r.id}<sup class:off={r.role !== 'leader'}>L</sup><sub class:off={role(r.id) !== 'standby'}>SB</sub>
-      </span>
-    {/each}
-  </div>
   <span class="slot q">
     <!-- The lock is a node of its own, not the quorum one restyled: a link
          that stops transmitting moves no node in the slot. -->
@@ -85,10 +59,10 @@
         data-testid="quorum"
         data-commitable={commitable}
         data-locked={mixer.lockReason}
-        role={mixer.locked ? 'alert' : undefined}
+        role={mixer.lockReason !== null ? 'alert' : undefined}
         title={commitable
           ? 'The serving replica can commit'
-          : mixer.locked
+          : mixer.lockReason !== null
             ? `Every write control is disabled: ${mixer.lockReason}`
             : 'The serving replica cannot commit (no quorum)'}
       >{commitable ? 'Q' : 'NO Q'}</span>
@@ -108,15 +82,49 @@
       </span>
     {/if}
   </span>
-  <div
-    class="link"
-    data-state={status.link}
-    role="status"
-    aria-live="polite"
-    data-testid="link"
-    title={`Revision ${status.revision}; primary ${status.primaryReplica ?? '-'}, standby ${status.standbyReplica ?? '-'} (${status.standby})`}
+  <!-- One lamp with a word in the operator's sightline; revision,
+       replica roles and the meter source open from it. -->
+  <button
+    class="link-key"
+    aria-expanded={open}
+    aria-controls="connection-details"
+    aria-label={`Connection ${LABEL[status.link]}, details`}
+    onclick={() => (open = !open)}
   >
-    <i></i><b>{LABEL[status.link]}</b>
+    <span
+      class="link"
+      data-state={status.link}
+      role="status"
+      aria-live="polite"
+      data-testid="link"
+      title={`Revision ${status.revision}; primary ${status.primaryReplica ?? '-'}, standby ${status.standbyReplica ?? '-'} (${status.standby})`}
+    >
+      <i></i><b>{LABEL[status.link]}</b>
+    </span>
+  </button>
+  <div class="details" class:open id="connection-details" role="region" aria-label="Connection details">
+    <div class="row"><span>Revision</span><b class="num">{status.revision}</b></div>
+    <div class="row"><span>Primary / standby</span><b class="num">{status.primaryReplica ?? '-'} / {status.standbyReplica ?? '-'} ({status.standby})</b></div>
+    <div class="row"><span>Meters from</span><b class="num">{mixer.meterReplica ?? '-'}</b></div>
+    <div class="replicas" aria-label="Replicas" data-testid="replicas">
+      {#each status.replicas as r (r.id)}
+        <span
+          class="replica"
+          class:serving={role(r.id) === 'primary'}
+          class:standby={role(r.id) === 'standby'}
+          class:ready={role(r.id) === 'standby' && status.standby === 'Ready'}
+          class:down={!r.healthy}
+          class:nocommit={r.healthy && !r.commitable}
+          title={describe(r)}
+          data-replica={r.id}
+          data-role={role(r.id)}
+          data-healthy={r.healthy}
+          data-commitable={r.commitable}
+        >
+          {r.id}<sup class:off={r.role !== 'leader'}>L</sup><sub class:off={role(r.id) !== 'standby'}>SB</sub>
+        </span>
+      {/each}
+    </div>
   </div>
   <span class="sr-only" data-testid="revision"><span class="rev">rev {status.revision}</span></span>
 </div>
@@ -163,6 +171,49 @@
     display: inline-block;
     width: 12ch;
     white-space: nowrap;
+  }
+  .link-key {
+    all: unset;
+    cursor: pointer;
+    border-radius: 3px;
+  }
+  .link-key:focus-visible {
+    outline: 2px solid var(--focus);
+  }
+  /* Opens under the header over the view; it moves nothing. */
+  .details {
+    display: none;
+    position: fixed;
+    top: 46px;
+    right: 10px;
+    z-index: 40;
+    min-width: 260px;
+    padding: 8px;
+    flex-direction: column;
+    gap: 4px;
+    border: 1px solid var(--line-strong);
+    border-radius: 3px;
+    background: var(--panel);
+    box-shadow: 0 6px 18px rgb(0 0 0 / 0.4);
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .details.open {
+    display: flex;
+  }
+  .details .row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .details b {
+    color: var(--text);
+    font-weight: 400;
+  }
+  .details .replicas {
+    display: flex;
+    gap: 4px;
+    margin-top: 4px;
   }
   .link {
     display: flex;
@@ -222,12 +273,6 @@
     font-size: 10.5px;
     color: var(--warn);
   }
-  .replicas {
-    flex: none;
-    display: flex;
-    justify-content: flex-end;
-    gap: 10px;
-  }
   .replica {
     display: inline-flex;
     width: 7ch;
@@ -248,7 +293,7 @@
   }
   .replica sup,
   .replica sub {
-    font-size: 8px;
+    font-size: 10px;
   }
   .replica.serving {
     background: var(--ok);
@@ -300,6 +345,12 @@
       padding: 0 6px;
       font-size: 10px;
     }
+  }
+  /* The narrowest phones (App.svelte): room for a locked desk's key. */
+  @media (max-width: 389px) {
+    .link {
+      padding: 0 3px;
+    }
     .replica {
       padding: 0 3px;
       font-size: 10px;
@@ -311,8 +362,7 @@
     }
   }
   @media (max-width: 1500px) {
-    .slot.fo,
-    .replicas {
+    .slot.fo {
       display: none;
     }
   }

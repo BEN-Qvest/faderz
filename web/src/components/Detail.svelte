@@ -1,7 +1,8 @@
 <script lang="ts">
   import type { BusState, ChannelState, EqBandType, RecallGroup, Solo, StereoImage, Tap } from '../lib/contract/types';
   import { TAPS, TAP_KEY, TAP_LABEL } from '../lib/audio/taps';
-  import { LAYOUT_LABELS, RECALL_GROUPS } from '../lib/contract/types';
+  import { LAYOUT_LABELS, RECALL_GROUPS, SCRIBBLE_COLORS } from '../lib/contract/types';
+  import { onMount } from 'svelte';
   import { getMixer } from '../lib/state/mixer.svelte';
   import { pointer } from '../lib/state/pointer';
   import { recallSafePath } from '../lib/state/paths';
@@ -14,8 +15,20 @@
   interface Props {
     id: string;
     onclose: () => void;
+    /** Moves the selection to another element of the same kind. */
+    onselect: (id: string) => void;
+    /** Section to scroll into view on open: input, eq or dynamics. */
+    section?: string | null;
   }
-  let { id, onclose }: Props = $props();
+  let { id, onclose, onselect, section = null }: Props = $props();
+  let drawer: HTMLElement | undefined = $state();
+  let heading: HTMLElement | undefined = $state();
+  // Focus moves into the panel when it opens, so the keyboard continues there.
+  onMount(() => heading?.focus({ preventScroll: true }));
+  $effect(() => {
+    if (!section || !drawer) return;
+    drawer.querySelector<HTMLElement>(`[data-section="${section}"]`)?.scrollIntoView({ block: 'start' });
+  });
   const mixer = getMixer();
   const shape = $derived(mixer.shape!);
   const channel = $derived(shape.channels.find((c) => c.id === id));
@@ -37,6 +50,11 @@
   const typeLabel: Record<EqBandType, string> = { lowShelf: 'Low shelf', peak: 'Peak', highShelf: 'High shelf' };
 
   const legs = $derived(LAYOUT_LABELS[element.layout]);
+  /** Channels step through channels, buses and auxes through their own list. */
+  const siblings = $derived(group === 'channels' ? shape.channels : group === 'buses' ? shape.buses : shape.auxes);
+  const at = $derived(siblings.findIndex((e) => e.id === id));
+  const prev = $derived(at > 0 ? siblings[at - 1] : undefined);
+  const next = $derived(at >= 0 && at < siblings.length - 1 ? siblings[at + 1] : undefined);
   /** All legs inverted, or all back to normal when every leg already is. */
   function invertAll(): void {
     const target = !st.polarity.every(Boolean);
@@ -62,15 +80,36 @@
 
 <svelte:window onkeydown={keydown} />
 
-<section class="detail" aria-label={`${element.name} processing`}>
+<section class="detail" bind:this={drawer} aria-label={`${element.name} processing`}>
   <header>
-    <h2>{element.name}</h2>
+    <h2 tabindex="-1" bind:this={heading}>{element.name}</h2>
     <span class="meta">{element.layout} - {group === 'channels' ? 'input channel' : group === 'buses' ? 'bus' : 'aux'}</span>
+    <span class="step">
+      <button class="key" disabled={!prev} onclick={() => prev && onselect(prev.id)} aria-label="Previous channel" title={prev ? `Previous: ${prev.name}` : undefined}>&lt; PREV</button>
+      <button class="key" disabled={!next} onclick={() => next && onselect(next.id)} aria-label="Next channel" title={next ? `Next: ${next.name}` : undefined}>NEXT &gt;</button>
+    </span>
     <button class="key close" onclick={onclose} aria-label="Close processing">CLOSE</button>
   </header>
   <div class="cols">
-    <div class="col">
+    <div class="col" data-section="input">
       <h3 class="panel-title">Input</h3>
+      {#if ch}
+        <div class="taps colors" role="radiogroup" aria-label={`${element.name} strip colour`}>
+          <span class="lbl">Colour</span>
+          {#each SCRIBBLE_COLORS as c (c)}
+            <button
+              class="key swatch"
+              role="radio"
+              data-color={c}
+              aria-disabled={mixer.locked}
+              aria-checked={ch.color === c}
+              aria-label={c === 'none' ? 'No colour' : c}
+              title={c === 'none' ? 'No colour' : c}
+              onclick={() => mixer.set(p('color'), c)}><i></i></button
+            >
+          {/each}
+        </div>
+      {/if}
       {#if channel?.altInput}
         <div class="taps" role="radiogroup" aria-label={`${element.name} input source`}>
           <span class="lbl">Source</span>
@@ -141,7 +180,7 @@
       {/if}
     </div>
 
-    <div class="col eq">
+    <div class="col eq" data-section="eq">
       <div class="row">
         <h3 class="panel-title">EQ</h3>
         <button class="key" aria-disabled={mixer.locked} aria-pressed={flag('eq', 'enabled')} onclick={() => toggle('eq', 'enabled')}>EQ IN</button>
@@ -166,7 +205,7 @@
       </div>
     </div>
 
-    <div class="col">
+    <div class="col" data-section="dynamics">
       <div class="row">
         <h3 class="panel-title">Gate</h3>
         <button class="key" aria-disabled={mixer.locked} aria-pressed={flag('gate', 'enabled')} onclick={() => toggle('gate', 'enabled')}>IN</button>
@@ -213,7 +252,7 @@
             <Param path={p('sends', aux.id, 'level')} label="Lvl" min={-90} max={10} fader format={(v) => formatDb(v)} />
           </div>
         {/each}
-        <h3 class="panel-title">Assign</h3>
+        <h3 class="panel-title" data-section="assign">Assign</h3>
         <div class="grid">
           {#each shape.buses as bus (bus.id)}
             <button class="key" aria-disabled={mixer.locked} aria-pressed={flag('routes', bus.id)} onclick={() => toggle('routes', bus.id)}>{bus.name}</button>
@@ -224,8 +263,14 @@
         </div>
         <h3 class="panel-title">Listen</h3>
         <div class="grid">
-          {#each ['off', 'pfl', 'afl'] as const as mode (mode)}
-            <button class="key" aria-disabled={mixer.locked} aria-pressed={mixer.value<Solo>(p('solo')) === mode} onclick={() => mixer.set(p('solo'), mode)}>{mode}</button>
+          <!-- Off is both keys unlit, never a lit key of its own. -->
+          {#each ['pfl', 'afl'] as const as mode (mode)}
+            <button
+              class="key {mode}"
+              aria-disabled={mixer.locked}
+              aria-pressed={mixer.value<Solo>(p('solo')) === mode}
+              onclick={() => mixer.set(p('solo'), mixer.value<Solo>(p('solo')) === mode ? 'off' : mode)}>{mode}</button
+            >
           {/each}
         </div>
       </div>
@@ -248,8 +293,13 @@
   /* A drawer over the right of the view: opening, closing or switching
      channels moves and resizes nothing under it, and every fader keeps
      its full travel. */
+  /* Placed in the strip area's grid cell of the mixer, so its right edge
+     is the strips' right edge and the masters stay reachable. */
   .detail {
     position: absolute;
+    /* Both lines named: an absolute item's auto line is the grid's edge. */
+    grid-column: 1 / 2;
+    grid-row: 1 / 2;
     top: 0;
     right: 0;
     bottom: 0;
@@ -283,8 +333,34 @@
     color: var(--text-dim);
     font-size: 11px;
   }
-  .close {
+  .swatch {
+    width: 24px;
+    padding: 0;
+    display: grid;
+    place-items: center;
+  }
+  .swatch i {
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+    border: 1px solid var(--line-strong);
+  }
+  .swatch[data-color='red'] i { background: #ff5a5f; }
+  .swatch[data-color='orange'] i { background: #ff9d3a; }
+  .swatch[data-color='yellow'] i { background: #f2d53c; }
+  .swatch[data-color='green'] i { background: #3ccf75; }
+  .swatch[data-color='cyan'] i { background: #3fd0e0; }
+  .swatch[data-color='blue'] i { background: #4d8dff; }
+  .swatch[data-color='purple'] i { background: #b07cff; }
+  .swatch[aria-checked='true'] {
+    background: var(--panel-2);
+    border-color: var(--text);
+    box-shadow: inset 0 0 0 1px var(--text);
+  }
+  .step {
     margin-left: auto;
+    display: flex;
+    gap: 3px;
   }
   .cols {
     display: flex;

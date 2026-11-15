@@ -4,7 +4,7 @@
 // excuse, and the total must be 0.
 
 import { expect, test, type Page } from '@playwright/test';
-import { HEADERS, debug, dragFader, live, patch, resetMock } from './support';
+import { HEADERS, RawClient, debug, dragFader, live, patch, resetMock } from './support';
 
 interface Shift {
   value: number;
@@ -85,6 +85,7 @@ test('mounts only once the web fonts are in, however late they arrive, so no tex
 });
 
 test('nothing moves on load, live updates, failover and interaction', async ({ page, request }, info) => {
+  test.setTimeout(60_000);
   const phone = (page.viewportSize()?.width ?? 1600) < 600;
   await live(page);
   await page.evaluate(() => document.fonts.ready);
@@ -157,6 +158,22 @@ test('nothing moves on load, live updates, failover and interaction', async ({ p
     await expectNoShift(page, 'bank change');
   }
 
+  const sof = page.getByRole('combobox', { name: 'Sends on faders' });
+  if (await sof.isVisible()) {
+    await sof.selectOption({ label: 'IFB 1' });
+    await page.waitForTimeout(300);
+    await page.getByTestId('sends-on-faders').click();
+    await expectNoShift(page, 'sends on faders');
+  }
+
+  const masters = page.getByRole('button', { name: 'MASTERS' });
+  if (await masters.isVisible()) {
+    await masters.click();
+    await page.waitForTimeout(300);
+    await masters.click();
+    await expectNoShift(page, 'masters over the strips');
+  }
+
   await page.locator('[data-channel="ch1"] .head').click();
   await page.waitForTimeout(300);
   await expectNoShift(page, 'open processing');
@@ -206,6 +223,9 @@ test('nothing moves on load, live updates, failover and interaction', async ({ p
 
 test('every fader fits its box, VCA masters included', async ({ page }) => {
   await live(page);
+  // Below 1400 px the masters lie over the strips while MASTERS is lit.
+  const masters = page.getByRole('button', { name: 'MASTERS' });
+  if (await masters.isVisible()) await masters.click();
   const over = await page.locator('.fader').evaluateAll((list) =>
     list.flatMap((f) => {
       const box = f.parentElement!.getBoundingClientRect();
@@ -217,61 +237,16 @@ test('every fader fits its box, VCA masters included', async ({ page }) => {
   expect(over).toEqual([]);
 });
 
-test('status-bar counters reserve their width, so a new digit moves nothing', async ({ page }) => {
-  await live(page);
-  await expect(page.getByTestId('counter').first()).toBeAttached();
-  const widths = await page.getByTestId('counter').evaluateAll((list) =>
-    list.map((b) => {
-      const probe = document.createElement('b');
-      probe.className = b.className;
-      probe.style.whiteSpace = 'pre';
-      probe.textContent = '000000';
-      b.parentElement!.append(probe);
-      const want = probe.getBoundingClientRect().width;
-      probe.remove();
-      return Math.abs(b.getBoundingClientRect().width - want);
-    }),
-  );
-  expect(widths.length).toBeGreaterThan(0);
-  for (const d of widths) expect(d).toBeLessThan(0.5);
-});
-
-test('status-bar counters are never cut silently: all in a tooltip, a count when they do not fit', async ({ page }) => {
-  await live(page);
-  const box = page.getByTestId('counters');
-  await expect(page.getByTestId('counter').first()).toBeAttached();
-  const label = await box.getAttribute('aria-label');
-  for (const name of ['deadline_miss', 'overrun_skipped_samples', 'input_late_blocks', 'input_wait_timeout', 'command_late', 'afv_late']) {
-    expect(label).toContain(`${name} `);
-  }
-  expect(await box.getAttribute('data-tip')).toBe(label);
-  // Either every counter shows in full, or the count does.
-  const state = await box.evaluate((b) => {
-    const list = b.querySelector<HTMLElement>('.list')!;
-    const compact = b.querySelector<HTMLElement>('.compact')!;
-    const fits = list.scrollWidth <= b.clientWidth;
-    const shown = (e: HTMLElement) => getComputedStyle(e).visibility === 'visible';
-    return { fits, list: shown(list), compact: shown(compact), compactFits: compact.scrollWidth <= b.clientWidth + 0.5, text: compact.textContent, w: b.clientWidth };
-  });
-  expect(state.w).toBeGreaterThan(0);
-  expect(state.list).toBe(state.fits);
-  expect(state.compact).toBe(!state.fits);
-  expect(state.compactFits).toBe(true);
-  expect(state.text).toMatch(/^6 counters, \d+ nonzero$/);
-  // Reachable by keyboard: focus shows the full list.
-  await box.focus();
-  await page.keyboard.press('Shift+Tab');
-  await page.keyboard.press('Tab');
-  await expect(page.getByRole('tooltip')).toHaveText(label!);
-});
-
-test('no visible label is cut off without its full text in a tooltip reachable by keyboard', async ({ page, request }) => {
-  // A long channel name (ch8), a long VCA name (vca2) and a listen list
-  // longer than the monitor's box.
+test('no visible label is cut off without its full text in a tooltip reachable by keyboard', async ({ page, request, baseURL }) => {
+  // A long channel name (ch8), a long VCA name (vca2), a listen list
+  // longer than the monitor's box and a fader another session holds.
+  const other = await RawClient.open(baseURL!);
+  expect((await other.command({ type: 'touch', path: '/channels/ch4/fader' })).type).toBe('delta');
   for (const ch of ['ch1', 'ch2', 'ch3', 'ch4', 'ch5', 'ch6', 'ch8']) await patch(request, `/channels/${ch}/solo`, 'pfl');
   await patch(request, '/channels/ch7/solo', 'afl');
   await patch(request, '/vcas/vca2/members', ['ch3', 'ch4', 'ch5', 'ch6', 'ch8']);
   await live(page);
+  await expect(page.getByTestId('holder-ch4')).not.toHaveText('');
   await page.evaluate(() => document.fonts.ready);
   const views = ['Mixer', 'Routing', 'Aux / N-1', 'AFV', 'Scenes', 'Setup'];
   const problems: string[] = [];
@@ -323,6 +298,8 @@ test('no visible label is cut off without its full text in a tooltip reachable b
   }
   for (const ch of ['ch1', 'ch2', 'ch3', 'ch4', 'ch5', 'ch6', 'ch7', 'ch8']) await patch(request, `/channels/${ch}/solo`, 'off');
   await patch(request, '/vcas/vca2/members', ['ch3', 'ch4', 'ch5', 'ch6']);
+  await other.command({ type: 'release', path: '/channels/ch4/fader' });
+  other.close();
   expect(problems).toEqual([]);
 });
 
@@ -332,14 +309,14 @@ test('a cut-off label shows its full text on hover, on keyboard focus and on a l
   const head = page.locator('[data-channel="ch1"] .head');
   if (info.project.name === 'desktop') {
     await page.locator('[data-channel="ch8"] .head').hover();
-    await expect(tooltip).toHaveText('Reporter 2 North Gate');
+    await expect(tooltip).toHaveText('Reporter 2 North Gate (Studio mic 8)');
     await page.mouse.move(0, 0);
     await expect(tooltip).toBeHidden();
     // Keyboard focus, which a mouse click does not give.
     await page.locator('[data-channel="ch8"] .head').focus();
     await page.keyboard.press('Shift+Tab');
     await page.keyboard.press('Tab');
-    await expect(tooltip).toHaveText('Reporter 2 North Gate');
+    await expect(tooltip).toHaveText('Reporter 2 North Gate (Studio mic 8)');
     await expect(page.locator('[data-channel="ch8"] .head')).toHaveAttribute('aria-describedby', 'faderz-tip');
     await page.keyboard.press('Escape');
     await expect(tooltip).toBeHidden();
@@ -352,7 +329,71 @@ test('a cut-off label shows its full text on hover, on keyboard focus and on a l
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: point });
   await page.waitForTimeout(800);
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-  await expect(tooltip).toHaveText('Pres 1');
+  await expect(tooltip).toHaveText('Pres 1 (Studio mic 1)');
   await expect(head).toHaveAttribute('aria-pressed', 'false');
   await expect(tooltip).toBeHidden({ timeout: 5000 });
+});
+
+test('no text an operator reads is set below 10 px', async ({ page }) => {
+  await live(page);
+  const small: string[] = [];
+  for (const name of ['Mixer', 'Routing', 'Aux / N-1', 'AFV', 'Scenes', 'Setup']) {
+    await showView(page, name);
+    await page.waitForTimeout(300);
+    if (name === 'Mixer') await page.locator('[data-channel="ch1"] .head').click();
+    small.push(
+      ...(await page.evaluate((view) => {
+        const out: string[] = [];
+        for (const el of document.querySelectorAll<HTMLElement>('body *')) {
+          if (el.closest('.sr-only, aside.mock')) continue;
+          const own = [...el.childNodes].some((n) => n.nodeType === Node.TEXT_NODE && n.textContent?.trim());
+          if (!own) continue;
+          const r = el.getBoundingClientRect();
+          const cs = getComputedStyle(el);
+          if (r.width === 0 || r.height === 0 || cs.visibility === 'hidden') continue;
+          const px = parseFloat(cs.fontSize);
+          // 0 px is the brand folded away on phones: not shown at all.
+          if (px > 0 && px < 10) out.push(`${view}: "${el.textContent?.trim().slice(0, 20)}" ${px}px (${el.tagName.toLowerCase()}.${el.className})`);
+        }
+        return out;
+      }, name)),
+    );
+  }
+  expect([...new Set(small)]).toEqual([]);
+});
+
+test('the dev mock key covers no control and no readout', async ({ page }) => {
+  await live(page);
+  const hits = await page.evaluate(() => {
+    const key = document.querySelector('aside.mock button')!.getBoundingClientRect();
+    const overlap = (r: DOMRect) => r.width > 0 && r.left < key.right && r.right > key.left && r.top < key.bottom && r.bottom > key.top;
+    return [...document.querySelectorAll<HTMLElement>('button, [role="slider"], output, .fixed, .notice-line, [data-testid="session"]')]
+      .filter((el) => !el.closest('aside.mock') && getComputedStyle(el).visibility !== 'hidden' && overlap(el.getBoundingClientRect()))
+      .map((el) => `${el.tagName.toLowerCase()}.${el.className} "${el.textContent?.trim().slice(0, 16)}"`);
+  });
+  expect(hits).toEqual([]);
+});
+
+test('on a touch screen no control of the mixer is under 24 px (WCAG 2.5.8)', async ({ page }) => {
+  await live(page);
+  // The masters too, where they are an overlay.
+  const masters = page.getByRole('button', { name: 'MASTERS' });
+  if (await masters.isVisible()) await masters.click();
+  const coarse = await page.evaluate(() => matchMedia('(pointer: coarse)').matches);
+  const small = await page.evaluate(() =>
+    [...document.querySelectorAll<HTMLElement>('button, [role="slider"], input, select, a[href]')]
+      .filter((el) => !el.closest('aside.mock, .sr-only, .skip'))
+      .filter((el) => {
+        const r = el.getBoundingClientRect();
+        const cs = getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth && cs.visibility !== 'hidden' && cs.pointerEvents !== 'none';
+      })
+      .filter((el) => {
+        const r = el.getBoundingClientRect();
+        return Math.min(r.width, r.height) < 24;
+      })
+      .slice(0, 40)
+      .map((el) => `${el.tagName.toLowerCase()}.${el.className} "${(el.getAttribute('aria-label') ?? el.textContent ?? '').trim().slice(0, 20)}" ${Math.round(el.getBoundingClientRect().width)}x${Math.round(el.getBoundingClientRect().height)}`),
+  );
+  expect(coarse ? [...new Set(small)] : []).toEqual([]);
 });

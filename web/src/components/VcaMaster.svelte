@@ -20,17 +20,22 @@
 </script>
 
 <section class="vca" aria-label={`VCA ${vca.name}`}>
-  <!-- Focusable so that the tooltip with the full name and the members
-       reaches the keyboard too. -->
-  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-  <div class="head" role="note" tabindex="0" use:tip={`VCA ${vca.name}: ${memberNames || 'no members'}`}>
+  <!-- A press spills the VCA: the strip area shows only its members. A
+       button, so the tooltip with the full name and the members reaches
+       the keyboard too. -->
+  <button
+    class="head"
+    onclick={() => document.dispatchEvent(new CustomEvent('faderz:spill', { detail: vca.id }))}
+    aria-label={`Spill VCA ${vca.name}: show only its members`}
+    use:tip={`VCA ${vca.name}: ${memberNames || 'no members'}. Press to show only its members on the strips.`}
+  >
     <span class="kind">VCA</span>
     <span class="name">{vca.name}</span>
-  </div>
+  </button>
   <div class="members">
     {members.length} ch
   </div>
-  <button class="key" aria-disabled={mixer.locked} aria-pressed={solo === 'pfl'} onclick={() => toggleSolo('pfl')} aria-label={`VCA ${vca.name} PFL, all members`}>PFL</button>
+  <button class="key pfl" aria-disabled={mixer.locked} aria-pressed={solo === 'pfl'} onclick={() => toggleSolo('pfl')} aria-label={`VCA ${vca.name} PFL, all members`}>PFL</button>
   <button class="key afl" aria-disabled={mixer.locked} aria-pressed={solo === 'afl'} onclick={() => toggleSolo('afl')} aria-label={`VCA ${vca.name} AFL, all members`}>AFL</button>
   <button class="key mute" aria-disabled={mixer.locked} aria-pressed={mute} onclick={() => mixer.set(vcaPath(vca.id, 'mute'), !mute)} aria-label={`VCA ${vca.name} mute`}>MUTE</button>
   <div class="f"><Fader path={vcaPath(vca.id, 'offset')} label={`VCA ${vca.name} offset`} /></div>
@@ -50,6 +55,10 @@
     border-left: 1px solid var(--line);
   }
   .head {
+    all: unset;
+    box-sizing: border-box;
+    display: block;
+    cursor: pointer;
     background: var(--well);
     border-radius: 3px;
     padding: 3px 4px;
@@ -58,7 +67,7 @@
   }
   .kind {
     display: block;
-    font-size: 9px;
+    font-size: 10px;
     color: var(--owned);
     font-weight: 600;
     letter-spacing: 0.1em;
@@ -86,7 +95,7 @@
     min-height: 140px;
   }
   .value {
-    font-size: 10.5px;
+    font-size: 11px;
     text-align: center;
     background: var(--well);
     border-radius: 2px;
