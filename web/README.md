@@ -182,6 +182,28 @@ mock's example state over REST. Tests tagged `@mock` need the mock's
 controls or its replicas, `@meters` its meter frames; they are left out
 of that run, and so is the production build server.
 
+### The UI from the binary
+
+The faderz binary carries the UI it is built with: `npm run build` here
+before `cargo build` at the repository root. A build without `dist/`
+answers `/` with 404 and a note saying so, and `cargo test` then checks
+only that answer.
+
+```sh
+FADERZ_BIN=../target/debug/faderz npm run test:binary
+```
+
+starts the binary three times, on ports 6471, 6481 and 6491
+(`FADERZ_BINARY_PORT` moves the first; ops and NMOS take the two after
+each), in auth modes `none`, `token` and `proxy`, the last behind a
+stand-in authenticating proxy on 6495 (`tests/binary/proxy.mjs`) that
+drops identity headers a client sends and sets its own. Each mode loads
+the UI from the binary and writes through it, within the binary's
+Content-Security-Policy; tests tagged with a mode check what only that
+mode refuses. In `proxy` mode the binary takes who the identity headers
+name, so it refuses to start with its API listener bound anywhere but
+loopback, where only the proxy beside it reaches it.
+
 ## Keyboard
 
 Faders are sliders: the arrows step 0.5 dB from -20 dB up, 1 dB down to
