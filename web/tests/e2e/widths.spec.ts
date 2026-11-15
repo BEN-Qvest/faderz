@@ -81,3 +81,105 @@ test('a locked desk keeps its key on screen at every width from 320 px', async (
   }
   expect(found).toEqual([]);
 });
+
+test('a tablet in portrait has the view tabs on a second header row, one tap each, and nothing moves', async ({ page }) => {
+  test.setTimeout(60_000);
+  // Layout shifts not caused by input, from the first paint on.
+  await page.addInitScript(() => {
+    const w = window as unknown as { __shifts: string[] };
+    w.__shifts = [];
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries() as Array<PerformanceEntry & { value: number; hadRecentInput: boolean; sources?: Array<{ node?: Node }> }>) {
+        if (!e.hadRecentInput && e.value > 0) w.__shifts.push(`${e.value.toFixed(4)} ${(e.sources ?? []).map((s) => (s.node as Element | undefined)?.className ?? '').join(',')}`);
+      }
+    }).observe({ type: 'layout-shift', buffered: true });
+  });
+  for (const [width, height] of [[701, 900], [768, 1024], [820, 1180], [1023, 1366]] as const) {
+    await page.setViewportSize({ width, height });
+    await live(page);
+    const tabs = page.getByRole('navigation', { name: 'Views' }).getByRole('button');
+    await expect(tabs).toHaveCount(6);
+    await expect(page.getByRole('combobox', { name: 'View' })).toBeHidden();
+    const header = (await page.locator('header.top').boundingBox())!;
+    expect(header.height, `${width}x${height}`).toBe(76);
+    for (const tab of await tabs.all()) {
+      const box = (await tab.boundingBox())!;
+      expect(box.x, `${width}x${height}`).toBeGreaterThanOrEqual(0);
+      expect(box.x + box.width, `${width}x${height}`).toBeLessThanOrEqual(width);
+      expect(box.y, `${width}x${height}`).toBeGreaterThanOrEqual(44);
+      expect(await tab.evaluate((e) => e.scrollWidth <= e.clientWidth)).toBe(true);
+    }
+    const main = (await page.locator('main').boundingBox())!;
+    for (const name of ['Aux / N-1', 'Setup', 'Mixer']) {
+      await page.getByRole('button', { name, exact: true }).click();
+      await expect(page.getByRole('button', { name, exact: true })).toHaveAttribute('aria-current', 'page');
+      expect(await page.locator('header.top').boundingBox()).toEqual(header);
+      expect(await page.locator('main').boundingBox()).toEqual(main);
+    }
+    // A panel that opens under the header opens under both rows.
+    await page.getByRole('button', { name: /^Connection LIVE, details$/ }).click();
+    const details = (await page.getByRole('region', { name: 'Connection details' }).boundingBox())!;
+    expect(details.y).toBeGreaterThanOrEqual(header.y + header.height);
+    await page.getByRole('button', { name: /^Connection LIVE, details$/ }).click();
+    expect(await page.evaluate(() => (window as unknown as { __shifts: string[] }).__shifts)).toEqual([]);
+  }
+  // In landscape at the same widths the views stay a menu on one row.
+  await page.setViewportSize({ width: 1023, height: 768 });
+  await expect(page.getByRole('combobox', { name: 'View' })).toBeVisible();
+  await expect(page.getByRole('navigation', { name: 'Views' })).toBeHidden();
+  expect((await page.locator('header.top').boundingBox())!.height).toBe(44);
+});
+
+test('rotating a tablet swaps the tab row and the menu, moves nothing else, and panels follow the header', async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.addInitScript(() => {
+    const w = window as unknown as { __shifts: number };
+    w.__shifts = 0;
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries() as Array<PerformanceEntry & { value: number; hadRecentInput: boolean }>) if (!e.hadRecentInput) w.__shifts += e.value;
+    }).observe({ type: 'layout-shift', buffered: true });
+  });
+  await page.setViewportSize({ width: 768, height: 1024 });
+  await live(page);
+  const header = page.locator('header.top');
+  const tabs = page.getByRole('navigation', { name: 'Views' });
+  const menu = page.getByRole('combobox', { name: 'View' });
+  const settle = () => page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+  const shifts = () => page.evaluate(() => (window as unknown as { __shifts: number }).__shifts);
+  for (const [width, height, rows] of [[1000, 768, 44], [768, 1024, 76], [1023, 768, 44], [834, 1194, 76]] as const) {
+    await page.setViewportSize({ width, height });
+    await settle();
+    const box = (await header.boundingBox())!;
+    expect(box.height, `${width}x${height}`).toBe(rows);
+    await expect(rows === 76 ? tabs : menu).toBeVisible();
+    await expect(rows === 76 ? menu : tabs).toBeHidden();
+    // The header height every panel under it reads is the one drawn.
+    const h = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--header-h').trim());
+    expect(h, `${width}x${height}`).toBe(`${rows}px`);
+    // After the rotation itself, nothing moves on its own.
+    const after = await shifts();
+    await page.waitForTimeout(1000);
+    expect(await shifts(), `${width}x${height}`).toBe(after);
+  }
+});
+
+test('the theme switches from the Setup view at every width, where the header has no theme key', async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 740 });
+  await live(page);
+  await expect(page.getByRole('button', { name: /theme$/ })).toBeHidden();
+  await page.getByRole('combobox', { name: 'View' }).selectOption('setup');
+  const themes = page.getByRole('radiogroup', { name: 'Theme of this screen' });
+  await expect(themes.getByRole('radio', { name: 'DARK' })).toHaveAttribute('aria-checked', 'true');
+  await themes.getByRole('radio', { name: 'LIGHT' }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+  await expect(themes.getByRole('radio', { name: 'LIGHT' })).toHaveAttribute('aria-checked', 'true');
+  // Kept for this screen, and the header key agrees where it is shown.
+  await page.reload();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+  await page.setViewportSize({ width: 1600, height: 1000 });
+  await expect(page.getByRole('button', { name: 'Switch to dark theme' })).toHaveText('DARK');
+  await page.getByRole('button', { name: 'Switch to dark theme' }).click();
+  await page.getByRole('button', { name: 'Setup', exact: true }).click();
+  await expect(page.getByRole('radiogroup', { name: 'Theme of this screen' }).getByRole('radio', { name: 'DARK' })).toHaveAttribute('aria-checked', 'true');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+});
