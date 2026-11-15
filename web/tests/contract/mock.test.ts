@@ -14,7 +14,7 @@ import { MockServer } from '../../dev/mock/server';
 import { CONSOLE_SESSIONS, DEFAULT_CHANNELS, exampleShape } from '../../dev/mock/shape';
 import { ownerHandle } from '../../src/lib/net/handle';
 import { decodeMeterFrame, deriveMeterLayout, type MeterFrame, type MeterLayout } from '../../src/lib/contract/meterFrame';
-import { DEAD_MS, HEARTBEAT_MS, LEASE_MS, METER_CREDIT_CAP, METER_PERIOD_MS } from '../../src/lib/contract/protocol';
+import { DEAD_MS, HEARTBEAT_MS, LEASE_MS, METER_CREDIT_CAP, METER_PERIOD_MS, SELECTIONS_INTERVAL_MS } from '../../src/lib/contract/protocol';
 import type {
   AckMessage,
   DeltaMessage,
@@ -22,6 +22,8 @@ import type {
   LinkMode,
   Owner,
   ReplicasMessage,
+  SelectionsMessage,
+  ControlRequestMessage,
   ServerMessage,
   SnapshotMessage,
 } from '../../src/lib/contract/types';
@@ -596,6 +598,113 @@ describe('leases', () => {
     await sleep(LEASE_MS + 600);
     expect((await owners())[path]).toBeUndefined();
   }, 10_000);
+});
+
+describe('selections and control requests', () => {
+  it('tells every connection what each session selected, until the session clears it or its lease lapses', async () => {
+    const observer = await new Client().open(onReplica('r1'));
+    await observer.hello();
+    const standby = await new Client(observer.session).open(onReplica('r2'));
+    await standby.hello('standby');
+    const a = await new Client().open(onReplica('r3'));
+    await a.hello();
+    let from = observer.messages.length;
+    let sbFrom = standby.messages.length;
+    a.send({ type: 'select', element: 'ch3' });
+    const seen = await observer.next<SelectionsMessage>((m) => m.type === 'selections' && m.selections.length > 0, from);
+    expect(seen.selections).toEqual([{ session: a.you, element: 'ch3' }]);
+    await standby.next((m) => m.type === 'selections' && m.selections.length > 0, sbFrom);
+    // A late joiner gets them after its snapshot.
+    const late = await new Client().open();
+    await late.hello();
+    const first = await late.next<SelectionsMessage>((m) => m.type === 'selections');
+    const snap = late.messages.findIndex((m) => m.type === 'snapshot');
+    expect(late.messages.indexOf(first)).toBeGreaterThan(snap);
+    expect(first.selections).toEqual([{ session: a.you, element: 'ch3' }]);
+    // The same selection again changes nothing, and one of an unknown
+    // element is ignored without an answer.
+    from = observer.messages.length;
+    const aFrom = a.messages.length;
+    a.send({ type: 'select', element: 'ch3' });
+    a.send({ type: 'select', element: 'nope' });
+    await sleep(300);
+    expect(a.messages.slice(aFrom).filter((m) => m.type === 'error')).toEqual([]);
+    expect(observer.count('selections', from)).toBe(0);
+    a.send({ type: 'select', element: null });
+    const cleared = await observer.next<SelectionsMessage>((m) => m.type === 'selections', from);
+    expect(cleared.selections).toEqual([]);
+    // A session that goes away loses its selection with its lease.
+    a.send({ type: 'select', element: 'pgm20' });
+    await observer.next<SelectionsMessage>((m) => m.type === 'selections' && m.selections.length > 0, from);
+    from = observer.messages.length;
+    await a.close();
+    const lapsed = await observer.next<SelectionsMessage>((m) => m.type === 'selections', from, LEASE_MS + DEAD_MS + 2000);
+    expect(lapsed.selections).toEqual([]);
+    await Promise.all([observer.close(), standby.close(), late.close()]);
+  }, 15_000);
+
+  it('sends the selections at most once per connection every 100 ms, the latest of a burst included', async () => {
+    const observer = await new Client().open(onReplica('r1'));
+    await observer.hello();
+    const a = await new Client().open(onReplica('r2'));
+    await a.hello();
+    await sleep(SELECTIONS_INTERVAL_MS);
+    const from = observer.messages.length;
+    const start = Date.now();
+    for (const id of ['ch1', 'ch2', 'ch3', 'ch4', 'ch5', 'ch6', 'ch7', 'ch8']) a.send({ type: 'select', element: id });
+    await sleep(SELECTIONS_INTERVAL_MS * 3);
+    const got = observer.messages.slice(from).filter((m): m is SelectionsMessage => m.type === 'selections');
+    expect(got.length).toBeGreaterThanOrEqual(1);
+    expect(got.length).toBeLessThanOrEqual(2);
+    expect(got.at(-1)!.selections).toEqual([{ session: a.you, element: 'ch8' }]);
+    expect(Date.now() - start).toBeGreaterThanOrEqual(SELECTIONS_INTERVAL_MS);
+    a.send({ type: 'select', element: null });
+    await Promise.all([observer.close(), a.close()]);
+  });
+
+  it('hands a control request to the primary connections of the holder only, naming the asker', async () => {
+    const holder = await new Client().open(onReplica('r1'));
+    await holder.hello();
+    const holderStandby = await new Client(holder.session).open(onReplica('r2'));
+    await holderStandby.hello('standby');
+    const asker = await new Client().open(onReplica('r3'));
+    await asker.hello();
+    const path = '/channels/ch9/fader';
+    await holder.answer(holder.command('touch', path));
+    const from = holder.messages.length;
+    asker.send({ type: 'request', path });
+    const req = await holder.next<ControlRequestMessage>((m) => m.type === 'controlRequest', from);
+    expect(req).toMatchObject({ path, from: asker.you });
+    // Nothing changed, nothing answered the asker, the standby heard nothing.
+    expect((await owners())[path]).toEqual(holder.you);
+    await sleep(300);
+    expect(asker.count('controlRequest')).toBe(0);
+    expect(asker.count('ack') + asker.count('error')).toBe(0);
+    expect(holderStandby.count('controlRequest')).toBe(0);
+    // A request for a control nobody else holds goes nowhere, and the
+    // same asker's next request for the same control within 3 s is dropped.
+    holder.send({ type: 'request', path });
+    asker.send({ type: 'request', path: '/channels/ch10/fader' });
+    for (let i = 0; i < 5; i++) asker.send({ type: 'request', path });
+    await sleep(300);
+    expect(holder.count('controlRequest', from)).toBe(1);
+    // Another control of the same holder, or another asker, is forwarded.
+    await holder.answer(holder.command('touch', '/channels/ch10/fader'));
+    asker.send({ type: 'request', path: '/channels/ch10/fader' });
+    const third = await new Client().open(onReplica('r2'));
+    await third.hello();
+    third.send({ type: 'request', path });
+    await sleep(300);
+    expect(holder.messages.slice(from).filter((m) => m.type === 'controlRequest').map((m) => (m as ControlRequestMessage).path)).toEqual([
+      path,
+      '/channels/ch10/fader',
+      path,
+    ]);
+    await holder.answer(holder.command('release', '/channels/ch10/fader'));
+    await third.close();
+    await holder.answer(holder.command('release', path));
+    await Promise.all([holder.close(), holderStandby.close(), asker.close()]);
+  });
 });
 
 describe('ahead of the cluster', () => {
