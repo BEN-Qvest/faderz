@@ -32,6 +32,8 @@ frame is decoded and its values validated before it is sent.
 - `FADERZ_MOCK_CHANNELS=<n>` sets the input channel count (default 29):
   mono channels `ch1`... followed by up to four stereo channels and one
   5.1 channel.
+- `FADERZ_BACKEND=<url>`, such as `http://127.0.0.1:8080`, loads no
+  mock: `/api/v1`, WebSocket included, goes to that faderz server.
 
 The striped MOCK button in the status bar kills, hangs, partitions and
 restores replicas. The same controls answer JSON under `/__mock`:
@@ -161,6 +163,24 @@ The specs share each server's mock state and run serially; each test
 restores every replica and clears the command logs and counters.
 `perf.spec.ts` and `throttle.spec.ts` run without tracing, whose DOM
 snapshots run on the page's main thread.
+
+### Against the faderz backend
+
+```sh
+FADERZ_BIN=../target/debug/faderz npm run test:backend
+FADERZ_E2E_BACKEND=../target/debug/faderz npm run test:e2e
+```
+
+`test:backend` starts the binary on port 6461 (`FADERZ_BACKEND_PORT`
+moves it, and its ops and NMOS listeners take the two after it) and
+checks its REST responses against `openapi.yaml` and its WebSocket
+messages against the schemas, with the validators of the contract
+tests. `FADERZ_E2E_BACKEND` runs the e2e suite against one replica of
+the binary (API, ops and NMOS on ports n + 3 to n + 5) behind the two
+dev servers, with the mock's example shape; a global setup writes the
+mock's example state over REST. Tests tagged `@mock` need the mock's
+controls or its replicas, `@meters` its meter frames; they are left out
+of that run, and so is the production build server.
 
 ## Keyboard
 
