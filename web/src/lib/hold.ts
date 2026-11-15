@@ -1,6 +1,8 @@
 // A press that acts only after a hold: pointer, Space or Enter held for
 // `ms` fires `fire`; letting go earlier cancels. While armed the node has
-// the class "arming", for a fill that shows the hold.
+// the class "arming", for a fill that shows the hold. An `ms` of 0 or less
+// fires on the press itself. What fires is the `fire` given when the press
+// started: an update during the hold changes the next press only.
 
 export interface HoldOptions {
   ms: number;
@@ -13,11 +15,13 @@ export function hold(node: HTMLElement, options: HoldOptions) {
   node.style.setProperty('--hold', `${opts.ms}ms`);
   const press = () => {
     if (timer) return;
+    const fire = opts.fire;
+    if (opts.ms <= 0) return fire();
     node.classList.add('arming');
     timer = setTimeout(() => {
       timer = null;
       node.classList.remove('arming');
-      opts.fire();
+      fire();
     }, opts.ms);
   };
   const lift = () => {
