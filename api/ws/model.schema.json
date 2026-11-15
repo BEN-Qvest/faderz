@@ -1,0 +1,2805 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/danielclasen/faderz/raw/main/api/ws/model.schema.json",
+  "title": "faderz mixer model",
+  "description": "Shared definitions for the faderz REST API and WebSocket messages: shape, live state, control paths, meters and counters.",
+  "$defs": {
+    "Id": {
+      "description": "Identifier of a shape element (channel, bus, aux, mix-minus, VCA, monitor output, output, scene, console).",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,31}$"
+    },
+    "IdSet": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Id"
+      },
+      "uniqueItems": true
+    },
+    "SessionId": {
+      "description": "Session of a client: 22 to 128 base64url characters without padding, carrying at least 128 random bits. A client sends it as ?session= on every WebSocket connection and in hello, and keeps it across reconnects and failover; the web UI also across reloads of the same tab, a console across bridge restarts. Command deduplication and the ownership lease key on it. It is a credential of the session: a client presenting another client's session id under the same principal can take over its ownership and the deduplication of its commands. It therefore never leaves the client that drew it and the server; every record published to clients carries the session's OwnerHandle instead. As it travels in the URL of every WebSocket upgrade, the server and every proxy in front of it redact the session query parameter from their access logs.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{22,128}$"
+    },
+    "OwnerHandle": {
+      "description": "Public handle of a session: the first 16 bytes of the SHA-256 digest of the session id (its ASCII characters) in base64url without padding, 22 characters. The server publishes it in place of the session id. A client computes the handle of its own session id the same way to recognise its own ownership; the session id cannot be derived from it.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{22}$"
+    },
+    "Owner": {
+      "description": "Identity of a client: who (principal), which session (by its handle), which kind of client, and which WebSocket connection. principal is 'anonymous' while no authentication is configured, otherwise the authenticated principal from the token or the authenticating proxy. Ownership and leases key on principal and session; connection only identifies the WebSocket that sent a command.",
+      "type": "object",
+      "required": [
+        "principal",
+        "handle",
+        "kind",
+        "connection"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "principal": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "handle": {
+          "$ref": "#/$defs/OwnerHandle"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "ui",
+            "console",
+            "script"
+          ]
+        },
+        "connection": {
+          "description": "Server-assigned id of the WebSocket connection, up to 128 characters: room for a 63-character replica id, a 32-digit hexadecimal id and a decimal counter.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "Revision": {
+      "description": "Global revision of the replicated state, shared by all replicas. Every applied change set increments it by one.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "Epoch": {
+      "description": "Id of the history of the replicated state: an unsigned 64-bit integer in decimal digits, carried as a string because JSON numbers in JavaScript hold integers exactly only up to 2^53. A state that starts empty or is restored from a backup gets a new epoch, so a revision names one state only together with its epoch, and revisions of two epochs are not comparable. A replica closes every WebSocket connection when its epoch changes, so the deltas on one connection belong to the epoch of its snapshot or resume.",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
+    },
+    "CommandId": {
+      "description": "Client-generated UUID of a command. A command id is applied at most once across all replicas within the deduplication retention, at least 10 s after the command was applied, so a client may resend it after a failover. A copy that arrives after the retention is applied again; its seq (client-message.schema.json#/$defs/Set) keeps it from undoing a later command of the same control only while the server still keeps the session's seqs, at least 13 s past the end of the session's lifetime. A client sends no copy more than 3 s after it issued the command, but nothing bounds how late a copy it sent arrives; one arriving after the seqs are forgotten is applied as a new command.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "SampleIndex": {
+      "description": "Media-time sample index at which a change takes effect, chosen by the system so every replica applies it at the same sample.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "ReplicaRole": {
+      "description": "leader orders commands into the replicated state; followers serve clients and forward commands to the leader.",
+      "type": "string",
+      "enum": [
+        "leader",
+        "follower"
+      ]
+    },
+    "ReplicaRef": {
+      "description": "The replica that sent a message.",
+      "type": "object",
+      "required": [
+        "id",
+        "role"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "role": {
+          "$ref": "#/$defs/ReplicaRole"
+        }
+      }
+    },
+    "ReplicaStatus": {
+      "type": "object",
+      "required": [
+        "id",
+        "role",
+        "healthy",
+        "commitable"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "role": {
+          "$ref": "#/$defs/ReplicaRole"
+        },
+        "healthy": {
+          "type": "boolean"
+        },
+        "commitable": {
+          "description": "The replica is part of a quorum and can commit commands. A client served by a replica that cannot commit fails over.",
+          "type": "boolean"
+        }
+      }
+    },
+    "OwnershipChange": {
+      "description": "A control was touched (owner set) or released (owner null).",
+      "type": "object",
+      "required": [
+        "path",
+        "owner"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/ControlPath"
+        },
+        "owner": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Owner"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "Layout": {
+      "description": "Channel layout. Width: mono 1, stereo 2, 5.1 6, 7.1 8. Channel order: mono M; stereo L R; 5.1 L R C LFE Ls Rs; 7.1 L R C LFE Ls Rs Lrs Rrs.",
+      "type": "string",
+      "enum": [
+        "mono",
+        "stereo",
+        "5.1",
+        "7.1"
+      ]
+    },
+    "Width": {
+      "type": "integer",
+      "enum": [
+        1,
+        2,
+        6,
+        8
+      ]
+    },
+    "FaderDb": {
+      "description": "Gain in dB. -90 is fully closed (-inf). Fader travel ends at +10 dB.",
+      "type": "number",
+      "minimum": -90,
+      "maximum": 10
+    },
+    "TrimDb": {
+      "type": "number",
+      "minimum": -20,
+      "maximum": 20
+    },
+    "Polarity": {
+      "description": "Polarity per leg of the element, in layout order; true inverts that leg. Each leg switches on its own, so one mis-wired leg of a stereo or surround feed is corrected without touching the others.",
+      "type": "array",
+      "items": {
+        "type": "boolean"
+      },
+      "minItems": 1,
+      "maxItems": 8
+    },
+    "LegTrim": {
+      "description": "Trim per leg in dB, in layout order, applied after trim.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TrimDb"
+      },
+      "minItems": 1,
+      "maxItems": 8
+    },
+    "Pan": {
+      "description": "-1 is full left (or front), 0 centre, 1 full right (or rear).",
+      "type": "number",
+      "minimum": -1,
+      "maximum": 1
+    },
+    "Divergence": {
+      "description": "Spread of the front image on surround buses: 0 feeds a centred source to the centre leg only, 1 to the left and right legs only (phantom centre); values between feed both.",
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "StereoImage": {
+      "description": "Leg use of a stereo channel: normal, leftToBoth feeds the left leg to both, rightToBoth the right leg to both, swap exchanges the legs. Ignored for other layouts.",
+      "type": "string",
+      "enum": [
+        "normal",
+        "leftToBoth",
+        "rightToBoth",
+        "swap"
+      ]
+    },
+    "Solo": {
+      "description": "Listen state of a channel on the monitor: pre-fader listen, after-fader listen (post-fader, before the AFV stage) or off.",
+      "type": "string",
+      "enum": [
+        "off",
+        "pfl",
+        "afl"
+      ]
+    },
+    "Tap": {
+      "description": "Pick-up point in a channel: input is the selected input before trim, preFader follows the processing before the fader, postFader follows fader and mute, before the AFV stage.",
+      "type": "string",
+      "enum": [
+        "input",
+        "preFader",
+        "postFader"
+      ]
+    },
+    "DirectOut": {
+      "description": "Direct out of a channel. An output flow of the shape whose source is the channel id carries it.",
+      "type": "object",
+      "required": [
+        "tap"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "tap": {
+          "$ref": "#/$defs/Tap"
+        }
+      }
+    },
+    "HpfFreq": {
+      "description": "Hz",
+      "type": "number",
+      "minimum": 20,
+      "maximum": 500
+    },
+    "EqFreq": {
+      "description": "Hz",
+      "type": "number",
+      "minimum": 20,
+      "maximum": 20000
+    },
+    "EqGain": {
+      "description": "dB",
+      "type": "number",
+      "minimum": -18,
+      "maximum": 18
+    },
+    "EqQ": {
+      "type": "number",
+      "minimum": 0.1,
+      "maximum": 16
+    },
+    "EqBandType": {
+      "type": "string",
+      "enum": [
+        "lowShelf",
+        "peak",
+        "highShelf"
+      ]
+    },
+    "GateThreshold": {
+      "description": "dBFS",
+      "type": "number",
+      "minimum": -80,
+      "maximum": 0
+    },
+    "GateRange": {
+      "description": "Attenuation when closed, dB",
+      "type": "number",
+      "minimum": 0,
+      "maximum": 80
+    },
+    "CompThreshold": {
+      "description": "dBFS",
+      "type": "number",
+      "minimum": -60,
+      "maximum": 0
+    },
+    "CompRatio": {
+      "type": "number",
+      "minimum": 1,
+      "maximum": 20
+    },
+    "AttackMs": {
+      "type": "number",
+      "minimum": 0.1,
+      "maximum": 200
+    },
+    "ReleaseMs": {
+      "type": "number",
+      "minimum": 5,
+      "maximum": 5000
+    },
+    "MakeupDb": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 24
+    },
+    "DelaySamples": {
+      "description": "Integer delay in samples at the shape sample rate, up to 5 s, for lip-sync against video processing chains.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 240000
+    },
+    "FrameRate": {
+      "description": "Video frame rate of the facility as a rational number, e.g. 25/1, 50/1 or 30000/1001. Clients use it to enter and show delays in frames.",
+      "type": "object",
+      "required": [
+        "numerator",
+        "denominator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "numerator": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 240000
+        },
+        "denominator": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1001
+        }
+      }
+    },
+    "TallySource": {
+      "description": "Name of a tally source as sent by the vision switcher.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9 ._:-]{1,64}$"
+    },
+    "TallyState": {
+      "type": "string",
+      "enum": [
+        "program",
+        "preview",
+        "off"
+      ]
+    },
+    "RecallGroup": {
+      "description": "Parameter group protected from scene recall. input covers the A/B input select, trim, leg trim, polarity, HPF and delay; dynamics covers gate and compressor; routing covers bus assignment, the direct out tap, mix-minus excludes and VCA membership. The meter tap is not recalled.",
+      "type": "string",
+      "enum": [
+        "input",
+        "eq",
+        "dynamics",
+        "pan",
+        "sends",
+        "routing",
+        "fader",
+        "mute",
+        "afv"
+      ]
+    },
+    "ChannelShape": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "width",
+        "layout",
+        "altInput"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "width": {
+          "$ref": "#/$defs/Width"
+        },
+        "layout": {
+          "$ref": "#/$defs/Layout"
+        },
+        "altInput": {
+          "description": "true when the channel has a second (B) input source configured, e.g. a redundant flow.",
+          "type": "boolean"
+        }
+      }
+    },
+    "InputSelect": {
+      "description": "Which input source feeds the channel. Switching keeps every processing setting; b needs altInput in the channel shape.",
+      "type": "string",
+      "enum": [
+        "a",
+        "b"
+      ]
+    },
+    "BusShape": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "kind",
+        "width",
+        "layout"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "program",
+            "me",
+            "cleanFeed"
+          ]
+        },
+        "width": {
+          "$ref": "#/$defs/Width"
+        },
+        "layout": {
+          "$ref": "#/$defs/Layout"
+        }
+      }
+    },
+    "MixMinusShape": {
+      "description": "Bus `bus` summed without the channels in the live `exclude` set, taken before bus processing.",
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "bus",
+        "width",
+        "layout"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "bus": {
+          "$ref": "#/$defs/Id"
+        },
+        "width": {
+          "$ref": "#/$defs/Width"
+        },
+        "layout": {
+          "$ref": "#/$defs/Layout"
+        }
+      }
+    },
+    "ElementShape": {
+      "description": "Aux bus or monitor output.",
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "width",
+        "layout"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "width": {
+          "$ref": "#/$defs/Width"
+        },
+        "layout": {
+          "$ref": "#/$defs/Layout"
+        }
+      }
+    },
+    "VcaShape": {
+      "type": "object",
+      "required": [
+        "id",
+        "name"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        }
+      }
+    },
+    "OutputShape": {
+      "description": "Output flow carrying a bus, aux, mix-minus or monitor output, or the direct out of a channel.",
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "source",
+        "width",
+        "layout"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "source": {
+          "$ref": "#/$defs/Id",
+          "description": "Bus, aux, mix-minus, monitor output or channel id."
+        },
+        "width": {
+          "$ref": "#/$defs/Width"
+        },
+        "layout": {
+          "$ref": "#/$defs/Layout"
+        }
+      }
+    },
+    "Shape": {
+      "description": "Mixer shape from start-up configuration. Fixed while the server runs.",
+      "type": "object",
+      "required": [
+        "sampleRate",
+        "frameRate",
+        "channels",
+        "buses",
+        "auxes",
+        "mixMinus",
+        "vcas",
+        "monitorOutputs",
+        "outputs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "sampleRate": {
+          "type": "integer",
+          "enum": [
+            48000
+          ]
+        },
+        "frameRate": {
+          "$ref": "#/$defs/FrameRate"
+        },
+        "channels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ChannelShape"
+          }
+        },
+        "buses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BusShape"
+          }
+        },
+        "auxes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ElementShape"
+          }
+        },
+        "mixMinus": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MixMinusShape"
+          }
+        },
+        "vcas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/VcaShape"
+          }
+        },
+        "monitorOutputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ElementShape"
+          }
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OutputShape"
+          }
+        }
+      }
+    },
+    "Hpf": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "freq"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "freq": {
+          "$ref": "#/$defs/HpfFreq"
+        }
+      }
+    },
+    "EqBand": {
+      "type": "object",
+      "required": [
+        "type",
+        "freq",
+        "gain",
+        "q"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "$ref": "#/$defs/EqBandType"
+        },
+        "freq": {
+          "$ref": "#/$defs/EqFreq"
+        },
+        "gain": {
+          "$ref": "#/$defs/EqGain"
+        },
+        "q": {
+          "$ref": "#/$defs/EqQ"
+        }
+      }
+    },
+    "Eq": {
+      "description": "4-band EQ. Bands are ordered low to high.",
+      "type": "object",
+      "required": [
+        "enabled",
+        "bands"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "bands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EqBand"
+          },
+          "minItems": 4,
+          "maxItems": 4
+        }
+      }
+    },
+    "Gate": {
+      "description": "Gate/expander. Linked across the channel width with a shared sidechain.",
+      "type": "object",
+      "required": [
+        "enabled",
+        "threshold",
+        "range",
+        "attack",
+        "release"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "threshold": {
+          "$ref": "#/$defs/GateThreshold"
+        },
+        "range": {
+          "$ref": "#/$defs/GateRange"
+        },
+        "attack": {
+          "$ref": "#/$defs/AttackMs"
+        },
+        "release": {
+          "$ref": "#/$defs/ReleaseMs"
+        }
+      }
+    },
+    "Comp": {
+      "description": "Compressor without look-ahead. Linked across the channel width with a shared sidechain.",
+      "type": "object",
+      "required": [
+        "enabled",
+        "threshold",
+        "ratio",
+        "attack",
+        "release",
+        "makeup"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "threshold": {
+          "$ref": "#/$defs/CompThreshold"
+        },
+        "ratio": {
+          "$ref": "#/$defs/CompRatio"
+        },
+        "attack": {
+          "$ref": "#/$defs/AttackMs"
+        },
+        "release": {
+          "$ref": "#/$defs/ReleaseMs"
+        },
+        "makeup": {
+          "$ref": "#/$defs/MakeupDb"
+        }
+      }
+    },
+    "Limiter": {
+      "description": "True-peak limiter at the output of a bus, aux or mix-minus feed, after the fader: holds the true peak (4x oversampling) at or below ceiling dBTP, as EBU Tech 3343 recommends for programme outputs. Without look-ahead it may overshoot by the transients it cannot anticipate; the output true-peak meter shows what leaves.",
+      "type": "object",
+      "required": [
+        "enabled",
+        "ceiling"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "ceiling": {
+          "$ref": "#/$defs/LimiterCeiling"
+        }
+      }
+    },
+    "LimiterCeiling": {
+      "description": "dBTP.",
+      "type": "number",
+      "minimum": -10,
+      "maximum": 0
+    },
+    "PanState": {
+      "description": "lr is the left/right position; fr the front/rear position, divergence the front spread and lfe the send level into the LFE leg, used by the panner on surround buses. The LFE send is band-limited to 120 Hz (ITU-R BS.775-4); -90 is off. pan is ignored for channels whose width equals the bus width, which map leg to leg by label. A channel wider than the bus folds down: 5.1 and 7.1 to stereo by the ITU-R BS.775 Lo/Ro equations (centre and surrounds at -3 dB, LFE dropped), 7.1 to 5.1 by summing each side and back surround pair at -3 dB.",
+      "type": "object",
+      "required": [
+        "lr",
+        "fr",
+        "divergence",
+        "lfe"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "lr": {
+          "$ref": "#/$defs/Pan"
+        },
+        "fr": {
+          "$ref": "#/$defs/Pan"
+        },
+        "divergence": {
+          "$ref": "#/$defs/Divergence"
+        },
+        "lfe": {
+          "$ref": "#/$defs/FaderDb"
+        }
+      }
+    },
+    "Send": {
+      "type": "object",
+      "required": [
+        "on",
+        "level",
+        "pan",
+        "pre"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "on": {
+          "type": "boolean"
+        },
+        "level": {
+          "$ref": "#/$defs/FaderDb"
+        },
+        "pan": {
+          "$ref": "#/$defs/Pan"
+        },
+        "pre": {
+          "description": "true taps pre-fader, false post-fader.",
+          "type": "boolean"
+        }
+      }
+    },
+    "ChannelState": {
+      "type": "object",
+      "required": [
+        "input",
+        "trim",
+        "legTrim",
+        "polarity",
+        "hpf",
+        "eq",
+        "gate",
+        "comp",
+        "dynamicsBeforeEq",
+        "delay",
+        "pan",
+        "image",
+        "fader",
+        "mute",
+        "solo",
+        "meterTap",
+        "directOut",
+        "sends",
+        "routes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/InputSelect"
+        },
+        "trim": {
+          "$ref": "#/$defs/TrimDb"
+        },
+        "legTrim": {
+          "$ref": "#/$defs/LegTrim"
+        },
+        "polarity": {
+          "$ref": "#/$defs/Polarity"
+        },
+        "hpf": {
+          "$ref": "#/$defs/Hpf"
+        },
+        "eq": {
+          "$ref": "#/$defs/Eq"
+        },
+        "gate": {
+          "$ref": "#/$defs/Gate"
+        },
+        "comp": {
+          "$ref": "#/$defs/Comp"
+        },
+        "dynamicsBeforeEq": {
+          "description": "false runs EQ before gate and compressor (the default order), true runs gate and compressor before EQ.",
+          "type": "boolean"
+        },
+        "delay": {
+          "$ref": "#/$defs/DelaySamples"
+        },
+        "pan": {
+          "$ref": "#/$defs/PanState"
+        },
+        "image": {
+          "$ref": "#/$defs/StereoImage"
+        },
+        "fader": {
+          "$ref": "#/$defs/FaderDb"
+        },
+        "mute": {
+          "type": "boolean"
+        },
+        "solo": {
+          "$ref": "#/$defs/Solo"
+        },
+        "meterTap": {
+          "description": "Where the channel meter picks up the signal.",
+          "$ref": "#/$defs/Tap"
+        },
+        "directOut": {
+          "$ref": "#/$defs/DirectOut"
+        },
+        "sends": {
+          "description": "Sends keyed by aux id.",
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/Id"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/Send"
+          }
+        },
+        "routes": {
+          "description": "Bus assignment keyed by bus id.",
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/Id"
+          },
+          "additionalProperties": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "BusState": {
+      "description": "Bus processing: the channel strip without trim, HPF and pan, plus an output limiter. Used for buses and auxes.",
+      "type": "object",
+      "required": [
+        "polarity",
+        "eq",
+        "gate",
+        "comp",
+        "dynamicsBeforeEq",
+        "limiter",
+        "delay",
+        "fader",
+        "mute"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "polarity": {
+          "$ref": "#/$defs/Polarity"
+        },
+        "eq": {
+          "$ref": "#/$defs/Eq"
+        },
+        "gate": {
+          "$ref": "#/$defs/Gate"
+        },
+        "comp": {
+          "$ref": "#/$defs/Comp"
+        },
+        "dynamicsBeforeEq": {
+          "description": "false runs EQ before gate and compressor (the default order), true runs gate and compressor before EQ.",
+          "type": "boolean"
+        },
+        "limiter": {
+          "$ref": "#/$defs/Limiter"
+        },
+        "delay": {
+          "$ref": "#/$defs/DelaySamples"
+        },
+        "fader": {
+          "$ref": "#/$defs/FaderDb"
+        },
+        "mute": {
+          "type": "boolean"
+        }
+      }
+    },
+    "MixMinusState": {
+      "type": "object",
+      "required": [
+        "exclude",
+        "fader",
+        "mute",
+        "interrupt"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "exclude": {
+          "description": "Channel ids left out of the sum.",
+          "$ref": "#/$defs/IdSet"
+        },
+        "fader": {
+          "$ref": "#/$defs/FaderDb"
+        },
+        "mute": {
+          "type": "boolean"
+        },
+        "interrupt": {
+          "$ref": "#/$defs/Interrupt"
+        }
+      }
+    },
+    "Interrupt": {
+      "description": "IFB interrupt (talkback) of a mix-minus output: while active, the output carries the input channel source, at its trim and processing but before its fader, in place of the mix-minus, so a presenter hears the producer in the earpiece. active is momentary: the server sets it back to false when the session that owns /active releases it or its lease runs out, so a lost client never leaves an output interrupted. Setting active with source null changes nothing audible.",
+      "type": "object",
+      "required": [
+        "source",
+        "active"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Channel id."
+        },
+        "active": {
+          "type": "boolean"
+        }
+      }
+    },
+    "VcaState": {
+      "description": "offset is added in dB to every member's fader; offsets of several memberships sum. Effective channel gain is clamped at +20 dB. mute mutes every member. Members' faders do not move. solo listens to every member on the monitor, as if each member had that solo set, without changing the members' own solo.",
+      "type": "object",
+      "required": [
+        "offset",
+        "mute",
+        "members",
+        "solo"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "offset": {
+          "$ref": "#/$defs/FaderDb"
+        },
+        "mute": {
+          "type": "boolean"
+        },
+        "members": {
+          "description": "Channel ids.",
+          "$ref": "#/$defs/IdSet"
+        },
+        "solo": {
+          "$ref": "#/$defs/Solo"
+        }
+      }
+    },
+    "MonitorState": {
+      "description": "Monitor section. While any channel or VCA has solo pfl or afl, the monitor plays the listen sum instead of source. A source wider than the monitor output folds down by downmix: loRo uses the ITU-R BS.775 Lo/Ro equations (centre and surrounds at -3 dB, LFE dropped), lr plays only its L and R legs. dim lowers the monitor by dimDepth dB; mono sums the legs and lowers the sum by monoCompensation dB; image feeds one leg to both or swaps them on a stereo monitor. speakerMute and speakerSolo hold one entry per leg of the monitor output in layout order: a muted leg is silent, and while any leg is soloed only soloed legs play.",
+      "type": "object",
+      "required": [
+        "source",
+        "level",
+        "dim",
+        "cut",
+        "mono",
+        "talkbackDim",
+        "dimDepth",
+        "monoCompensation",
+        "downmix",
+        "image",
+        "speakerMute",
+        "speakerSolo"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "description": "Bus, aux or mix-minus id.",
+          "$ref": "#/$defs/Id"
+        },
+        "level": {
+          "$ref": "#/$defs/FaderDb"
+        },
+        "dim": {
+          "type": "boolean"
+        },
+        "cut": {
+          "type": "boolean"
+        },
+        "mono": {
+          "type": "boolean"
+        },
+        "talkbackDim": {
+          "description": "Dims the monitor while any mix-minus interrupt is active, so talkback does not feed back through the control room speakers.",
+          "type": "boolean"
+        },
+        "dimDepth": {
+          "$ref": "#/$defs/MonitorDimDepth"
+        },
+        "monoCompensation": {
+          "$ref": "#/$defs/MonoCompensation"
+        },
+        "downmix": {
+          "$ref": "#/$defs/Downmix"
+        },
+        "image": {
+          "$ref": "#/$defs/StereoImage"
+        },
+        "speakerMute": {
+          "type": "array",
+          "items": {
+            "type": "boolean"
+          },
+          "minItems": 1,
+          "maxItems": 8
+        },
+        "speakerSolo": {
+          "type": "array",
+          "items": {
+            "type": "boolean"
+          },
+          "minItems": 1,
+          "maxItems": 8
+        }
+      }
+    },
+    "MonitorDimDepth": {
+      "description": "Attenuation of DIM, dB.",
+      "type": "number",
+      "minimum": 0,
+      "maximum": 60
+    },
+    "MonoCompensation": {
+      "description": "Attenuation of the mono sum, dB; 3 keeps the level of uncorrelated legs.",
+      "type": "number",
+      "minimum": 0,
+      "maximum": 6
+    },
+    "Downmix": {
+      "type": "string",
+      "enum": [
+        "loRo",
+        "lr"
+      ]
+    },
+    "AfvBinding": {
+      "description": "Audio-follow-video stage of a channel: post-fader, ramped gain between 0 dB (open) and offLevel (closed). open is driven by tally and is read-only. On program the stage rises to 0 dB over riseMs; on preview or off it waits holdMs, then falls to offLevel over fallMs. A tally carrying transitionMs uses it for both directions of that transition. offLevel -90 closes fully.",
+      "type": "object",
+      "required": [
+        "enabled",
+        "source",
+        "riseMs",
+        "fallMs",
+        "holdMs",
+        "offLevel",
+        "open"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "source": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/TallySource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "riseMs": {
+          "$ref": "#/$defs/AfvTimeMs"
+        },
+        "fallMs": {
+          "$ref": "#/$defs/AfvTimeMs"
+        },
+        "holdMs": {
+          "$ref": "#/$defs/AfvTimeMs"
+        },
+        "offLevel": {
+          "$ref": "#/$defs/AfvOffLevel"
+        },
+        "open": {
+          "type": "boolean"
+        }
+      }
+    },
+    "AfvTimeMs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "AfvOffLevel": {
+      "description": "Level of a closed AFV stage in dB, -90 (fully closed) to 0.",
+      "type": "number",
+      "minimum": -90,
+      "maximum": 0
+    },
+    "Scene": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "storedAt"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "storedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "SceneRecalled": {
+      "description": "The scene recalled last, for every client to show as current; null before the first recall and after that scene is deleted. Only the server changes it.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "at"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/Id"
+            },
+            "at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "ConsoleStatus": {
+      "description": "Hardware control surface attached to the mixer.",
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "handle",
+        "protocol",
+        "transport",
+        "connected",
+        "bankOffset",
+        "strips"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "handle": {
+          "description": "Handle of the session the surface uses as a client, so its ownership can be shown by name.",
+          "$ref": "#/$defs/OwnerHandle"
+        },
+        "protocol": {
+          "type": "string",
+          "enum": [
+            "mcu",
+            "hui",
+            "osc"
+          ]
+        },
+        "transport": {
+          "type": "string",
+          "enum": [
+            "alsa-midi",
+            "bridge",
+            "osc-udp"
+          ]
+        },
+        "connected": {
+          "type": "boolean"
+        },
+        "bankOffset": {
+          "description": "Index of the first channel on the surface.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "strips": {
+          "description": "Fader strips on the surface.",
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "State": {
+      "description": "Live mixer state. Maps are keyed by the ids of the shape.",
+      "type": "object",
+      "required": [
+        "channels",
+        "buses",
+        "auxes",
+        "mixMinus",
+        "vcas",
+        "monitor",
+        "afv",
+        "tally",
+        "recallSafe",
+        "scenes",
+        "consoles",
+        "metering",
+        "tone",
+        "sceneRecalled"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "channels": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/Id"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/ChannelState"
+          }
+        },
+        "buses": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/Id"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/BusState"
+          }
+        },
+        "auxes": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/Id"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/BusState"
+          }
+        },
+        "mixMinus": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/Id"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/MixMinusState"
+          }
+        },
+        "vcas": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/Id"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/VcaState"
+          }
+        },
+        "monitor": {
+          "$ref": "#/$defs/MonitorState"
+        },
+        "afv": {
+          "description": "AFV bindings keyed by channel id.",
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/Id"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/AfvBinding"
+          }
+        },
+        "tally": {
+          "description": "Last tally state per source.",
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/TallySource"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/TallyState"
+          }
+        },
+        "recallSafe": {
+          "description": "Recall-safe parameter groups keyed by channel, bus, aux, mix-minus or VCA id. An absent id has none.",
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/Id"
+          },
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/RecallGroup"
+            },
+            "uniqueItems": true
+          }
+        },
+        "scenes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Scene"
+          }
+        },
+        "consoles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConsoleStatus"
+          }
+        },
+        "metering": {
+          "$ref": "#/$defs/Metering"
+        },
+        "tone": {
+          "$ref": "#/$defs/Tone"
+        },
+        "sceneRecalled": {
+          "$ref": "#/$defs/SceneRecalled"
+        }
+      }
+    },
+    "Owners": {
+      "description": "Owned controls: control path to the owner. Part of the replicated state, so ownership survives a replica switch. Ownership belongs to the session (principal and session of the owner) and lapses when the session lease expires. Every message of the session that reaches a replica not partitioned from the quorum renews the lease, through any connection; the lease expires 2 s after the last renewal. A server also renews the lease of every session it holds an open connection of, and may take up to 7 s to close a connection whose client has gone silent (client-message.schema.json#/$defs/Ping), so ownership of a session whose client is gone lapses up to 9 s after the client's last message: up to 7 s until its connections are closed plus the 2 s lease. A replica failure or a page reload therefore keeps a held control while the session reconnects within the lease. After a snapshot or resume on a new connection of its session, a client releases every control its session owns that it is not touching, so ownership does not outlast a reload.",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/ControlPath"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/Owner"
+      }
+    },
+    "StateDocument": {
+      "type": "object",
+      "required": [
+        "revision",
+        "replica",
+        "shape",
+        "state",
+        "owners"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "replica": {
+          "$ref": "#/$defs/ReplicaRef"
+        },
+        "shape": {
+          "$ref": "#/$defs/Shape"
+        },
+        "state": {
+          "$ref": "#/$defs/State"
+        },
+        "owners": {
+          "$ref": "#/$defs/Owners"
+        }
+      }
+    },
+    "ControlPath": {
+      "description": "JSON Pointer (RFC 6901) to a writable leaf of State.",
+      "type": "string",
+      "anyOf": [
+        {
+          "pattern": "^/channels/[a-z][a-z0-9-]{0,31}/(input|trim|legTrim/[0-7]|polarity/[0-7]|hpf/(enabled|freq)|eq/enabled|eq/bands/[0-3]/(type|freq|gain|q)|gate/(enabled|threshold|range|attack|release)|comp/(enabled|threshold|ratio|attack|release|makeup)|dynamicsBeforeEq|delay|pan/(lr|fr|divergence|lfe)|image|fader|mute|solo|meterTap|directOut/tap|sends/[a-z][a-z0-9-]{0,31}/(on|level|pan|pre)|routes/[a-z][a-z0-9-]{0,31})$"
+        },
+        {
+          "pattern": "^/(buses|auxes)/[a-z][a-z0-9-]{0,31}/(polarity/[0-7]|eq/enabled|eq/bands/[0-3]/(type|freq|gain|q)|gate/(enabled|threshold|range|attack|release)|comp/(enabled|threshold|ratio|attack|release|makeup)|dynamicsBeforeEq|limiter/(enabled|ceiling)|delay|fader|mute)$"
+        },
+        {
+          "pattern": "^/mixMinus/[a-z][a-z0-9-]{0,31}/(exclude|fader|mute|interrupt/(source|active))$"
+        },
+        {
+          "pattern": "^/vcas/[a-z][a-z0-9-]{0,31}/(offset|mute|members|solo)$"
+        },
+        {
+          "pattern": "^/monitor/(source|level|dim|cut|mono|talkbackDim|dimDepth|monoCompensation|downmix|image|speakerMute/[0-7]|speakerSolo/[0-7])$"
+        },
+        {
+          "pattern": "^/afv/[a-z][a-z0-9-]{0,31}/(enabled|source|riseMs|fallMs|holdMs|offLevel)$"
+        },
+        {
+          "pattern": "^/recallSafe/[a-z][a-z0-9-]{0,31}$"
+        },
+        {
+          "pattern": "^/metering/(zones/(alignment|permittedMax|truePeakMax)|loudness/(preset|target|tolerance)|scale)$"
+        },
+        {
+          "pattern": "^/tone/(on|level|ident|targets)$"
+        }
+      ]
+    },
+    "ContinuousPath": {
+      "description": "Control paths whose writes are continuous: a client moving one of these controls may coalesce its writes and send only the latest value of a control at a limited rate. Every other ControlPath is discrete: each write is sent, in order. The declaration is per path, not per value type.",
+      "type": "string",
+      "anyOf": [
+        {
+          "pattern": "^/(channels|buses|auxes|mixMinus)/[a-z][a-z0-9-]{0,31}/fader$"
+        },
+        {
+          "pattern": "^/channels/[a-z][a-z0-9-]{0,31}/(trim|legTrim/[0-7]|hpf/freq|pan/(lr|fr|divergence|lfe)|sends/[a-z][a-z0-9-]{0,31}/(level|pan))$"
+        },
+        {
+          "pattern": "^/(channels|buses|auxes)/[a-z][a-z0-9-]{0,31}/(eq/bands/[0-3]/(freq|gain|q)|gate/(threshold|range|attack|release)|comp/(threshold|ratio|attack|release|makeup)|delay)$"
+        },
+        {
+          "pattern": "^/(buses|auxes)/[a-z][a-z0-9-]{0,31}/limiter/ceiling$"
+        },
+        {
+          "pattern": "^/vcas/[a-z][a-z0-9-]{0,31}/offset$"
+        },
+        {
+          "pattern": "^/monitor/level$"
+        }
+      ]
+    },
+    "ReadOnlyPath": {
+      "description": "JSON Pointer to a part of State that only the server changes.",
+      "type": "string",
+      "anyOf": [
+        {
+          "pattern": "^/afv/[a-z][a-z0-9-]{0,31}/open$"
+        },
+        {
+          "pattern": "^/tally/[A-Za-z0-9 ._:-]{1,64}$"
+        },
+        {
+          "pattern": "^/(scenes|consoles)$"
+        },
+        {
+          "pattern": "^/sceneRecalled$"
+        }
+      ]
+    },
+    "ValueByPath": {
+      "description": "Constrains `value` by the leaf `path` points to.",
+      "type": "object",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/(fader|level|offset)$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/FaderDb"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/trim$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/TrimDb"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/legTrim/[0-7]$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/TrimDb"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "(/(enabled|mute|on|pre|dim|cut|mono|open)|/polarity/[0-7]|/routes/[a-z][a-z0-9-]{0,31})$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/hpf/freq$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/HpfFreq"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/bands/[0-3]/freq$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/EqFreq"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/bands/[0-3]/gain$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/EqGain"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/bands/[0-3]/q$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/EqQ"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/bands/[0-3]/type$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/EqBandType"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/gate/threshold$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/GateThreshold"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/gate/range$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/GateRange"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/comp/threshold$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/CompThreshold"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/comp/ratio$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/CompRatio"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/(gate|comp)/attack$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/AttackMs"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/(gate|comp)/release$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/ReleaseMs"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/comp/makeup$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/MakeupDb"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/delay$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/DelaySamples"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "(/pan/(lr|fr)|/sends/[a-z][a-z0-9-]{0,31}/pan)$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/Pan"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/solo$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/Solo"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/(exclude|members)$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/IdSet"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "const": "/monitor/source"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/Id"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/afv/[a-z][a-z0-9-]{0,31}/source$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/TallySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/recallSafe/"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/RecallGroup"
+                },
+                "uniqueItems": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/tally/"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/TallyState"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "const": "/scenes"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Scene"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "const": "/consoles"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ConsoleStatus"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/(meterTap|directOut/tap)$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/Tap"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/metering/zones/(alignment|permittedMax|truePeakMax)$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": -40,
+                "maximum": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/metering/loudness/preset$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/LoudnessPreset"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/metering/loudness/target$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/LoudnessTarget"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/metering/loudness/tolerance$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/LoudnessTolerance"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/metering/scale$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/LoudnessScale"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/pan/divergence$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/Divergence"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/pan/lfe$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/FaderDb"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/image$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/StereoImage"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/dynamicsBeforeEq$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "/limiter/ceiling$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/LimiterCeiling"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/afv/[a-z][a-z0-9-]{0,31}/(riseMs|fallMs|holdMs)$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/AfvTimeMs"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/afv/[a-z][a-z0-9-]{0,31}/offLevel$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/AfvOffLevel"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/mixMinus/[a-z][a-z0-9-]{0,31}/interrupt/source$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/Id"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "(/interrupt/active|/monitor/talkbackDim)$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/tone/(on|ident)$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/tone/level$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/ToneLevel"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/tone/targets$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/IdSet"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/monitor/dimDepth$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/MonitorDimDepth"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/monitor/monoCompensation$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/MonoCompensation"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/monitor/downmix$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/Downmix"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/monitor/(speakerMute|speakerSolo)/[0-7]$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/channels/[a-z][a-z0-9-]{0,31}/input$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/InputSelect"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/sceneRecalled$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/SceneRecalled"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Change": {
+      "description": "Write of one control.",
+      "type": "object",
+      "required": [
+        "path",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/ControlPath"
+        },
+        "value": true
+      },
+      "$ref": "#/$defs/ValueByPath"
+    },
+    "StateChange": {
+      "description": "One changed leaf of State, as carried by a delta.",
+      "type": "object",
+      "required": [
+        "path",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ControlPath"
+            },
+            {
+              "$ref": "#/$defs/ReadOnlyPath"
+            }
+          ]
+        },
+        "value": true
+      },
+      "$ref": "#/$defs/ValueByPath"
+    },
+    "Conflict": {
+      "description": "A write refused because another client owns the control.",
+      "type": "object",
+      "required": [
+        "path",
+        "current",
+        "owner"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/ControlPath"
+        },
+        "current": {
+          "description": "Current value of the control."
+        },
+        "owner": {
+          "$ref": "#/$defs/Owner"
+        }
+      }
+    },
+    "MeterDb": {
+      "description": "Level in dBFS (true peak in dBTP). -120 is silence or below.",
+      "type": "number",
+      "minimum": -120,
+      "maximum": 30
+    },
+    "MeterLegs": {
+      "description": "One value per channel of the element, in layout order.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MeterDb"
+      },
+      "minItems": 1,
+      "maxItems": 8
+    },
+    "ChannelMeter": {
+      "description": "Input channel metering. peak is the sample peak and momentary the BS.1770-5 momentary loudness (K-weighted, 400 ms window, LFE excluded, in LUFS) at the channel meterTap; truePeak (4x oversampling, dBTP) is measured at the direct out tap, where the channel leaves the mixer. momentary is null until 400 ms of audio have been measured.",
+      "type": "object",
+      "required": [
+        "peak",
+        "truePeak",
+        "momentary"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "peak": {
+          "$ref": "#/$defs/MeterLegs"
+        },
+        "truePeak": {
+          "$ref": "#/$defs/MeterLegs"
+        },
+        "momentary": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": -120,
+              "maximum": 30
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "Loudness": {
+      "description": "ITU-R BS.1770-5 / EBU R128 loudness in LUFS, LRA in LU (EBU Tech 3342). null until enough audio has been measured. maxMomentary and maxShortTerm are the highest momentary and short-term loudness since the last reset (EBU Tech 3341). integratedValid is false after a telemetry drop until the integrated measurement is reset. lraStable is false during the first 60 s after a reset, while LRA is not yet meaningful.",
+      "type": "object",
+      "required": [
+        "momentary",
+        "shortTerm",
+        "integrated",
+        "lra",
+        "maxMomentary",
+        "maxShortTerm",
+        "integratedValid",
+        "lraStable"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "momentary": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": -120,
+              "maximum": 30
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "shortTerm": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": -120,
+              "maximum": 30
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "integrated": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": -120,
+              "maximum": 30
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lra": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "maxMomentary": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": -120,
+              "maximum": 30
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "maxShortTerm": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": -120,
+              "maximum": 30
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "integratedValid": {
+          "type": "boolean"
+        },
+        "lraStable": {
+          "type": "boolean"
+        }
+      }
+    },
+    "Metering": {
+      "description": "Meter display settings shared by every client. zones are the meter colour boundaries in dBFS: alignment level (EBU R 68: -18), permitted maximum (-9, the former quasi-peak limit) and the true-peak maximum (EBU R 128: -1 dBTP). loudness is the target and tolerance an integrated loudness is judged against: preset ebu is -23 LUFS +/-1 LU (EBU R 128 live), atsc -24 LKFS +/-2 LU (ATSC A/85), custom keeps target and tolerance as written. Writing preset ebu or atsc also sets target and tolerance to its values; writing target or tolerance sets preset to custom. scale is the loudness meter scale of EBU Tech 3341: ebu9 shows -18 to +9 LU around the target (the default), ebu18 shows -36 to +18 LU.",
+      "type": "object",
+      "required": [
+        "zones",
+        "loudness",
+        "scale"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "zones": {
+          "type": "object",
+          "required": [
+            "alignment",
+            "permittedMax",
+            "truePeakMax"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "alignment": {
+              "description": "Alignment level, dBFS.",
+              "type": "number",
+              "minimum": -40,
+              "maximum": 0
+            },
+            "permittedMax": {
+              "description": "Permitted maximum, dBFS.",
+              "type": "number",
+              "minimum": -40,
+              "maximum": 0
+            },
+            "truePeakMax": {
+              "description": "Maximum true-peak level, dBTP.",
+              "type": "number",
+              "minimum": -40,
+              "maximum": 0
+            }
+          }
+        },
+        "loudness": {
+          "type": "object",
+          "required": [
+            "preset",
+            "target",
+            "tolerance"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "preset": {
+              "$ref": "#/$defs/LoudnessPreset"
+            },
+            "target": {
+              "$ref": "#/$defs/LoudnessTarget"
+            },
+            "tolerance": {
+              "$ref": "#/$defs/LoudnessTolerance"
+            }
+          }
+        },
+        "scale": {
+          "$ref": "#/$defs/LoudnessScale"
+        }
+      }
+    },
+    "Tone": {
+      "description": "Line-up tone: a 1 kHz sine at level dBFS (sample peak) on every leg. While on, each output in targets (bus, aux or mix-minus ids) carries the tone in place of its mix, after its fader and before its limiter. EBU R 68 aligns at -18 dBFS, SMPTE practice at -20 dBFS. ident true identifies the legs: the tone stops on one leg at a time in layout order, for 250 ms each second.",
+      "type": "object",
+      "required": [
+        "on",
+        "level",
+        "ident",
+        "targets"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "on": {
+          "type": "boolean"
+        },
+        "level": {
+          "$ref": "#/$defs/ToneLevel"
+        },
+        "ident": {
+          "type": "boolean"
+        },
+        "targets": {
+          "$ref": "#/$defs/IdSet"
+        }
+      }
+    },
+    "ToneLevel": {
+      "description": "dBFS.",
+      "type": "number",
+      "minimum": -30,
+      "maximum": 0
+    },
+    "LoudnessPreset": {
+      "type": "string",
+      "enum": [
+        "ebu",
+        "atsc",
+        "custom"
+      ]
+    },
+    "LoudnessTarget": {
+      "description": "Target integrated loudness, LUFS.",
+      "type": "number",
+      "minimum": -31,
+      "maximum": -14
+    },
+    "LoudnessTolerance": {
+      "description": "Tolerance around the target, LU.",
+      "type": "number",
+      "minimum": 0.5,
+      "maximum": 5
+    },
+    "LoudnessScale": {
+      "type": "string",
+      "enum": [
+        "ebu9",
+        "ebu18"
+      ]
+    },
+    "BusMeter": {
+      "description": "Bus, aux and mix-minus metering at the output, where the signal leaves the mixer: sample peak, true peak (4x oversampling, dBTP), RMS and loudness. RMS is referenced to a full-scale sine (AES17), so a sine at -18 dBFS peak reads -18 dB RMS. correlation is the phase correlation of the L and R legs of a stereo element, -1 to 1, measured over 400 ms; null for other layouts and while both legs are silent.",
+      "type": "object",
+      "required": [
+        "peak",
+        "truePeak",
+        "rms",
+        "loudness",
+        "correlation"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "peak": {
+          "$ref": "#/$defs/MeterLegs"
+        },
+        "truePeak": {
+          "$ref": "#/$defs/MeterLegs"
+        },
+        "rms": {
+          "$ref": "#/$defs/MeterLegs"
+        },
+        "loudness": {
+          "$ref": "#/$defs/Loudness"
+        },
+        "correlation": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": -1,
+              "maximum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "MonitorMeter": {
+      "description": "Monitor output metering: sample peak per leg of what the monitor plays before level, dim, cut, mono and speaker mutes. While any channel or VCA listens, that is the listen sum, and PFL takes priority over AFL: while any PFL is on, only the PFL listens are summed. Otherwise it is the monitor source, folded to the monitor layout by downmix.",
+      "type": "object",
+      "required": [
+        "peak"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "peak": {
+          "$ref": "#/$defs/MeterLegs"
+        }
+      }
+    },
+    "Counters": {
+      "description": "Engine counters by metric name, as exported on /metrics.",
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]*_total$"
+      },
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    }
+  }
+}

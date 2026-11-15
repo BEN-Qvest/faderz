@@ -1,0 +1,31 @@
+import { readFileSync } from 'node:fs';
+import { defineConfig } from 'vitest/config';
+import { svelte } from '@sveltejs/vite-plugin-svelte';
+
+// Dev-only HTTPS: FADERZ_DEV_TLS_CERT and FADERZ_DEV_TLS_KEY name PEM files.
+// Without them `npm run dev` serves plain HTTP.
+const tlsCert = process.env['FADERZ_DEV_TLS_CERT'];
+const tlsKey = process.env['FADERZ_DEV_TLS_KEY'];
+const https = tlsCert && tlsKey ? { cert: readFileSync(tlsCert), key: readFileSync(tlsKey) } : undefined;
+
+export default defineConfig(async ({ command, mode }) => ({
+  plugins: [
+    svelte(),
+    // The mock server exists only in `vite` dev serving; builds never load it.
+    ...(command === 'serve' && mode !== 'test' ? [(await import('./dev/mock/plugin.ts')).faderzMock()] : []),
+  ],
+  // Component tests mount Svelte's client runtime, not its server one.
+  ...(process.env['VITEST'] ? { resolve: { conditions: ['browser'] } } : {}),
+  server: {
+    fs: { allow: ['..'] },
+    ...(https ? { https } : {}),
+  },
+  build: {
+    target: 'es2022',
+    sourcemap: true,
+  },
+  test: {
+    include: ['tests/unit/**/*.test.ts', 'tests/contract/**/*.test.ts'],
+    environment: 'node',
+  },
+}));

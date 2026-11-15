@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/danielclasen/faderz/raw/main/api/ws/client-message.schema.json",
+  "title": "faderz WebSocket client message",
+  "description": "Messages a client sends on /api/v1/ws. hello is the first message on every connection. A client keeps one primary connection (commands, deltas, meter frames, counters) and one standby connection to another replica (deltas, replicas, heartbeats). Commands (set, touch, release) are applied in the order received and answered by exactly one of: a delta listing the command id among its origins, an ack, or an error. Error 503 means not applied: the command changed nothing, and the client sends it again with the same id and seq. A client sends a command again with the same id after error 503, after a snapshot answering a hello or resync sent after the command or a snapshot answering none, as the snapshot can stand in for the deltas that answered it, or on another connection when the one it was sent on fails; otherwise it waits for the answer and sends no copy, as the server answers every command it reads. The server applies an id at most once (model.schema.json#/$defs/CommandId) and answers every copy. A client sends no command, first or again, more than 3 s after it issued it (its failover bound): one still unanswered then is dropped, so every copy of a command reaches the server while it remembers the command's id and seq. A server reads at most 64 commands per connection ahead of their answers: with 64 unanswered it reads nothing more on that connection, heartbeats included, until it has answered one. A client therefore keeps at most 64 commands sent and unanswered per connection, each copy counted, until each is answered or dropped. The server batches the commands arriving within one processing block into one delta. A client coalesces writes to one continuous control (model.schema.json#/$defs/ContinuousPath) to at most 50 per second, sending the latest value; it sends every write to a discrete control. Every message renews the session lease (model.schema.json#/$defs/Owners). Read index: a replica answers a hello or resync carrying lastRevision of its own epoch only once it has applied every log entry up to lastRevision, so the snapshot or resume it answers with never has an older revision; until then it holds the answer, for at most 2 s. A replica that cannot confirm lastRevision by then, because it is cut off from the quorum (then at once, without holding) or cannot catch up, answers with the state it has applied marked stale: true, which may be older than lastRevision. A client that has no snapshot or resume it can apply 3 s after its hello, resync or promote leaves that connection and goes on with another endpoint or replica. A lastRevision of its epoch above every revision the cluster has committed is answered at once with ahead (server-message.schema.json#/$defs/Ahead), a lastRevision of another epoch at once with a snapshot. It likewise applies no command that follows a promote carrying lastRevision of its epoch before it has applied that revision.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/Hello"
+    },
+    {
+      "$ref": "#/$defs/Promote"
+    },
+    {
+      "$ref": "#/$defs/Set"
+    },
+    {
+      "$ref": "#/$defs/Touch"
+    },
+    {
+      "$ref": "#/$defs/Release"
+    },
+    {
+      "$ref": "#/$defs/Resync"
+    },
+    {
+      "$ref": "#/$defs/Credit"
+    },
+    {
+      "$ref": "#/$defs/Ping"
+    },
+    {
+      "$ref": "#/$defs/Pong"
+    }
+  ],
+  "$defs": {
+    "Hello": {
+      "description": "Identifies the client and the role of this connection. With lastRevision and its epoch the server answers, once it has applied that revision (read index), with resume when the epoch is its own and it still holds every delta after lastRevision, otherwise with a snapshot. A lastRevision of another epoch is answered at once with a snapshot, never with resume. Without lastRevision the server answers with a snapshot. A standby connection receives deltas, replicas and pings but no meter frames or counters. session must equal the ?session= of the connection.",
+      "type": "object",
+      "required": [
+        "type",
+        "session",
+        "kind",
+        "mode"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "hello"
+        },
+        "session": {
+          "$ref": "model.schema.json#/$defs/SessionId"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "ui",
+            "console"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "primary",
+            "standby"
+          ]
+        },
+        "lastRevision": {
+          "description": "Highest revision the client has applied.",
+          "$ref": "model.schema.json#/$defs/Revision"
+        },
+        "epoch": {
+          "description": "Epoch of lastRevision; sent together with it.",
+          "$ref": "model.schema.json#/$defs/Epoch"
+        }
+      },
+      "dependentRequired": {
+        "lastRevision": [
+          "epoch"
+        ],
+        "epoch": [
+          "lastRevision"
+        ]
+      }
+    },
+    "Set": {
+      "description": "Write one control. seq orders the commands of a session on one control: set, touch and release of a control share one counter, which increases per session and control, also across reloads: a web client starts the seq of every control at the Unix time in milliseconds when it loads and adds one per command to that control, and at most 50 writes per second keep it below the clock. A set, touch or release whose seq is not above the last one applied from this session for the same path is answered with ack result stale and has no effect, so a copy of a command, or a command resent after a later one of the same control was applied, cannot undo the later one. The server keeps the last seq applied per session and path for at least 13 s past the end of the session's lifetime: the deduplication retention of 10 s (model.schema.json#/$defs/CommandId) plus the 3 s failover bound within which a client still sends a command; a session's lifetime ends when its lease expires, after the lease period without a command or renewal of it (model.schema.json#/$defs/Owners). Refused with error 409 while another session owns the control.",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "seq",
+        "path",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "set"
+        },
+        "id": {
+          "$ref": "model.schema.json#/$defs/CommandId"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "path": {
+          "$ref": "model.schema.json#/$defs/ControlPath"
+        },
+        "value": true
+      },
+      "$ref": "model.schema.json#/$defs/ValueByPath"
+    },
+    "Touch": {
+      "description": "Take ownership of a control for this session, as on pointer-down or a touched console fader. Held until release or until the session lease expires. Refused with error 409 while another session owns it, and answered with ack result stale when its seq is not above the last applied from this session for the control (#/$defs/Set).",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "seq",
+        "path"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "touch"
+        },
+        "id": {
+          "$ref": "model.schema.json#/$defs/CommandId"
+        },
+        "seq": {
+          "description": "On the counter of the control that set, touch and release share (#/$defs/Set).",
+          "type": "integer",
+          "minimum": 1
+        },
+        "path": {
+          "$ref": "model.schema.json#/$defs/ControlPath"
+        }
+      }
+    },
+    "Release": {
+      "description": "Give up ownership of a control; answered with ack result stale when its seq is not above the last applied from this session for the control (#/$defs/Set). After a snapshot or resume on a new connection of its session, a client releases every control its session owns that it is not touching (model.schema.json#/$defs/Owners).",
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "seq",
+        "path"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "release"
+        },
+        "id": {
+          "$ref": "model.schema.json#/$defs/CommandId"
+        },
+        "seq": {
+          "description": "On the counter of the control that set, touch and release share (#/$defs/Set).",
+          "type": "integer",
+          "minimum": 1
+        },
+        "path": {
+          "$ref": "model.schema.json#/$defs/ControlPath"
+        }
+      }
+    },
+    "Resync": {
+      "description": "Sent after a revision gap, a promote or a meter layout mismatch. Answered like hello, once the replica has applied lastRevision (read index); with full the answer is a snapshot.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "resync"
+        },
+        "lastRevision": {
+          "description": "Highest revision the client has applied.",
+          "$ref": "model.schema.json#/$defs/Revision"
+        },
+        "epoch": {
+          "description": "Epoch of lastRevision; sent together with it.",
+          "$ref": "model.schema.json#/$defs/Epoch"
+        },
+        "full": {
+          "description": "Answer with a snapshot even when the replica holds every delta after lastRevision.",
+          "const": true
+        }
+      },
+      "dependentRequired": {
+        "lastRevision": [
+          "epoch"
+        ],
+        "epoch": [
+          "lastRevision"
+        ]
+      }
+    },
+    "Promote": {
+      "description": "Turn this standby connection into the primary one, after the primary was lost or its replica reported it cannot commit. The replica applies the commands that follow only once it has applied lastRevision (read index). Not answered; the client follows it with resync.",
+      "type": "object",
+      "required": [
+        "type",
+        "lastRevision",
+        "epoch"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "promote"
+        },
+        "lastRevision": {
+          "description": "Highest revision the client has applied.",
+          "$ref": "model.schema.json#/$defs/Revision"
+        },
+        "epoch": {
+          "description": "Epoch of lastRevision. The replica waits for lastRevision only when this is its own epoch.",
+          "$ref": "model.schema.json#/$defs/Epoch"
+        }
+      }
+    },
+    "Credit": {
+      "description": "Grants the server n more meter frames on this connection. The server holds an outstanding credit count per connection, 0 when it opens and at most 8: credit adds n, and credits beyond 8 are discarded. Each meter frame sent consumes one credit. In a meter period in which the connection holds no credit the server sends it no frame; that frame is dropped, never queued. The meter rate of a connection is therefore the lower of the replica's 25 per second and the rate of its credits. A client grants up to 8 after hello and then one credit per meter frame it has rendered, batched into one credit message per few frames. A client that stops granting, such as a hidden tab, receives at most 8 more frames and then none until it grants again; there is no unsubscribe message. A standby connection receives no meter frames; credits granted on it are kept, within the cap, until promote.",
+      "type": "object",
+      "required": [
+        "type",
+        "n"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "credit"
+        },
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "Ping": {
+      "description": "Heartbeat. Both sides send ping every 250 ms on every connection after hello and answer every ping with pong echoing t. t is the sender's clock in milliseconds, opaque to the receiver; ping and pong carry no state. Each side watches every connection with a monotonic clock of its own, and any received message, text or binary, counts as traffic. A peer without traffic for 375 ms (1.5 periods) is suspect, which closes or switches nothing; without traffic for 750 ms (3 periods) it is dead: a client closes the connection and promotes its standby when it was the primary; a server closes it within 7 s of the last traffic. One late beat, from scheduling jitter or a garbage collection pause, reaches only suspect and cannot cause a failover; three missed beats in a row bound failure detection to 750 ms. Heartbeats are these JSON messages on both sides: WebSocket protocol ping and pong frames do not replace them.",
+      "type": "object",
+      "required": [
+        "type",
+        "t"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "ping"
+        },
+        "t": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "Pong": {
+      "description": "Answer to a server ping, echoing its t. Carries no state.",
+      "type": "object",
+      "required": [
+        "type",
+        "t"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "pong"
+        },
+        "t": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}
