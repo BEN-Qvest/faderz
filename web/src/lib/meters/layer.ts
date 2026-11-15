@@ -26,6 +26,8 @@ const LOUD_W = 3;
 /** Height of the true-peak over lamp at the top of a meter, px, and the gap below it. */
 const LAMP_H = 3;
 const LAMP_GAP = 1;
+/** Canvas beyond the meters' boxes on every side, px. */
+const MARGIN = 1;
 
 export interface MeterSpec {
   group: MeterGroup;
@@ -102,6 +104,8 @@ export class MeterLayer {
   private dpr = 1;
   private w = 0;
   private h = 0;
+  /** The canvas box relative to its place without its transform, px. */
+  private box: Rect = { x: 0, y: 0, w: 0, h: 0 };
   private zones: MeterZones = { alignment: -18, permittedMax: -9, truePeakMax: -1 };
   /** Loudness target, LUFS: marked on the momentary loudness bar of channel meters. */
   private target = -23;
@@ -119,7 +123,11 @@ export class MeterLayer {
 
   constructor(private readonly meters: MeterStore) {}
 
-  /** Starts drawing into `canvas`, which covers `host`; meters register before or after. */
+  /**
+   * Starts drawing into `canvas`, anchored at the top left corner of
+   * `host`; the layer sets its size and moves it over the visible meters.
+   * Meters register before or after.
+   */
   attach(host: HTMLElement, canvas: HTMLCanvasElement): void {
     this.host = host;
     this.canvas = canvas;
@@ -214,35 +222,87 @@ export class MeterLayer {
     };
   }
 
-  /** Reads every rectangle once, relative to the canvas, after a layout change. */
+  /**
+   * Reads every rectangle once after a layout change, and fits the canvas
+   * to the visible meters: each frame drawn copies every pixel of the
+   * canvas, so a canvas the size of the view cost the main thread a few
+   * ms a frame for pixels no meter uses. The canvas keeps its layout
+   * position, at the corner of the host, and moves by a transform only,
+   * which is no layout shift.
+   */
   private measure(): void {
     this.layoutDirty = false;
     const canvas = this.canvas!;
     const c = canvas.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-    if (c.width !== this.w || c.height !== this.h || dpr !== this.dpr) {
-      this.w = c.width;
-      this.h = c.height;
-      this.dpr = dpr;
-      canvas.width = Math.max(1, Math.round(c.width * dpr));
-      canvas.height = Math.max(1, Math.round(c.height * dpr));
-    }
-    const rel = (r: DOMRect): Rect => ({ x: r.left - c.left, y: r.top - c.top, w: r.width, h: r.height });
+    // Rectangles relative to the canvas's place without its transform.
+    const ox = c.left - this.box.x;
+    const oy = c.top - this.box.y;
+    const rel = (r: DOMRect): Rect => ({ x: r.left - ox, y: r.top - oy, w: r.width, h: r.height });
     const clips = new Map<HTMLElement, Rect>();
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
     for (const s of this.slots.values()) {
       if (!s.visible) continue;
       s.rect = rel(s.el.getBoundingClientRect());
       if (s.clipper === undefined) s.clipper = this.clipperOf(s.el);
-      if (!s.clipper) {
-        s.clip = null;
-        continue;
-      }
-      let clip = clips.get(s.clipper);
-      if (!clip) {
-        clip = rel(s.clipper.getBoundingClientRect());
-        clips.set(s.clipper, clip);
+      let clip: Rect | null = null;
+      if (s.clipper) {
+        clip = clips.get(s.clipper) ?? null;
+        if (!clip) {
+          clip = rel(s.clipper.getBoundingClientRect());
+          clips.set(s.clipper, clip);
+        }
       }
       s.clip = clip;
+      const r = s.rect;
+      const left = clip ? Math.max(r.x, clip.x) : r.x;
+      const top = clip ? Math.max(r.y, clip.y) : r.y;
+      const right = clip ? Math.min(r.x + r.w, clip.x + clip.w) : r.x + r.w;
+      const bottom = clip ? Math.min(r.y + r.h, clip.y + clip.h) : r.y + r.h;
+      if (right <= left || bottom <= top) continue;
+      x0 = Math.min(x0, left);
+      y0 = Math.min(y0, top);
+      x1 = Math.max(x1, right);
+      y1 = Math.max(y1, bottom);
+    }
+    // One pixel of margin takes the floor mark, drawn on the row below a
+    // meter's box. Edges fall on whole device pixels, so the backing
+    // store maps one to one onto the screen at any devicePixelRatio.
+    const dpr = window.devicePixelRatio || 1;
+    let box: Rect = { x: 0, y: 0, w: 0, h: 0 };
+    let bw = 1;
+    let bh = 1;
+    if (x1 > x0 && y1 > y0) {
+      const dx0 = Math.floor((x0 - MARGIN) * dpr);
+      const dy0 = Math.floor((y0 - MARGIN) * dpr);
+      const dx1 = Math.ceil((x1 + MARGIN) * dpr);
+      const dy1 = Math.ceil((y1 + MARGIN) * dpr);
+      box = { x: dx0 / dpr, y: dy0 / dpr, w: (dx1 - dx0) / dpr, h: (dy1 - dy0) / dpr };
+      bw = dx1 - dx0;
+      bh = dy1 - dy0;
+    }
+    if (box.w !== this.w || box.h !== this.h || dpr !== this.dpr) {
+      this.w = box.w;
+      this.h = box.h;
+      this.dpr = dpr;
+      canvas.style.width = `${box.w}px`;
+      canvas.style.height = `${box.h}px`;
+      // Each assignment clears and reallocates the backing store.
+      if (canvas.width !== bw) canvas.width = bw;
+      if (canvas.height !== bh) canvas.height = bh;
+    }
+    if (box.x !== this.box.x || box.y !== this.box.y) canvas.style.transform = `translate(${box.x}px, ${box.y}px)`;
+    this.box = box;
+    for (const s of this.slots.values()) {
+      if (!s.visible) continue;
+      s.rect.x -= box.x;
+      s.rect.y -= box.y;
+    }
+    for (const clip of clips.values()) {
+      clip.x -= box.x;
+      clip.y -= box.y;
     }
   }
 
