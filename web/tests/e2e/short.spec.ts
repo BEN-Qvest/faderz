@@ -91,6 +91,9 @@ test('a notice longer than the header slot widens nothing and moves no header it
     const text = notice.locator('.text');
     expect(await text.evaluate((el) => el.scrollWidth > el.clientWidth), 'the notice is cut off').toBe(true);
     expect(await notice.getAttribute('data-tip')).toBe(await text.textContent());
+    // The compact header (link word, pending count, DESK, USR, gaps)
+    // leaves the text room to be read, not only a tooltip.
+    expect(await text.evaluate((el) => el.clientWidth), 'notice text width').toBeGreaterThanOrEqual(90);
   } finally {
     await other.command({ type: 'release', path });
     other.close();
@@ -105,6 +108,7 @@ test('the commit banner shows its whole text to the keyboard on a short screen',
     for (const r of REPLICAS.filter((x) => x !== primary)) expect((await request.post(`/__mock/replicas/${r}/partition`)).ok()).toBe(true);
     await expect(banner).toBeVisible();
     // The narrow line drops words; the tooltip carries them.
+    await expect(banner.getByText('audio continues')).toHaveCount(1);
     await expect(banner.getByText('audio continues')).toBeHidden();
     // The banner follows the view menu in the tab order.
     await page.getByRole('combobox', { name: 'View' }).focus();
