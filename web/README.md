@@ -143,6 +143,74 @@ hold does is decided when it starts. A scene recall leaves the
 integration paused or running, and RESET leaves it paused. Channels latch an over only where they feed a direct out; the TP
 key above the strips clears those on this screen only.
 
+### Sign-in
+
+At start the page reads `GET /api/v1/session` (`src/lib/net/auth.ts`).
+Not signed in, in `oidc` mode it goes to `/api/v1/login?return=<path>`,
+which sends the browser to the identity provider and back; if it went
+there within the last 30 s it shows a prompt with a SIGN IN link
+instead, so a sign-in that does not take cannot loop. In `token` mode
+it shows a prompt for the API token, which it exchanges with
+`POST /api/v1/login` for a session cookie. When the link leaves Live and
+while it is down the
+page reads the session again (then every 5 s), so an ended session brings the
+prompt back, or in `oidc` mode goes to the sign-in again (within the
+same 30 s guard); a REST request answered 401 reads the session again
+too. The status bar names the user and role, and in `token` and
+`oidc` mode offers Sign out (`POST /api/v1/logout`), which in `oidc`
+mode continues to the provider's end-session endpoint when it has one.
+A viewer's write controls are locked with the reason "signed in as a
+viewer"; the server refuses a viewer's writes either way.
+
+`oidc` mode takes these settings, each in the configuration file, as a
+flag of `faderz` and as an environment variable; the flag wins over the
+variable and the variable over the file (`faderz --help`):
+
+| Key under `auth.oidc` | Flag | Variable | Default |
+| --- | --- | --- | --- |
+| `issuerUrl` | `--oidc-issuer-url` | `FADERZ_OIDC_ISSUER_URL` | required |
+| `clientId` | `--oidc-client-id` | `FADERZ_OIDC_CLIENT_ID` | required |
+| `clientSecret.file` | `--oidc-client-secret-file` | `FADERZ_OIDC_CLIENT_SECRET_FILE` | none: a public client |
+| `publicUrl` | `--oidc-public-url` | `FADERZ_OIDC_PUBLIC_URL` | required |
+| `roleClaim` | `--oidc-role-claim` | `FADERZ_OIDC_ROLE_CLAIM` | `groups` |
+| `scopes` | `--oidc-scopes` | `FADERZ_OIDC_SCOPES` | none besides `openid` |
+| `operatorRole` | `--oidc-operator-role` | `FADERZ_OIDC_OPERATOR_ROLE` | `faderz-operator` |
+| `viewerRole` | `--oidc-viewer-role` | `FADERZ_OIDC_VIEWER_ROLE` | none |
+| `allowedClients` | `--oidc-allowed-clients` | `FADERZ_OIDC_ALLOWED_CLIENTS` | the client id |
+| `audience` | `--oidc-audience` | `FADERZ_OIDC_AUDIENCE` | none: not checked |
+| `sessionTtl` | `--oidc-session-ttl` | `FADERZ_OIDC_SESSION_TTL` | `8h` |
+| `sessionKey.file` | `--oidc-session-key-file` | `FADERZ_OIDC_SESSION_KEY_FILE` | drawn per process |
+
+`auth.mode` is `--auth-mode` and `FADERZ_AUTH_MODE`. The redirect URI to
+register with the provider is `<publicUrl>/api/v1/login/callback`, and
+`<publicUrl>/` is the post-logout redirect URI. A user whose `roleClaim`
+holds `operatorRole` is an operator; any other user is a viewer, or,
+with `viewerRole` set, a viewer only when the claim holds that and
+refused otherwise. A value matches with or without a leading `/`, as
+group paths are written, and a `roleClaim` with `.` that is no
+top-level claim is followed as a path (`realm_access.roles`). The role is
+the one at sign-in; a change at the provider applies from the next one.
+A session lasts `sessionTtl` from the sign-in (seconds, or a number with
+`s`, `m`, `h` or `d`, 60 s to 7 d), whatever the ID token's lifetime.
+Signing out ends it on the replica that answers, for every copy of the
+cookie, and closes the WebSockets opened with it there; that replica
+holds the sign-out in memory, so another replica, or the same one after
+a restart, takes a copy of the cookie until it expires; WebSockets are
+also closed when it expires. `issuerUrl` and every endpoint the provider
+publishes need `https`, or `http` to a loopback address, as does
+`publicUrl`, and `sessionKey` needs 32 bytes or more. Without
+`sessionKey` a session holds on the process that signed it and ends when
+that restarts.
+
+API clients send the `auth.token` when one is configured, or an access
+token of the provider: not an ID token (no `nonce`, no `typ` `ID`), with
+an `azp` among `allowedClients`, and an `aud` holding `audience` when that
+is set. Keycloak puts `account` into an access token's `aud` and the
+client id only through an audience mapper; with `audience` unset, `azp`
+alone binds the token to the allowed clients. faderz logs at start
+which auth mode applies and whether the file, a flag or a variable set
+it.
+
 `window.__faderz` is a read-only view of the sync state for tests:
 `connection`, `standby`, `primaryReplica`, `standbyReplica`, `session`
 (dev builds only: the session id is a credential), `revision`,
@@ -204,11 +272,14 @@ only that answer.
 FADERZ_BIN=../target/debug/faderz npm run test:binary
 ```
 
-starts the binary three times, on ports 6471, 6481 and 6491
+starts the binary four times, on ports 6471, 6481, 6491 and 6501
 (`FADERZ_BINARY_PORT` moves the first; ops and NMOS take the two after
-each), in auth modes `none`, `token` and `proxy`, the last behind a
-stand-in authenticating proxy on 6495 (`tests/binary/proxy.mjs`) that
-drops identity headers a client sends and sets its own. Each mode loads
+each), in auth modes `none`, `token`, `proxy` and `oidc`: `proxy` behind
+a stand-in authenticating proxy on 6495 (`tests/binary/proxy.mjs`) that
+drops identity headers a client sends and sets its own, `oidc` against
+a stand-in OpenID provider on 6505 (`tests/binary/idp.mjs`) that signs
+alice in as an operator, with its settings given as flags and
+environment variables. Each mode loads
 the UI from the binary and writes through it, within the binary's
 Content-Security-Policy; tests tagged with a mode check what only that
 mode refuses. In `proxy` mode the binary takes who the identity headers
