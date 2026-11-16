@@ -8,11 +8,13 @@ use axum::extract::ws::{Message, WebSocket};
 use futures_util::future::BoxFuture;
 use samplez_replica::entry::SessionKey;
 use samplez_service::replica::{Ack, Begin, NotApplied, Resolution};
-use samplez_service::ws::{Admission, Answer, CatchUp, ClientQueue, Encode, Reply, serve_client};
+use samplez_service::ws::{
+    Admission, Answer, CatchUp, ClientQueue, Encode, Frame, Reply, To, serve_client,
+};
 use samplez_service::{Connect, Owner, OwnerHandle, Position};
 use serde_json::{Value, json};
 
-use crate::app::{App, splice};
+use crate::app::{App, SELECTIONS, splice};
 use crate::contract::{check, contract};
 use crate::state::{self, Action, Command, Control};
 
@@ -36,6 +38,7 @@ struct Hello {
 /// Serves one WebSocket client until it closes or fails.
 pub async fn serve(app: Arc<App>, socket: WebSocket, connect: Connect) {
     let queue = app.hub.subscribe(&connect.owner);
+    let _connected = app.connected(SessionKey::from(&connect.owner));
     let hello = Arc::new(Mutex::new(Hello::default()));
     let encoder = Encoder {
         app: app.clone(),
@@ -219,7 +222,18 @@ fn on_message<'a>(
         let mut h = hello.lock().expect("hello lock poisoned");
         h.kind = msg["kind"].as_str().map(str::to_owned);
         h.greet = true;
+        drop(h);
+        // Meter frames and control requests go to primary connections only.
         queue.set_primary(msg["mode"] == "primary");
+        // Queued now, sent once the answer to the hello has gone out.
+        let to = To::Connection {
+            principal: &connect.owner.principal,
+            connection: &connect.owner.connection,
+        };
+        app.hub.send(
+            to,
+            Frame::Status(SELECTIONS, app.selections_message().into()),
+        );
         return Reply::CatchUp(CatchUp {
             since: position(&msg),
             full: false,
@@ -245,6 +259,24 @@ fn on_message<'a>(
             grant(queue, kept);
             Reply::Promote(position(&msg))
         }
+        "select" => {
+            let owner = owner_record(&connect.owner, &client_kind);
+            app.select(
+                SessionKey::from(&connect.owner),
+                owner,
+                msg["element"].as_str(),
+            );
+            Reply::Now(None)
+        }
+        "request" => {
+            let (app, asker) = (app.clone(), owner_record(&connect.owner, &client_kind));
+            let (from, path) = (
+                SessionKey::from(&connect.owner),
+                msg["path"].as_str().unwrap_or_default().to_owned(),
+            );
+            tokio::spawn(async move { app.request(from, asker, path).await });
+            Reply::Now(None)
+        }
         "resync" => Reply::CatchUp(CatchUp {
             since: position(&msg),
             full: msg["full"] == true,
@@ -260,11 +292,6 @@ fn on_message<'a>(
             Reply::Now(None)
         }
         "set" | "touch" | "release" => control(app, connect, &client_kind, &msg, admission),
-        // Not commands and not answered (client-message.schema.json Select,
-        // Request). This replica does not deliver them yet: sending a
-        // selections or controlRequest message to other connections needs
-        // a server-initiated text frame that samplez-service does not have.
-        "select" | "request" => Reply::Now(None),
         // A type the contract has but this server does not handle: refused,
         // never taken for a command.
         _ => Reply::Now(Some(error(
@@ -404,4 +431,85 @@ fn refusal(app: &App, id: &str, path: &str, answer: &state::Answer) -> Message {
 fn grant(queue: &ClientQueue, n: u64) {
     let room = CREDIT_CAP.saturating_sub(queue.meter_credits());
     queue.grant_meter_credits(n.min(room));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::{app, owner, selected};
+    use axum::Router;
+    use axum::extract::ws::WebSocketUpgrade;
+    use axum::routing::get;
+    use futures_util::{SinkExt, StreamExt};
+    use samplez_service::ws::Sessions;
+    use samplez_service::{Identity, Role};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio::task::JoinHandle;
+    use tokio_tungstenite::tungstenite::Message as Sent;
+
+    /// A serve cancelled mid-connection still counts its connection
+    /// closed, so the session's selection goes with its last connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_serve_counts_its_connection_closed() {
+        let (app, dir) = app().await;
+        let session = "session-a-0123456789abcdef";
+        let sessions = Arc::new(Sessions::new("r1").unwrap());
+        let (served, mut serving) = mpsc::unbounded_channel::<JoinHandle<()>>();
+        let ws_app = app.clone();
+        let router = Router::new().route(
+            "/ws",
+            get(move |upgrade: WebSocketUpgrade| {
+                let (app, sessions, served) = (ws_app.clone(), sessions.clone(), served.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| async move {
+                        let mut owner = owner(session);
+                        owner.connection = crate::app::uuid().unwrap();
+                        let connect = Connect {
+                            identity: Identity {
+                                user: None,
+                                role: Role::Operator,
+                            },
+                            owner,
+                            sessions,
+                        };
+                        let _ = served.send(tokio::spawn(serve(app, socket, connect)));
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let key = SessionKey::from(&owner(session));
+        let hello = json!({ "type": "hello", "session": session, "kind": "ui", "mode": "primary" });
+
+        // Served once it answers: counted by then.
+        let (mut first, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let serve_first = serving.recv().await.unwrap();
+        first.send(Sent::text(hello.to_string())).await.unwrap();
+        first.next().await.unwrap().unwrap();
+        serve_first.abort();
+        assert!(serve_first.await.unwrap_err().is_cancelled());
+
+        let (mut second, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let serve_second = serving.recv().await.unwrap();
+        second.send(Sent::text(hello.to_string())).await.unwrap();
+        let select = json!({ "type": "select", "element": "ch1" });
+        second.send(Sent::text(select.to_string())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !selected(&app, &key) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("selected");
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(5), serve_second)
+            .await
+            .expect("the second connection ends")
+            .unwrap();
+        assert!(!selected(&app, &key), "gone with the last connection");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
