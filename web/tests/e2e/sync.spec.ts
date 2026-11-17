@@ -406,7 +406,7 @@ test('with every replica down the client disables every write control and sends 
   // The quorum slot says why writes are off: the link, not the quorum.
   const lock = page.getByTestId('quorum');
   await expect(lock).toHaveText('LOCK');
-  await expect(lock).toHaveAttribute('title', /^Every write control is disabled: (reconnecting|no replica reachable)$/);
+  await expect(lock).toHaveAttribute('title', /^Every write control is disabled: (connecting|no replica reachable)$/);
   await expect(slider).toHaveAttribute('aria-disabled', 'true');
   await expect(mute).toHaveAttribute('aria-disabled', 'true');
   await expect(page.locator('[role="slider"][aria-disabled="false"]')).toHaveCount(0);
@@ -493,4 +493,28 @@ test('a client never resumes onto a restored cluster that has committed past its
   await expect.poll(() => debug(page, 'connection')).toBe('Live');
   await expect(page.getByTestId('fader-value-ch19')).toHaveText(formatDb(-32));
   await expect.poll(async () => (await debug(page, 'revision')) === (await serverState(request)).revision).toBe(true);
+});
+
+test('connects on its first socket over a link whose requests and upgrade take 4 s, and never shows Offline', { tag: '@mock' }, async ({ page, request }) => {
+  // The page's session request is as slow as the upgrade, so the deadline
+  // it measures for the first socket leaves room for a 4 s open.
+  expect((await request.post('/__mock/slow-link?ms=4000')).ok()).toBe(true);
+  const sockets: string[] = [];
+  page.on('websocket', (ws) => {
+    if (ws.url().includes('/api/v1/ws')) sockets.push(ws.url());
+  });
+  await page.addInitScript(() => {
+    const seen: string[] = ((window as unknown as { __links: string[] }).__links = []);
+    const t = setInterval(() => {
+      const s = window.__faderz?.connection;
+      if (s !== undefined && seen.at(-1) !== s) seen.push(s);
+      if (s === 'Live') clearInterval(t);
+    }, 20);
+  });
+  await page.goto('/');
+  await expect(page.getByTestId('link')).toHaveAttribute('data-state', 'Live', { timeout: 20_000 });
+  const links = await page.evaluate(() => (window as unknown as { __links: string[] }).__links);
+  expect(links).not.toContain('Offline');
+  // The primary was the first socket; the standby the second, at most.
+  expect(sockets.length).toBeLessThanOrEqual(2);
 });

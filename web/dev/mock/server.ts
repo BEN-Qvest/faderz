@@ -49,6 +49,8 @@ export class MockServer {
   readonly cluster: Cluster;
   private readonly wss = new WebSocketServer({ noServer: true });
   private readonly routes: Route[];
+  /** Every REST request and WebSocket upgrade is answered this late, as over a slow link. */
+  private slowLinkMs = 0;
 
   /** `bindHost` is the host name the server is bound to, when it is one. */
   constructor(
@@ -66,13 +68,22 @@ export class MockServer {
 
   private upgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
     const url = new URL(req.url ?? '/', 'http://mock');
+    const one = /^\/__mock\/replicas\/([a-z0-9-]+)\/api\/v1\/ws$/.exec(url.pathname);
+    if (url.pathname !== `${API}/ws` && !one) return; // not ours, e.g. Vite's HMR socket
+    const ms = this.slowLinkMs;
+    if (ms === 0) return this.accept(req, socket, head, url, one?.[1]);
+    setTimeout(() => {
+      if (!socket.destroyed) this.accept(req, socket, head, url, one?.[1]);
+    }, ms);
+  }
+
+  /** Answers an upgrade of /api/v1/ws, or of the one replica `id` names. */
+  private accept(req: IncomingMessage, socket: Duplex, head: Buffer, url: URL, id: string | undefined): void {
     let replica;
-    if (url.pathname === `${API}/ws`) {
+    if (id === undefined) {
       replica = this.cluster.route();
     } else {
-      const m = /^\/__mock\/replicas\/([a-z0-9-]+)\/api\/v1\/ws$/.exec(url.pathname);
-      if (!m) return; // not ours, e.g. Vite's HMR socket
-      const r = this.cluster.replica(m[1]!);
+      const r = this.cluster.replica(id);
       replica = r && r.healthy && r.frozen === 'none' ? r : null;
     }
     const session = url.searchParams.get('session');
@@ -110,6 +121,13 @@ export class MockServer {
 
   /** Connect-style middleware; calls next() for anything it does not serve. */
   middleware = (req: IncomingMessage, res: ServerResponse, next: () => void): void => {
+    const ms = this.slowLinkMs;
+    const path = new URL(req.url ?? '/', 'http://mock').pathname;
+    if (ms === 0 || !(path.startsWith(API + '/') || /^\/__mock\/replicas\/[a-z0-9-]+\/api\//.test(path))) return this.serve(req, res, next);
+    setTimeout(() => this.serve(req, res, next), ms);
+  };
+
+  private serve(req: IncomingMessage, res: ServerResponse, next: () => void): void {
     const url = new URL(req.url ?? '/', 'http://mock');
     // REST of one replica, the base the client derives from a per-replica endpoint.
     const one = /^\/__mock\/replicas\/([a-z0-9-]+)(\/api\/v1\/.+)$/.exec(url.pathname);
@@ -132,7 +150,7 @@ export class MockServer {
       return;
     }
     void this.api(req, res, url.pathname.slice(API.length));
-  };
+  }
 
   /**
    * A REST request, through one replica when `via` is given, otherwise
@@ -374,6 +392,12 @@ export class MockServer {
     }
     if (method === 'POST' && path === '/__mock/audit/reset') {
       c.resetAudit();
+      return send(200, { ok: true });
+    }
+    if (method === 'POST' && path === '/__mock/slow-link') {
+      const ms = Number(url.searchParams.get('ms') ?? '0');
+      if (!Number.isFinite(ms) || ms < 0) return send(400, { error: 'ms must be a non-negative number' });
+      this.slowLinkMs = ms;
       return send(200, { ok: true });
     }
     if (method === 'POST' && path === '/__mock/drop-clients') {
