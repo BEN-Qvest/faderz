@@ -13,11 +13,11 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
 use samplez::rt::ProcessStatus;
-use samplez::{Counters, Engine, EntryError, GainError};
+use samplez::{Counters, Engine, EntryError, GainError, InputState, InputStatus};
 use samplez_dsp::StripParam;
 use samplez_replica::Replica;
 use samplez_service::ws::{Frame, Hub};
-use samplez_service::{Counter, Gauge, Ops, Position, ReplicatedState};
+use samplez_service::{Counter, Gauge, Metrics, Ops, Position, ReplicatedState};
 use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -56,6 +56,7 @@ pub struct Audio {
     taps: Mutex<Vec<mix::MeterTap>>,
     resends: Counter,
     resend_pending: Gauge,
+    inputs: Mutex<InputHealth>,
 }
 
 /// What the engine was sent: every coefficient, and each input's flow.
@@ -133,6 +134,7 @@ impl Audio {
                 "1 while a resend to the engine is pending; /readyz fails then.",
                 &[],
             ),
+            inputs: Mutex::new(InputHealth::new(metrics, shape)),
             ops,
         })
     }
@@ -335,6 +337,10 @@ impl Audio {
                 self.ops.heartbeat().beat();
             }
             let status = self.engine.status();
+            self.inputs
+                .lock()
+                .expect("input health lock poisoned")
+                .update(&status.inputs);
             let late = dropped(counters);
             match drops.tick(late, &status.diverged, tick.into_std()) {
                 Act::None => {}
@@ -354,6 +360,82 @@ impl Audio {
             hub.publish(Frame::Meters(frame.into()));
         }
     }
+}
+
+/// Each channel's input as the engine reads it, on `/metrics`.
+struct InputHealth {
+    attached: Vec<Gauge>,
+    margin: Vec<Gauge>,
+    /// Copied, late and too-late block counts, and the counts last added.
+    blocks: Vec<[(Counter, u64); 3]>,
+}
+
+impl InputHealth {
+    fn new(metrics: &Metrics, shape: &Shape) -> InputHealth {
+        let mut h = InputHealth {
+            attached: Vec::new(),
+            margin: Vec::new(),
+            blocks: Vec::new(),
+        };
+        for c in &shape.channels {
+            let l = [("channel", c.id.as_str())];
+            h.attached.push(metrics.gauge(
+                "faderz_input_attached",
+                "1 while the engine reads the channel's input flow, 0 while it is \
+                 pruned and polled until it is readable again.",
+                &l,
+            ));
+            h.margin.push(metrics.gauge(
+                "faderz_input_margin_needed_samples",
+                "The readerMarginSamples the channel's input needs when the \
+                 configured one is below it, from its late blocks or its \
+                 producer's batch hint; 0 when it suffices.",
+                &l,
+            ));
+            let count = |name, help| (metrics.counter(name, help, &l), 0);
+            h.blocks.push([
+                count(
+                    "faderz_input_copied_blocks_total",
+                    "Blocks of the channel's input read on time.",
+                ),
+                count(
+                    "faderz_input_late_blocks_total",
+                    "Blocks of the channel's input not read because its head was \
+                     below them at their deadline: silenced.",
+                ),
+                count(
+                    "faderz_input_too_late_blocks_total",
+                    "Blocks of the channel's input not read because the flow no \
+                     longer held them: silenced.",
+                ),
+            ]);
+        }
+        h
+    }
+
+    /// Follows the engine's input statuses, one per channel in shape
+    /// order.
+    fn update(&mut self, inputs: &[InputStatus]) {
+        for (i, input) in inputs.iter().enumerate().take(self.attached.len()) {
+            self.attached[i].set(f64::from(u8::from(input.state == InputState::Attached)));
+            self.margin[i].set(margin_needed(input) as f64);
+            let c = &input.counters;
+            for ((counter, last), now) in self.blocks[i]
+                .iter_mut()
+                .zip([c.copied, c.late, c.too_late])
+            {
+                counter.add(now.saturating_sub(*last));
+                *last = now;
+            }
+        }
+    }
+}
+
+/// The `readerMarginSamples` an input needs when the configured one is
+/// below it, the larger of what its late blocks and its producer's batch
+/// hint ask for; 0 when it suffices.
+fn margin_needed(input: &InputStatus) -> u64 {
+    input.margin_warning.max(input.margin_short).unwrap_or(0)
 }
 
 /// What [`Drops::tick`] asks for.
@@ -450,6 +532,28 @@ pub fn state_of(replica: &Replica<Mixer>) -> (Value, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The margin an input needs is the larger of the two the engine
+    /// reports, either of which may be absent.
+    #[test]
+    fn the_margin_needed_is_the_larger_report() {
+        let status = |warning, short| InputStatus {
+            name: "in".into(),
+            state: InputState::Attached,
+            up: true,
+            flow_id: String::new(),
+            error: None,
+            margin_short: short,
+            margin_warning: warning,
+            counters: Default::default(),
+            meters: Default::default(),
+        };
+        assert_eq!(margin_needed(&status(None, None)), 0);
+        assert_eq!(margin_needed(&status(Some(1303), None)), 1303);
+        assert_eq!(margin_needed(&status(None, Some(1008))), 1008);
+        assert_eq!(margin_needed(&status(Some(700), Some(1008))), 1008);
+        assert_eq!(margin_needed(&status(Some(1399), Some(1008))), 1399);
+    }
 
     /// A rise of a drop count or a new divergence resends, at most once
     /// per RESEND_EVERY, logged once per episode; generation_late is not
