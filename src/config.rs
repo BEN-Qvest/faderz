@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::contract::{check, contract};
-use crate::shape::Shape;
+use crate::shape::{Shape, loudness_channels};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -41,7 +41,8 @@ pub struct Config {
     pub mxl: Option<Mxl>,
     /// samplez's engine timing: `sampleRate`, `blockSize`,
     /// `readerMarginSamples`, `maxCatchupBlocks`, `pruneAfterBlocks`,
-    /// `rampSamples`. samplez checks the values and supplies defaults.
+    /// `rampSamples`. samplez checks the values and supplies defaults,
+    /// but for `readerMarginSamples`, [`READER_MARGIN`] here.
     #[serde(default)]
     pub engine: Map<String, Value>,
     /// samplez's RT thread settings (`enabled`, `priority`, `rtCpu`).
@@ -101,6 +102,12 @@ pub struct Output {
     #[serde(default)]
     pub domain: Option<String>,
 }
+
+/// `readerMarginSamples` when the configuration sets none: 32 ms. An
+/// input read through a copy of a flow on another node has needed 1303
+/// to 1399 samples, which samplez's default of 576 reads almost wholly
+/// late; the margin delays every output by as much.
+pub const READER_MARGIN: u32 = 1536;
 
 /// The `engine` keys faderz passes to samplez; the others it sets itself.
 const ENGINE_KEYS: [&str; 6] = [
@@ -474,7 +481,8 @@ impl Config {
 impl Config {
     /// The engine configuration of the `mxl` section, with a matrix of
     /// zeros: one input per channel reading its flow of input a, one
-    /// output per output of the shape.
+    /// output per output of the shape, and one meter per bus, aux,
+    /// mix-minus and monitor output no output carries.
     fn audio(&self, shape: &Shape) -> Result<Option<samplez::Config>, String> {
         let Some(mxl) = &self.mxl else {
             return Ok(None);
@@ -512,6 +520,7 @@ impl Config {
                 "domain": domain(at, &input.domain)?,
                 "flowId": input.flow,
                 "channels": c.width,
+                "loudnessChannels": loudness_channels(&c.layout),
             }));
         }
         let mut outputs = Vec::new();
@@ -526,8 +535,27 @@ impl Config {
                 "group": o.id,
                 "role": "Audio",
                 "channels": o.width,
+                "loudnessChannels": loudness_channels(&o.layout),
             }));
         }
+        let columns = shape.meter_columns();
+        if columns.len() > samplez::config::MAX_METERS {
+            return Err(format!(
+                "shape: {} buses, auxes, mix-minus and monitor outputs have no output, \
+                 the engine meters at most {} of them; add outputs for the others",
+                columns.len(),
+                samplez::config::MAX_METERS
+            ));
+        }
+        let meters: Vec<Value> = (columns.into_iter())
+            .map(|(id, width, layout)| {
+                json!({
+                    "name": id,
+                    "channels": width,
+                    "loudnessChannels": loudness_channels(layout),
+                })
+            })
+            .collect();
         if let Some(id) = mxl.inputs.keys().find(|id| !shape.is_channel(id)) {
             return Err(format!("mxl.inputs.{id}: not a channel of the shape"));
         }
@@ -537,8 +565,14 @@ impl Config {
             return Err(format!("mxl.outputs.{id}: not an output of the shape"));
         }
         let rows: usize = shape.channels.iter().map(|c| c.width).sum();
-        let columns: usize = shape.outputs.iter().map(|o| o.width).sum();
-        let mut v = Value::Object(self.engine.clone());
+        let columns: usize = (shape.outputs.iter().map(|o| o.width))
+            .chain(shape.meter_columns().iter().map(|m| m.1))
+            .sum();
+        let mut engine = self.engine.clone();
+        engine
+            .entry("readerMarginSamples")
+            .or_insert(json!(READER_MARGIN));
+        let mut v = Value::Object(engine);
         v["libmxl"] = json!(mxl.library_path);
         v["domains"] = mxl
             .domains
@@ -547,6 +581,7 @@ impl Config {
             .collect();
         v["inputs"] = json!(inputs);
         v["outputs"] = json!(outputs);
+        v["meters"] = json!(meters);
         v["matrix"] = json!(vec![vec![0.0f32; columns]; rows]);
         v["rt"] = Value::Object(self.rt.clone());
         let engine =
@@ -788,5 +823,60 @@ mod tests {
         assert!(e.contains("mxl.inputs.ch1.altFlow: required"), "{e}");
         let ok = config(json!({ "flow": id(1), "altFlow": id(5) }));
         Config::parse(&ok, || unreachable!()).unwrap();
+
+        // Each bus, aux, mix-minus and monitor output no output carries
+        // is an engine meter on matrix columns after the outputs', and
+        // each leg is weighted for loudness by its layout.
+        let (c, ..) = Config::parse(&ok, || unreachable!()).unwrap();
+        let e = c.audio.unwrap();
+        let meters: Vec<_> = e
+            .meters
+            .iter()
+            .map(|m| (m.name.as_str(), m.channels))
+            .collect();
+        assert_eq!(meters, [("cf", 2), ("aux1", 1), ("mm1", 2), ("mon", 2)]);
+        assert_eq!((e.columns(), e.matrix[0].len()), (9, 9));
+        let stereo = Some(vec!["L".to_owned(), "R".to_owned()]);
+        assert_eq!(e.inputs[2].loudness_channels, stereo);
+        assert_eq!(e.meters[0].loudness_channels, stereo);
+        assert_eq!(e.reader_margin_samples, READER_MARGIN);
+
+        let mut set: Value = serde_json::from_str(&ok).unwrap();
+        set["engine"] = json!({ "readerMarginSamples": 960 });
+        let (c, ..) = Config::parse(&set.to_string(), || unreachable!()).unwrap();
+        assert_eq!(c.audio.unwrap().reader_margin_samples, 960);
+    }
+
+    /// More buses, auxes, mix-minus and monitor outputs without an output
+    /// than the engine has meters for refuse the configuration, naming
+    /// the limit; as many as it has are taken.
+    #[test]
+    fn more_uncarried_elements_than_engine_meters_are_refused() {
+        let id = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+        let config = |auxes: usize| {
+            let mut shape = small();
+            // cf, mm1 and mon have no output: aux1 and the added auxes
+            // make up the rest.
+            let aux = |i: usize| json!({ "id": format!("aux{i}"), "name": "a", "width": 1, "layout": "mono" });
+            shape["auxes"] = (1..=auxes).map(aux).collect();
+            json!({
+                "replica": { "name": "r1" },
+                "shape": shape,
+                "mxl": {
+                    "domains": [{ "name": "d", "path": "/dev/shm/d" }],
+                    "inputs": {
+                        "ch1": { "flow": id(1), "altFlow": id(5) },
+                        "ch2": { "flow": id(2) },
+                        "st1": { "flow": id(3) },
+                    },
+                    "outputs": { "out-pgm": { "flow": id(4) } },
+                },
+            })
+            .to_string()
+        };
+        let max = samplez::config::MAX_METERS;
+        Config::parse(&config(max - 3), || unreachable!()).unwrap();
+        let e = Config::parse(&config(max - 2), || unreachable!()).unwrap_err();
+        assert!(e.contains(&format!("at most {max}")), "{e}");
     }
 }
