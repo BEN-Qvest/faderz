@@ -1,8 +1,8 @@
 //! The configuration file: listeners, auth and API settings of
-//! samplez-service, where the replicated state lives, the shape, and the
-//! MXL flows the engine reads and writes. The auth settings in
-//! [`SETTINGS`] can also be given as command-line flags or environment
-//! variables.
+//! samplez-service, where the replicated state lives, the shape, the
+//! declared consoles, and the MXL flows the engine reads and writes. The
+//! auth settings in [`SETTINGS`] can also be given as command-line flags
+//! or environment variables.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ use serde_json::{Map, Value, json};
 
 use crate::contract::{check, contract};
 use crate::shape::{Shape, loudness_channels};
+use crate::state::Console;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -35,6 +36,11 @@ pub struct Config {
     pub replica: ReplicaConfig,
     /// Model `Shape`.
     pub shape: Value,
+    /// Consoles known before any registers: in `/consoles` from the start,
+    /// named by this list, never removed. `protocol` defaults to `mcu`,
+    /// `transport` to `bridge`, `strips` to 8.
+    #[serde(default)]
+    pub consoles: Vec<Console>,
     /// The MXL flows of the audio. Absent, faderz runs no engine: the
     /// state is served, nothing is mixed, and `/readyz` fails.
     #[serde(default)]
@@ -499,6 +505,13 @@ impl Config {
             ));
         }
         let mut shape = Shape::parse(&config.shape).map_err(|e| format!("shape: {e}"))?;
+        for (i, c) in config.consoles.iter().enumerate() {
+            check(&contract().console_status, &c.status(None, false, 0))
+                .map_err(|e| format!("consoles[{i}]: {e}"))?;
+            if config.consoles[..i].iter().any(|d| d.id == c.id) {
+                return Err(format!("consoles[{i}].id {:?}: used twice", c.id));
+            }
+        }
         let mut config = config;
         config.audio = config.audio(&shape)?;
         config.label_sources(&mut shape)?;
@@ -920,6 +933,49 @@ mod tests {
         set["engine"] = json!({ "readerMarginSamples": 960 });
         let (c, ..) = Config::parse(&set.to_string(), || unreachable!()).unwrap();
         assert_eq!(c.audio.unwrap().reader_margin_samples, 960);
+    }
+
+    /// Declared consoles take defaults; a console the contract refuses or
+    /// an id used twice refuses the configuration.
+    #[test]
+    fn consoles_are_checked_and_take_defaults() {
+        let config = |consoles: Value| {
+            json!({ "replica": { "name": "r1" }, "shape": small(), "consoles": consoles })
+                .to_string()
+        };
+        let (c, ..) = Config::parse(
+            &config(json!([
+                { "id": "xt-1", "name": "X-Touch" },
+                { "id": "osc-1", "name": "Tablet", "protocol": "osc", "transport": "osc-udp", "strips": 16 },
+            ])),
+            || unreachable!(),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                c.consoles[0].protocol.as_str(),
+                c.consoles[0].transport.as_str(),
+                c.consoles[0].strips
+            ),
+            ("mcu", "bridge", 8)
+        );
+        assert_eq!(c.consoles[1].strips, 16);
+        let (c, ..) = Config::parse(&with(json!({ "name": "r1" })), || unreachable!()).unwrap();
+        assert!(c.consoles.is_empty());
+        let refused =
+            |consoles: Value| Config::parse(&config(consoles), || unreachable!()).unwrap_err();
+        let e = refused(json!([{ "id": "a", "name": "A" }, { "id": "a", "name": "B" }]));
+        assert!(e.contains("consoles[1].id \"a\": used twice"), "{e}");
+        let e = refused(json!([{ "id": "Bad", "name": "A" }]));
+        assert!(e.contains("consoles[0]"), "{e}");
+        let e = refused(json!([{ "id": "a", "name": "" }]));
+        assert!(e.contains("consoles[0]"), "{e}");
+        let e = refused(json!([{ "id": "a", "name": "A", "strips": 0 }]));
+        assert!(e.contains("consoles[0]"), "{e}");
+        let e = refused(json!([{ "id": "a", "name": "A", "protocol": "midi" }]));
+        assert!(e.contains("consoles[0]"), "{e}");
+        let e = refused(json!([{ "id": "a", "name": "A", "bankOffset": 0 }]));
+        assert!(e.contains("bankOffset"), "{e}");
     }
 
     /// A channel's 1-based flow channels reach the engine 0-based, one
