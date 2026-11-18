@@ -1,7 +1,7 @@
 //! The samplez engine under the replicated state: started with the gain
 //! matrix of the state it opens with, it is sent every channel's strip,
-//! then follows every applied delta with strip and gain changes and input
-//! routes at the delta's `atIndex`, and its meters go to the primary
+//! then follows every applied delta with strip, duck and gain changes and
+//! input routes at the delta's `atIndex`, and its meters go to the primary
 //! connections as meter frames.
 //!
 //! In a set of one the engine keeps its own log ([`Engine::start`]): the
@@ -21,7 +21,8 @@ use std::time::Duration;
 use openraft::ServerState;
 use samplez::rt::ProcessStatus;
 use samplez::{
-    Counters, Engine, EntryError, GainError, InputState, InputStatus, Replication, Report,
+    Counters, DuckSetting, DuckTargets, Engine, Entry, EntryError, GainError, InputState,
+    InputStatus, Replication, Report, Targets,
 };
 use samplez_dsp::StripParam;
 use samplez_replica::Replica;
@@ -110,6 +111,9 @@ struct Sent {
     /// not sent, as all are at start: the engine's strip passes its input
     /// unchanged until set.
     strips: Vec<Vec<Option<StripParam>>>,
+    /// The duck groups and masks the engine holds, as targets; `None`
+    /// after a resend asked for, when every setting and mask goes again.
+    ducks: Option<Targets>,
 }
 
 impl Sent {
@@ -120,6 +124,7 @@ impl Sent {
     fn clear(&mut self, engine: &Engine) {
         self.matrix.iter_mut().flatten().for_each(|g| *g = f32::NAN);
         self.strips.iter_mut().flatten().for_each(|p| *p = None);
+        self.ducks = None;
         for (routed, input) in self.routed.iter_mut().zip(engine.status().inputs) {
             *routed = input.flow_id;
         }
@@ -289,6 +294,12 @@ impl Audio {
                 .iter()
                 .map(|c| vec![None; strip::params(&Value::Null, c.width).len()])
                 .collect(),
+            // What an engine holds before any duck entry: every group at
+            // its defaults and every mask 0.
+            ducks: Some(Targets {
+                ducks: vec![DuckTargets::default(); self.shape.ducks.len()],
+                ..Targets::default()
+            }),
         };
         self.apply(&state, &mut sent, 0, true).await;
         // A resend asked for meanwhile marks it ready once done. The lock
@@ -344,10 +355,10 @@ impl Audio {
         }
     }
 
-    /// Sends the engine every strip parameter and coefficient of `state`'s
-    /// targets ([`mix::targets`]) that differs from what it was sent, and
-    /// a route for every channel whose selected flow differs, all at `at`
-    /// rounded up to a block. When the engine no
+    /// Sends the engine every strip parameter, duck setting, duck mask and
+    /// coefficient of `state`'s targets ([`mix::targets`]) that differs
+    /// from what it was sent, and a route for every channel whose selected
+    /// flow differs, all at `at` rounded up to a block. When the engine no
     /// longer takes that index, the rest of the diff goes at the earliest
     /// one it does; while it holds as many changes as it takes, the next
     /// waits. With `settle`, the gains wait for the strips' ramps.
@@ -365,6 +376,42 @@ impl Audio {
                 }
             }
         }
+        let next = Targets {
+            ducks: targets.ducks,
+            masks: targets.masks,
+            ..Targets::default()
+        };
+        let entries = match &sent.ducks {
+            Some(held) => held.diff(&next),
+            None => next.assert(&[], None),
+        };
+        let mut held = sent.ducks.take().unwrap_or_default();
+        let mut refused = false;
+        for entry in entries {
+            let took = match &entry {
+                Entry::Duck { group, setting } => {
+                    let set = |at| self.engine.set_duck(*group, setting.clone(), at);
+                    self.send(&mut at, set).await
+                }
+                &Entry::DuckMask {
+                    input,
+                    output,
+                    mask,
+                } => {
+                    let set = |at| self.engine.set_duck_mask(input, output, mask, at);
+                    self.send(&mut at, set).await
+                }
+                _ => continue,
+            };
+            if took {
+                hold_entry(&mut held, entry);
+            } else {
+                refused = true;
+            }
+        }
+        // After a refusal every setting and mask goes again on the next
+        // write.
+        sent.ducks = (!refused).then_some(held);
         if settle {
             at = (at + self.ramp).next_multiple_of(self.block);
         }
@@ -381,6 +428,8 @@ impl Audio {
             }
         }
         for (slot, flow) in targets.flows.into_iter().enumerate() {
+            // Every channel reads a flow: no target detaches one.
+            let Some(flow) = flow else { continue };
             while flow != sent.routed[slot] {
                 match self.engine.route(slot, &flow, at) {
                     Ok(_) => sent.routed[slot].clone_from(&flow),
@@ -482,6 +531,45 @@ impl Audio {
         values.insert("input_too_late_blocks_total".into(), json!(too_late));
         values.insert("resends_total".into(), json!(self.resent.load(Relaxed)));
         Value::Object(values)
+    }
+}
+
+/// Notes in `held` the duck setting or mask `entry` sent.
+fn hold_entry(held: &mut Targets, entry: Entry) {
+    match entry {
+        Entry::Duck { group, setting } => {
+            if held.ducks.len() <= group {
+                held.ducks.resize(group + 1, DuckTargets::default());
+            }
+            let d = &mut held.ducks[group];
+            match setting {
+                DuckSetting::Detector(p) => d.params = *p,
+                DuckSetting::Keys(k) => d.keys = k,
+                DuckSetting::Mode(m) => d.mode = m,
+                DuckSetting::Hold { held } => d.held = held,
+                DuckSetting::Depth { slot, db } => {
+                    if d.depths.len() <= slot {
+                        d.depths.resize(slot + 1, 0.0);
+                    }
+                    d.depths[slot] = db;
+                }
+            }
+        }
+        Entry::DuckMask {
+            input,
+            output,
+            mask,
+        } => {
+            if held.masks.len() <= input {
+                held.masks.resize(input + 1, Vec::new());
+            }
+            let row = &mut held.masks[input];
+            if row.len() <= output {
+                row.resize(output + 1, 0);
+            }
+            row[output] = mask;
+        }
+        _ => {}
     }
 }
 

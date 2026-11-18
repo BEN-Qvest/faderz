@@ -37,7 +37,9 @@ export const SELECTIONS_INTERVAL_MS = 100;
 /** First byte of a binary meter frame, ASCII 'M'. */
 export const METER_FRAME_MAGIC = 0x4d;
 /** Format version in the second byte of a binary meter frame. */
-export const METER_FRAME_VERSION = 3;
+export const METER_FRAME_VERSION = 4;
+/** Int16 duck envelope value of a full envelope, 1. */
+export const METER_ENVELOPE_FULL = 10000;
 /** Int16 meter value meaning null, a loudness or correlation of -Infinity, or no measurement. */
 export const METER_NULL = -32768;
 /** Int16 meter value of a leg of digital silence, -Infinity: -120 dB, the floor of a leg. */

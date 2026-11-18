@@ -25,6 +25,9 @@ pub const STALE_TOUCH_MS: u64 = 1500;
 /// A duck key let go sooner than this after its press was a tap, as the
 /// web UI's talk key tells a tap from a hold.
 pub const LATCH_MS: u64 = 300;
+/// A duck reading older than this, 3 meter periods of 40 ms, no longer
+/// lights a duck key.
+pub const DUCK_STALE_MS: u64 = 120;
 
 /// What a duck key does with its group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -674,7 +677,7 @@ impl Surface {
                 .map(|note| {
                     let led = self
                         .duck_key(engine, i, note)
-                        .map_or(Led::Off, |k| duck_led(engine, &k.duck));
+                        .map_or(Led::Off, |k| duck_led(engine, &k.duck, now));
                     (note, led)
                 })
                 .collect();
@@ -820,13 +823,19 @@ impl Surface {
 }
 
 /// A duck key's LED: on while the group is held or latched in, blinking
-/// while it is bypassed (`mode` `off`), else off.
-fn duck_led(engine: &Engine, duck: &str) -> Led {
+/// while it is bypassed (`mode` `off`) and not held, on while it ducks its
+/// targets by a meter frame younger than `DUCK_STALE_MS`, else off.
+fn duck_led(engine: &Engine, duck: &str, now: u64) -> Led {
     let at = |leaf: &str| engine.display(&format!("/ducks/{duck}/{leaf}")).cloned();
+    let ducking = engine
+        .duck(duck)
+        .is_some_and(|d| d.envelope > 0.0 && now < d.at + DUCK_STALE_MS);
     if at("hold") == Some(json!(true)) || at("mode") == Some(json!("on")) {
         Led::On
     } else if at("mode") == Some(json!("off")) {
         Led::Blink
+    } else if ducking {
+        Led::On
     } else {
         Led::Off
     }
@@ -846,6 +855,7 @@ mod tests {
     use super::*;
     use crate::engine::Action;
     use crate::engine::tests::{engine, live, sent};
+    use crate::meters::Layout;
 
     fn units(n: usize) -> Vec<UnitSpec> {
         (0..n)
@@ -1147,7 +1157,7 @@ mod tests {
         let duck = json!({ "mode": "auto", "hold": false });
         let snapshot = json!({ "type": "snapshot", "replica": { "id": "r1", "role": "leader" },
             "you": {}, "epoch": "1", "revision": 5,
-            "shape": { "channels": [{ "id": "ch1", "name": "Mic 1" }], "buses": [],
+            "shape": { "channels": [{ "id": "ch1", "name": "Mic 1", "width": 1 }], "buses": [],
                 "ducks": [{ "id": "comm", "name": "Commentary A" }, { "id": "comm-b", "name": "Commentary B" }] },
             "state": { "channels": { "ch1": { "fader": -90, "mute": false, "solo": "off" } },
                 "ducks": { "comm": duck, "comm-b": duck }, "consoles": [] },
@@ -1495,6 +1505,44 @@ mod tests {
             json!([]),
         );
         assert_eq!(led(&mut s, &e, 5), vec![0], "auto");
+    }
+
+    #[test]
+    fn function_key_leds_light_while_the_group_ducks_until_the_frames_go_stale() {
+        let mut e = ducking();
+        let layout = Layout::of(&e.mirror().shape).expect("a layout");
+        let frame = |envelope: i16| layout.frame(&[[-2000, envelope, 1], [i16::MIN, 0, 0]]);
+        let mut s = Surface::new(units(1), None);
+        let led = |s: &mut Surface, e: &Engine, now| {
+            s.render(e, now)
+                .into_iter()
+                .filter(|(u, m)| *u == 0 && m[..2] == [0x90, F1])
+                .map(|(_, m)| m[2])
+                .collect::<Vec<u8>>()
+        };
+        assert_eq!(led(&mut s, &e, 0), vec![0], "auto, no frames");
+        e.binary(1, &frame(5000), 10);
+        assert_eq!(led(&mut s, &e, 10), vec![0x7f], "ducking");
+        e.binary(1, &frame(2500), 50);
+        assert_eq!(led(&mut s, &e, 50), Vec::<u8>::new(), "sent once");
+        e.binary(1, &frame(0), 90);
+        assert_eq!(led(&mut s, &e, 90), vec![0], "engaged, not yet ducking");
+        e.binary(1, &frame(10_000), 130);
+        assert_eq!(led(&mut s, &e, 130), vec![0x7f]);
+        assert_eq!(led(&mut s, &e, 130 + DUCK_STALE_MS - 1), Vec::<u8>::new());
+        assert_eq!(
+            led(&mut s, &e, 130 + DUCK_STALE_MS),
+            vec![0],
+            "stale: the state alone"
+        );
+        delta(
+            &mut e,
+            6,
+            json!([{ "path": MODE, "value": "off" }]),
+            json!([]),
+        );
+        e.binary(1, &frame(5000), 300);
+        assert_eq!(led(&mut s, &e, 300), vec![1], "bypassed: blinks");
     }
 
     #[test]

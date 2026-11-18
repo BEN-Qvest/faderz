@@ -10,8 +10,9 @@
 //! and their levels, bus, aux and mix-minus faders, mutes and polarity,
 //! the mix-minus exclusions, and the monitor's source, downmix, level,
 //! dim, cut, mono and speaker mutes and solos. Everything else in the
-//! state is the input's strip ([`crate::strip`]) or is kept and not
-//! applied. [`targets`] adds the strips and each input's flow.
+//! state is the input's strip ([`crate::strip`]), a duck group
+//! ([`crate::duck`]) or is kept and not applied. [`targets`] adds the
+//! strips, the duck groups and their masks, and each input's flow.
 //!
 //! Every value is computed with `libm`, not the host's math library, so
 //! replicas on other hosts derive the same bits from the same state.
@@ -24,12 +25,18 @@ use serde_json::Value;
 
 use crate::shape::Shape;
 use crate::state::tokens;
-use crate::strip;
+use crate::{duck, strip};
 
 /// A fader at this level or below is closed.
 const CLOSED_DB: f64 = -90.0;
 /// The most a channel's fader and VCA offsets add up to.
 const MAX_CHANNEL_DB: f64 = 20.0;
+
+/// The gain of channel `id` after its fader, mute and VCAs, before AFV,
+/// the same on every leg.
+pub fn post_fader(state: &Value, id: &str) -> f64 {
+    channel(state, id, Tap::PostFader)
+}
 
 /// Linear gain of `db`, 0 at [`CLOSED_DB`] and below.
 pub fn gain(db: f64) -> f64 {
@@ -174,7 +181,7 @@ fn gains(shape: &Shape, state: &Value, factors: &[Factors]) -> Vec<Vec<f32>> {
 
 /// The element each of the matrix's columns carries and its width: the
 /// outputs, then the meter columns ([`Shape::meter_columns`]).
-fn columns(shape: &Shape) -> Vec<(&str, usize)> {
+pub(crate) fn columns(shape: &Shape) -> Vec<(&str, usize)> {
     let outputs = shape.outputs.iter().map(|o| (o.source.as_str(), o.width));
     let meters = shape.meter_columns().into_iter().map(|(id, w, _)| (id, w));
     outputs.chain(meters).collect()
@@ -220,8 +227,10 @@ fn flow(state: &Value, id: &str, w: &Wiring) -> String {
 }
 
 /// Everything the engine of `shape` plays from `state`: the gain matrix
-/// ([`matrix`]), each channel's strip ([`strip::params`]) and the flow
-/// its selected input reads ([`selected`]), one slot per channel.
+/// ([`matrix`]), each channel's strip ([`strip::params`]), the duck
+/// groups ([`duck::targets`]) and masks ([`duck::masks`]) and the flow
+/// its selected input reads ([`selected`]), one slot per channel. Every
+/// output is enabled.
 pub fn targets(shape: &Shape, wiring: &[Wiring], state: &Value) -> Targets {
     Derived::new(shape, wiring, state).targets
 }
@@ -254,6 +263,9 @@ struct Moved {
     /// The strips and flows of these slots.
     strips: BTreeSet<usize>,
     flows: BTreeSet<usize>,
+    /// The duck masks: a group's targets or destinations, or the
+    /// monitor's source.
+    masks: bool,
 }
 
 impl Derived {
@@ -278,10 +290,16 @@ impl Derived {
         Derived {
             targets: Targets {
                 gains: gains(shape, state, &factors),
-                flows: selected(shape, wiring, state),
+                flows: selected(shape, wiring, state)
+                    .into_iter()
+                    .map(Some)
+                    .collect(),
                 strips: (shape.channels.iter())
                     .map(|c| strip::params(&state["channels"][&c.id], c.width))
                     .collect(),
+                ducks: duck::targets(shape, state),
+                masks: duck::masks(shape, state),
+                outputs: Vec::new(),
             },
             factors,
             first,
@@ -349,7 +367,15 @@ impl Derived {
             self.targets.strips[slot] = strip::params(&state["channels"][&c.id], c.width);
         }
         for slot in moved.flows {
-            self.targets.flows[slot] = flow(state, &shape.channels[slot].id, &wiring[slot]);
+            self.targets.flows[slot] = Some(flow(state, &shape.channels[slot].id, &wiring[slot]));
+        }
+        // A handful of groups, each read in full: a key gain follows its
+        // channel's fader, mute and VCAs, which any write can move.
+        if !shape.ducks.is_empty() {
+            self.targets.ducks = duck::targets(shape, state);
+        }
+        if moved.masks {
+            self.targets.masks = duck::masks(shape, state);
         }
     }
 }
@@ -425,11 +451,18 @@ impl Moved {
                 (Some("buses" | "auxes" | "mixMinus"), Some(id)) => {
                     moved.elements.insert(id.to_owned());
                 }
-                (Some("monitor"), _) => moved.monitor = true,
+                (Some("monitor"), _) => {
+                    moved.monitor = true;
+                    moved.masks |= matches!(id, None | Some("source"));
+                }
+                // A group, or a group's triggers, targets or destinations.
+                (Some("ducks"), _) => {
+                    moved.masks |= t.len() < 4 || duck::routing_of(path).is_some();
+                }
                 (
                     Some(
-                        "ducks" | "tally" | "loudness" | "recallSafe" | "scenes" | "consoles"
-                        | "metering" | "tone" | "sceneRecalled",
+                        "tally" | "loudness" | "recallSafe" | "scenes" | "consoles" | "metering"
+                        | "tone" | "sceneRecalled",
                     ),
                     _,
                 ) => {}

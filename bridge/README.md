@@ -272,7 +272,7 @@ UI shows the bridge's controls as `<console> (<user>)`.
 | SELECT | Selects the strip's channel (`select`); the LED shows the selection, and blinks while the strip's fader is held by another session |
 | REC | Read, no action, unless `keys` binds it to a duck group |
 | F1 to F8 (X-Touch) | The shape's duck groups in order, or what `keys` binds. Pressed, the key touches the group's `/ducks/<id>/hold` and sets it `true`; let go, it releases it, which sets it `false`. Let go within 300 ms, a tap, it first sets `/ducks/<id>/mode` to `on`, or to `auto` when it is `on`; a group in `off` (bypassed) keeps it, as only a screen or the API sets and ends a bypass. On a group in `off` the key touches and holds only once it has been down 300 ms, so a tap sends nothing; a longer press holds it despite the bypass. A key bound with `hold` only holds, one bound with `latch` only toggles the mode on each press. The bridge sets no depth or timing: the group's settings apply as for any other cause |
-| F1 to F8 LEDs | On while the group's `hold` is `true` or its `mode` is `on`, blinking while its `mode` is `off` (bypassed), else off |
+| F1 to F8 LEDs | On while the group's `hold` is `true` or its `mode` is `on`, blinking while its `mode` is `off` (bypassed) and it is not held, on while it ducks its targets, else off |
 | BANK left/right | Moves every unit by all their strips together; each unit's `bankOffset` follows |
 | CHANNEL left/right | Moves by one channel |
 | Master fader (X-Touch) | `master`, or the program bus's fader |
@@ -289,9 +289,11 @@ toggles the mode, which no session owns, so the duck stays latched in
 once the holder lets go. While a key of a bypassed group is down, line
 2 reads `<group name> bypassed`. After messages
 from a network surface went missing, a held duck key is let go after
-1.5 seconds, as a key cannot show that it is still down. The F-key LEDs
-show the manual state only; a duck its detector triggers does not light
-them.
+1.5 seconds, as a key cannot show that it is still down. A duck key
+also lights while its group ducks its targets, whatever the cause: the
+envelope of the group's last meter frame is above 0. A reading older
+than 120 ms (3 meter periods) lights nothing, and the LED shows the
+state alone.
 
 ## Connection
 
@@ -304,6 +306,13 @@ dropped 3 s after they were issued. After every snapshot or resume on a
 new primary connection it releases every control its session owns that
 no fader holds, touches again what a held fader lost, and registers its
 consoles again.
+
+On a shape with duck groups the primary connection takes meter frames:
+the bridge grants the cap of 8 credits once live and tops them up to 8
+whenever 4 or fewer are left, and reads only the duck section of each
+frame. A frame whose version, layout fingerprint or length does not
+match the last snapshot's shape is dropped; one of another fingerprint
+sends a `resync` with `full`, once per layout. The standby takes none.
 
 ## Tests
 

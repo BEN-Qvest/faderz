@@ -4,21 +4,23 @@
 // output: peak, truePeak and rms legs, then momentary, shortTerm,
 // integrated, lra, maxMomentary, maxShortTerm, correlation (NaN for null)
 // and flags (bit 0 integratedValid, bit 1 lraStable). Per monitor output:
-// peak legs.
+// peak legs. Per duck group: key (NaN for null), envelope and flags (bit 0
+// engaged).
 
 import type { MeterFrame, MeterLayout } from '../contract/meterFrame';
 import type { BusMeter, Loudness } from '../contract/types';
 
-export type MeterGroup = 'channels' | 'buses' | 'auxes' | 'mixMinus' | 'monitor';
+export type MeterGroup = 'channels' | 'buses' | 'auxes' | 'mixMinus' | 'monitor' | 'ducks';
 
 export interface MeterSlot {
   offset: number;
   legs: number;
-  kind: 'channel' | 'bus' | 'monitor';
+  kind: 'channel' | 'bus' | 'monitor' | 'duck';
 }
 
-const GROUPS: readonly MeterGroup[] = ['channels', 'buses', 'auxes', 'mixMinus', 'monitor'];
-const SIZE = { channel: (legs: number) => 2 * legs + 1, bus: (legs: number) => 3 * legs + 8, monitor: (legs: number) => legs };
+const GROUPS: readonly MeterGroup[] = ['channels', 'buses', 'auxes', 'mixMinus', 'monitor', 'ducks'];
+const KIND = { channels: 'channel', buses: 'bus', auxes: 'bus', mixMinus: 'bus', monitor: 'monitor', ducks: 'duck' } as const;
+const SIZE = { channel: (legs: number) => 2 * legs + 1, bus: (legs: number) => 3 * legs + 8, monitor: (legs: number) => legs, duck: () => 3 };
 
 export const slotKey = (group: MeterGroup, id: string) => `${group}/${id}`;
 
@@ -27,7 +29,7 @@ export function meterSlots(layout: MeterLayout): Map<string, MeterSlot> {
   const slots = new Map<string, MeterSlot>();
   let offset = 0;
   for (const group of GROUPS) {
-    const kind = group === 'channels' ? 'channel' : group === 'monitor' ? 'monitor' : 'bus';
+    const kind = KIND[group];
     for (const e of layout[group]) {
       slots.set(slotKey(group, e.id), { offset, legs: e.legs, kind });
       offset += SIZE[kind](e.legs);
@@ -60,5 +62,10 @@ export function flattenMeterFrame(layout: MeterLayout, frame: MeterFrame): Float
     loud(b.loudness, b.correlation);
   }
   for (const m of frame.monitor) put(m.peak);
+  for (const d of frame.ducks) {
+    out[o++] = d.key ?? Number.NaN;
+    out[o++] = d.envelope;
+    out[o++] = d.engaged ? 1 : 0;
+  }
   return out;
 }

@@ -4,7 +4,7 @@
 
 import { SvelteSet } from 'svelte/reactivity';
 import { deriveMeterLayout } from '../contract/meterFrame';
-import type { BusMeter, Shape } from '../contract/types';
+import type { BusMeter, DuckMeter, Shape } from '../contract/types';
 import { meterSlots, slotKey, type MeterGroup, type MeterSlot } from './flat';
 
 export type { MeterGroup } from './flat';
@@ -88,7 +88,7 @@ export class MeterStore {
    * carries none.
    */
   private showsTruePeak(key: string, slot: MeterSlot): boolean {
-    if (slot.kind === 'monitor') return false;
+    if (slot.kind === 'monitor' || slot.kind === 'duck') return false;
     return slot.kind !== 'channel' || this.directOuts.has(key.slice('channels/'.length));
   }
 
@@ -196,7 +196,7 @@ export class MeterStore {
     if (cached) return cached;
     const v = this.values;
     const slot = this.slots.get(key);
-    if (!v || !slot) return undefined;
+    if (!v || !slot || slot.kind === 'duck') return undefined;
     const legs = (i: number) => Array.from(v.subarray(slot.offset + i * slot.legs, slot.offset + (i + 1) * slot.legs));
     const opt = (x: number) => (Number.isNaN(x) ? null : x);
     let reading: MeterReading;
@@ -226,6 +226,18 @@ export class MeterStore {
     }
     this.readings.set(key, reading);
     return reading;
+  }
+
+  /**
+   * A duck group's readings in the latest frame, or undefined without one.
+   * Not cached and not reactive: a reader polls it on the frame clock.
+   */
+  duck(id: string): DuckMeter | undefined {
+    const v = this.values;
+    const slot = this.slots.get(slotKey('ducks', id));
+    if (!v || !slot) return undefined;
+    const key = v[slot.offset]!;
+    return { key: Number.isNaN(key) ? null : key, envelope: v[slot.offset + 1]!, engaged: (v[slot.offset + 2]! & 1) === 1 };
   }
 
   /** Forget the latest frames, so bars fall. Latched overs stay. */

@@ -12,13 +12,13 @@ import {
   type MeterValues,
 } from '../../src/lib/contract/meterFrame';
 import { METER_FRAME_MAGIC, METER_FRAME_VERSION, METER_NULL, METER_SILENCE } from '../../src/lib/contract/protocol';
-import type { BusMeter, ChannelMeter, Layout, Shape, Width } from '../../src/lib/contract/types';
+import type { BusMeter, ChannelMeter, DuckMeter, Layout, Shape, Width } from '../../src/lib/contract/types';
 import { API_DIR, Contract } from '../../dev/mock/contract';
 
 const LAYOUT_OF: Record<Width, Layout> = { 1: 'mono', 2: 'stereo', 6: '5.1', 8: '7.1' };
 const el = (id: string, width: Width) => ({ id, name: id, width, layout: LAYOUT_OF[width] });
 
-function shape(channels: Width[], buses: Width[], auxes: Width[], mixMinus: Width[], monitor: Width[] = []): Shape {
+function shape(channels: Width[], buses: Width[], auxes: Width[], mixMinus: Width[], monitor: Width[] = [], ducks: string[] = []): Shape {
   return {
     sampleRate: 48000,
     frameRate: { numerator: 25, denominator: 1 },
@@ -29,6 +29,7 @@ function shape(channels: Width[], buses: Width[], auxes: Width[], mixMinus: Widt
     vcas: [],
     monitorOutputs: monitor.map((w, i) => el(`mon${i + 1}`, w)),
     outputs: [],
+    ducks: ducks.map((id) => ({ id, name: id })),
   };
 }
 
@@ -64,6 +65,7 @@ function values(layout: MeterLayout, seed = 1): MeterValues {
     auxes: layout.auxes.map(bus),
     mixMinus: layout.mixMinus.map(bus),
     monitor: layout.monitor.map((e) => ({ peak: legs(e.legs) })),
+    ducks: layout.ducks.map((): DuckMeter => ({ key: maybe(-120, 30), envelope: Math.round(rnd() * 10000) / 10000, engaged: rnd() < 0.5 })),
   };
 }
 
@@ -72,21 +74,24 @@ const MODEL = 'https://github.com/danielclasen/faderz/raw/main/api/ws/model.sche
 const channelMeter = contract.ajv.compile({ $ref: `${MODEL}#/$defs/ChannelMeter` });
 const busMeter = contract.ajv.compile({ $ref: `${MODEL}#/$defs/BusMeter` });
 const monitorMeter = contract.ajv.compile({ $ref: `${MODEL}#/$defs/MonitorMeter` });
+const duckMeter = contract.ajv.compile({ $ref: `${MODEL}#/$defs/DuckMeter` });
 
 function expectModelValid(v: MeterValues): void {
   for (const m of v.channels) expect(channelMeter(m), JSON.stringify(channelMeter.errors)).toBe(true);
   for (const m of [...v.buses, ...v.auxes, ...v.mixMinus]) expect(busMeter(m), JSON.stringify(busMeter.errors)).toBe(true);
   for (const m of v.monitor) expect(monitorMeter(m), JSON.stringify(monitorMeter.errors)).toBe(true);
+  for (const m of v.ducks) expect(duckMeter(m), JSON.stringify(duckMeter.errors)).toBe(true);
 }
 
-// One mono channel ch1 and one stereo bus pgm, replica "rep" (odd length,
-// so one padding byte), sequence 258.
+// One mono channel ch1, one stereo bus pgm and one duck group comm,
+// replica "rep" (odd length, so one padding byte), sequence 258.
 const TINY = deriveMeterLayout({
   channels: [{ ...el('ch1', 1), altInput: false }],
   buses: [{ ...el('pgm', 2), kind: 'program' }],
   auxes: [],
   mixMinus: [],
   monitorOutputs: [],
+  ducks: [{ id: 'comm', name: 'Commentary' }],
 });
 const TINY_VALUES: MeterValues = {
   channels: [{ peak: [-6.5], truePeak: [-5.9], momentary: -20.004 }],
@@ -111,12 +116,13 @@ const TINY_VALUES: MeterValues = {
   auxes: [],
   mixMinus: [],
   monitor: [],
+  ducks: [{ key: -20, envelope: 0.5, engaged: true }],
 };
 // prettier-ignore
 const TINY_BYTES = [
-  0x4d, 0x03, 0x03, 0x00, // magic 'M', version 3, replica id length 3, reserved
+  0x4d, 0x04, 0x03, 0x00, // magic 'M', version 4, replica id length 3, reserved
   0x02, 0x01, 0x00, 0x00, // sequence 258
-  0xf5, 0x1d, 0xdd, 0xbd, // fingerprint FNV-1a("c/ch1/1;b/pgm/2;") = 0xbddd1df5
+  0x39, 0xed, 0x5e, 0x3d, // fingerprint FNV-1a("c/ch1/1;b/pgm/2;d/comm/1;") = 0x3d5eed39
   0x72, 0x65, 0x70, 0x00, // "rep", padding
   0x76, 0xfd, // ch1 peak -6.5 -> -650
   0xb2, 0xfd, // ch1 truePeak -5.9 -> -590
@@ -132,6 +138,9 @@ const TINY_BYTES = [
   0x00, 0x80, // maxShortTerm null -> -32768
   0x55, 0x00, // correlation 0.85 -> 85
   0x01, 0x00, // flags: integratedValid, not lraStable
+  0x30, 0xf8, // comm key -20 -> -2000
+  0x88, 0x13, // comm envelope 0.5 -> 5000
+  0x01, 0x00, // comm duck flags: engaged
 ];
 
 describe('meter frame byte layout', () => {
@@ -175,25 +184,34 @@ describe('meter frame byte layout', () => {
       auxes: [],
       mixMinus: [],
       monitor: [],
+      ducks: [{ key: -20, envelope: 0.5, engaged: true }],
     });
     expectModelValid(frame);
   });
 
   it('starts the values at an even offset without padding for an even replica id', () => {
     const bytes = encodeMeterFrame(TINY, { sequence: 0, replica: 'r1' }, TINY_VALUES);
-    expect(bytes.length).toBe(12 + 2 + 2 * 17);
+    expect(bytes.length).toBe(12 + 2 + 2 * 20);
     expect([...bytes.slice(12, 16)]).toEqual([0x72, 0x31, 0x76, 0xfd]);
   });
 });
 
 describe('meter layout', () => {
-  it('orders channels, buses, auxes, mix-minus and monitor outputs with their legs', () => {
-    const layout = deriveMeterLayout(shape([1, 2, 6, 8], [2], [1], [2], [2]));
+  it('orders channels, buses, auxes, mix-minus, monitor outputs and duck groups with their legs', () => {
+    const layout = deriveMeterLayout(shape([1, 2, 6, 8], [2], [1], [2], [2], ['comm', 'remote']));
     expect(layout.channels.map((e) => e.legs)).toEqual([1, 2, 6, 8]);
-    expect(layout.valueCount).toBe(2 * 17 + 4 + (3 * 2 + 8) + (3 * 1 + 8) + (3 * 2 + 8) + 2);
+    expect(layout.ducks).toEqual([{ id: 'comm', legs: 1 }, { id: 'remote', legs: 1 }]);
+    expect(layout.valueCount).toBe(2 * 17 + 4 + (3 * 2 + 8) + (3 * 1 + 8) + (3 * 2 + 8) + 2 + 2 * 3);
     expect(layout.fingerprint).toBe(
-      fnv1a('c/ch1/1;c/ch2/2;c/ch3/6;c/ch4/8;b/bus1/2;a/aux1/1;m/mm1/2;o/mon1/2;'),
+      fnv1a('c/ch1/1;c/ch2/2;c/ch3/6;c/ch4/8;b/bus1/2;a/aux1/1;m/mm1/2;o/mon1/2;d/comm/1;d/remote/1;'),
     );
+  });
+
+  it('reads a shape without ducks as one with none', () => {
+    const { ducks: _, ...without } = shape([1], [2], [], []);
+    const layout = deriveMeterLayout(without);
+    expect(layout.ducks).toEqual([]);
+    expect(layout.fingerprint).toBe(fnv1a('c/ch1/1;b/bus1/2;'));
   });
 
   it('uses FNV-1a 32-bit', () => {
@@ -206,9 +224,9 @@ describe('meter layout', () => {
 describe('meter frame round trip', () => {
   it.each([
     ['empty', shape([], [], [], [])],
-    ['one of each', shape([1], [2], [2], [1], [2])],
+    ['one of each', shape([1], [2], [2], [1], [2], ['comm'])],
     ['every width', shape([1, 2, 6, 8], [2, 6, 8], [1, 2], [2, 2])],
-    ['64 channels', shape(Array<Width>(64).fill(2), [2, 6, 2], Array<Width>(8).fill(2), Array<Width>(4).fill(2), [6, 2])],
+    ['64 channels, 8 duck groups', shape(Array<Width>(64).fill(2), [2, 6, 2], Array<Width>(8).fill(2), Array<Width>(4).fill(2), [6, 2], ['d1', 'd2', 'd3', 'd4', 'd5', 'd6', 'd7', 'd8'])],
   ])('%s', (_, s) => {
     const layout = deriveMeterLayout(s);
     for (const seed of [1, 2, 3]) {
@@ -266,6 +284,7 @@ describe('meter values', () => {
     auxes: [],
     mixMinus: [],
     monitor: [],
+    ducks: [],
   });
   const wire = (bytes: Uint8Array) => {
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -317,12 +336,54 @@ describe('meter values', () => {
     expect(low.buses[0]!.loudness.lra).toBe(0);
   });
 
+  it('writes a duck key like a leg but null for a group not in use, the envelope in ten-thousandths, engaged in bit 0', () => {
+    const ducks = deriveMeterLayout(shape([], [], [], [], [], ['a', 'b', 'c', 'd']));
+    const bytes = encodeMeterFrame(ducks, { sequence: 0, replica: 'r1' }, {
+      channels: [],
+      buses: [],
+      auxes: [],
+      mixMinus: [],
+      monitor: [],
+      ducks: [
+        { key: null, envelope: 0, engaged: false },
+        { key: -Infinity, envelope: 0.12345, engaged: false },
+        { key: 40, envelope: 1.5, engaged: true },
+        { key: -6.02, envelope: -0.2, engaged: true },
+      ],
+    });
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    expect(Array.from({ length: ducks.valueCount }, (_, i) => view.getInt16(14 + 2 * i, true))).toEqual([
+      METER_NULL, 0, 0,
+      METER_SILENCE, 1235, 0,
+      4000, 10000, 1,
+      -602, 0, 1,
+    ]);
+    const frame = decodeMeterFrame(ducks, bytes);
+    expect(frame.ducks).toEqual([
+      { key: null, envelope: 0, engaged: false },
+      { key: -120, envelope: 0.1235, engaged: false },
+      { key: 30, envelope: 1, engaged: true },
+      { key: -6.02, envelope: 0, engaged: true },
+    ]);
+    expectModelValid(frame);
+  });
+
+  it('decodes only bit 0 of the duck flags and clamps an envelope beyond 10000', () => {
+    const one = deriveMeterLayout(shape([], [], [], [], [], ['a']));
+    const bytes = encodeMeterFrame(one, { sequence: 0, replica: 'r1' }, { channels: [], buses: [], auxes: [], mixMinus: [], monitor: [], ducks: [{ key: -20, envelope: 0, engaged: false }] });
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    view.setInt16(16, 12000, true);
+    view.setInt16(18, 2, true);
+    expect(decodeMeterFrame(one, bytes).ducks).toEqual([{ key: -20, envelope: 1, engaged: false }]);
+  });
+
   it('refuses values that do not fit the layout', () => {
     const enc = (v: MeterValues, replica = 'r1') => () => encodeMeterFrame(one, { sequence: 0, replica }, v);
     expect(enc({ ...busWith(0, {}), buses: [] })).toThrow(RangeError);
     expect(enc({ ...busWith(0, {}), buses: [{ ...busWith(0, {}).buses[0]!, rms: [0, 0] }] })).toThrow(RangeError);
     expect(enc(busWith(0, {}), '')).toThrow(RangeError);
     expect(enc(busWith(0, {}), 'r'.repeat(33))).toThrow(RangeError);
+    expect(enc({ ...busWith(0, {}), ducks: [{ key: null, envelope: 0, engaged: false }] })).toThrow(RangeError);
   });
 });
 
@@ -346,6 +407,9 @@ describe('meter frame header checks', () => {
   it('rejects a wrong magic, version or replica id', () => {
     expect(reason(TINY, patched(0, METER_FRAME_MAGIC + 1))).toBe('magic');
     expect(reason(TINY, patched(1, METER_FRAME_VERSION + 1))).toBe('version');
+    expect(METER_FRAME_VERSION).toBe(4);
+    // A format 3 frame, of a server without duck telemetry.
+    expect(reason(TINY, patched(1, 3))).toBe('version');
     expect(reason(TINY, patched(2, 0))).toBe('replica');
     expect(reason(TINY, patched(2, 33))).toBe('replica');
     expect(reason(TINY, patched(13, 0x07))).toBe('replica');
@@ -358,6 +422,18 @@ describe('meter frame header checks', () => {
     const bytes = encodeMeterFrame(a, { sequence: 1, replica: 'r1' }, values(a));
     expect(reason(a, bytes)).toBe('decoded');
     expect(reason(b, bytes)).toBe('fingerprint');
+  });
+
+  it('rejects a frame whose duck groups differ, also at the same length', () => {
+    const a = deriveMeterLayout(shape([1], [2], [], [], [], ['comm']));
+    const renamed = deriveMeterLayout(shape([1], [2], [], [], [], ['remote']));
+    const none = deriveMeterLayout(shape([1], [2], [], []));
+    expect(renamed.valueCount).toBe(a.valueCount);
+    const bytes = encodeMeterFrame(a, { sequence: 1, replica: 'r1' }, values(a));
+    expect(reason(a, bytes)).toBe('decoded');
+    expect(reason(renamed, bytes)).toBe('fingerprint');
+    expect(reason(none, bytes)).toBe('fingerprint');
+    expect(reason(a, encodeMeterFrame(none, { sequence: 1, replica: 'r1' }, values(none)))).toBe('fingerprint');
   });
 
   it('rejects a truncated, extended or short frame', () => {

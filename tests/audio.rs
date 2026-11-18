@@ -3,6 +3,8 @@
 //! back from its output flow and its meters.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use faderz::config::Config;
@@ -72,8 +74,21 @@ async fn start_with(
     inputs: Value,
     outputs: Value,
 ) -> Server {
+    start_engine(data, domain, shape, inputs, outputs, json!({})).await
+}
+
+/// [`start_with`] with the `engine` settings `engine`.
+async fn start_engine(
+    data: &Path,
+    domain: &Path,
+    shape: Value,
+    inputs: Value,
+    outputs: Value,
+    engine: Value,
+) -> Server {
     let listener = json!({ "bind": "127.0.0.1", "port": 0 });
     let config = json!({
+        "engine": engine,
         "listeners": { "api": listener, "ops": listener, "nmos": listener },
         "auth": { "mode": "none" },
         "api": { "allowedOrigins": ["http://faderz.test"] },
@@ -241,7 +256,7 @@ async fn meter_values(server: &Server, skip: usize) -> Vec<i16> {
             if frames <= skip {
                 continue;
             }
-            assert_eq!(&f[..3], &[0x4d, 3, 2], "magic, version, replica id length");
+            assert_eq!(&f[..3], &[0x4d, 4, 2], "magic, version, replica id length");
             // After the 12-byte header and "r1".
             return f[14..]
                 .chunks_exact(2)
@@ -252,7 +267,7 @@ async fn meter_values(server: &Server, skip: usize) -> Vec<i16> {
 }
 
 /// Values of the meter frame: ch1 3, ch2 3, st1 5, then pgm 14, mm1 14
-/// and the monitor 2.
+/// and the monitor 2; the shape has no duck group.
 const CH1_PEAK: usize = 0;
 const CH2_PEAK: usize = 3;
 const ST1_PEAK: usize = 6;
@@ -790,4 +805,234 @@ async fn the_engine_counters_reach_every_connection() {
         );
     }
     server.stop().await;
+}
+
+/// Both legs of every sample of `flow` from sample `from` up to `to`,
+/// by sample index from `from`; every block must have been written.
+fn span(domain: &Path, flow: &str, from: u64, to: u64) -> Vec<(f32, f32)> {
+    let mut reader = Reader::new(domain, flow);
+    let input = reader.generation.input(0).unwrap();
+    let mut state = SlotState::default();
+    let n = B as usize;
+    let mut legs = Vec::new();
+    for k in from / B..=to / B {
+        let o = input.read(&mut state, k, &GroupWait::Skipped, &mut reader.buf);
+        assert_eq!(o, Outcome::Copy, "block {k} of {flow}");
+        let (l, r) = reader.buf.split_at(n);
+        legs.extend(l.iter().copied().zip(r.iter().copied()));
+    }
+    let skip = (from % B) as usize;
+    legs.drain(..skip);
+    legs.truncate((to - from) as usize);
+    legs
+}
+
+/// The commentary key, the ambience under it, mono and stereo.
+const COMM: f32 = 0.5;
+const AMB: [f32; 2] = [0.25, -0.25];
+/// The duck group's settings: depth dB, attack, hold and release ms.
+const DEPTH: f32 = 10.0;
+const ATTACK_MS: u64 = 20;
+const HOLD_MS: u64 = 200;
+const RELEASE_MS: u64 = 300;
+/// Samples per ms at 48 kHz.
+const PER_MS: u64 = 48;
+/// The detector decides once every 8 samples (samplez-dsp
+/// `GAIN_INTERVAL`), and a sample's key acts from the next interval on:
+/// an edge of the envelope lands within two intervals of the time the
+/// settings give, whatever the block size.
+const EDGE: u64 = 2 * 8;
+
+/// A burst on the commentary channel ducks the ambience in the
+/// programme output by the group's depth over its attack, holds it for
+/// the hold time after the burst ends and recovers over the release,
+/// each edge within [`EDGE`] samples, while the M&E output, carrying the
+/// same ambience but no destination of the group, keeps every sample's
+/// bits.
+async fn a_burst_ducks_the_programme_but_not_the_me(block: u32) {
+    let name = format!("duck-{block}");
+    let domain = domain(&name);
+    // The burst, hold and release fit in the domain's history.
+    std::fs::write(
+        domain.0.join("options.json"),
+        r#"{"urn:x-mxl:option:history_duration/v1.0": 4000000000}"#,
+    )
+    .unwrap();
+    let data = dir(
+        Path::new(env!("CARGO_TARGET_TMPDIR")),
+        &format!("data-{name}"),
+    );
+    let ids: Vec<String> = (0..4).map(|_| new_id()).collect();
+    let stereo = |id: &str, source: &str| json!({ "id": id, "name": id, "source": source, "width": 2, "layout": "stereo" });
+    let shape = json!({
+        "sampleRate": 48000,
+        "frameRate": { "numerator": 25, "denominator": 1 },
+        "channels": [
+            { "id": "comm", "name": "Comm", "width": 1, "layout": "mono", "altInput": false },
+            { "id": "amb", "name": "Amb", "width": 2, "layout": "stereo", "altInput": false },
+        ],
+        "buses": [
+            { "id": "pgm", "name": "PGM", "kind": "program", "width": 2, "layout": "stereo" },
+            { "id": "me", "name": "M&E", "kind": "me", "width": 2, "layout": "stereo" },
+        ],
+        "auxes": [], "mixMinus": [], "vcas": [],
+        "ducks": [{ "id": "talk", "name": "Commentary" }],
+        "monitorOutputs": [{ "id": "mon", "name": "Monitor", "width": 2, "layout": "stereo" }],
+        "outputs": [stereo("out-pgm", "pgm"), stereo("out-me", "me")],
+    });
+    // The commentary reads COMM over the samples [start, end), else
+    // silence; set once the mix is up.
+    let burst = Arc::new([AtomicU64::new(u64::MAX), AtomicU64::new(u64::MAX)]);
+    let at = burst.clone();
+    let _comm = Source::signal(&domain.0, &ids[0], 1, move |_, idx| {
+        let on = (at[0].load(Relaxed)..at[1].load(Relaxed)).contains(&idx);
+        if on { COMM } else { 0.0 }
+    });
+    let _amb = Source::start(&domain.0, &ids[1], AMB.to_vec());
+    let server = start_engine(
+        &data.0,
+        &domain.0,
+        shape,
+        json!({ "comm": { "flow": ids[0] }, "amb": { "flow": ids[1] } }),
+        json!({ "out-pgm": { "flow": ids[2] }, "out-me": { "flow": ids[3] } }),
+        // The edges are read from one window of 2 s: a debug engine on a
+        // loaded host can read an input late at the default margin.
+        json!({ "blockSize": block, "readerMarginSamples": 100 * PER_MS }),
+    )
+    .await;
+    appears(&domain.0, &ids[2]).await;
+    appears(&domain.0, &ids[3]).await;
+    // The commentary hard left in the programme only, keying the group
+    // pre-fader; the ambience in both.
+    patch(
+        &server,
+        &[
+            ("/buses/pgm/fader", json!(0)),
+            ("/buses/me/fader", json!(0)),
+            ("/channels/comm/fader", json!(0)),
+            ("/channels/comm/pan/lr", json!(-1)),
+            ("/channels/comm/routes/pgm", json!(true)),
+            ("/channels/comm/routes/me", json!(false)),
+            ("/channels/amb/fader", json!(0)),
+            ("/channels/amb/routes/pgm", json!(true)),
+            ("/channels/amb/routes/me", json!(true)),
+            ("/ducks/talk/channels/comm/trigger", json!(true)),
+            ("/ducks/talk/channels/amb/target", json!(true)),
+            ("/ducks/talk/channels/amb/depth", json!(DEPTH)),
+            ("/ducks/talk/destinations/pgm", json!(true)),
+            ("/ducks/talk/destinations/me", json!(false)),
+            ("/ducks/talk/keyTap", json!("preFader")),
+            // The key is a constant: no high-pass to take it out.
+            ("/ducks/talk/keyHpf/enabled", json!(false)),
+            ("/ducks/talk/attackMs", json!(ATTACK_MS)),
+            ("/ducks/talk/holdMs", json!(HOLD_MS)),
+            ("/ducks/talk/releaseMs", json!(RELEASE_MS)),
+        ],
+    )
+    .await;
+    let mut pgm = Reader::new(&domain.0, &ids[2]);
+    let mut me = Reader::new(&domain.0, &ids[3]);
+    pgm.expect(AMB[0], AMB[1], "the ambience, no commentary")
+        .await;
+    me.expect(AMB[0], AMB[1], "the M&E").await;
+
+    let api = api();
+    let (hold, release) = (HOLD_MS * PER_MS, RELEASE_MS * PER_MS);
+    let near = |v: f32, want: f32| (v - want).abs() <= 1e-6;
+    // Bursts of 0.8 s from 0.5 s on, off the block grid, until one is read
+    // whole: a debug engine on a loaded host can still read a block of an
+    // input late, which leaves it out of both outputs. Such a block is
+    // silence in the M&E, or a commentary on the left leg (both legs
+    // ducked alike, so L + R) other than COMM or silence.
+    let mut read = None;
+    for attempt in 0..3 {
+        let now = time::timestamp_to_index(&api, time::now(&api));
+        let (start, end) = (now + 500 * PER_MS + 7, now + 1300 * PER_MS + 7);
+        burst[1].store(end, Relaxed);
+        burst[0].store(start, Relaxed);
+        let (from, to) = (start - 100 * PER_MS, end + hold + release + 100 * PER_MS);
+        // Written by then, with the 100 ms the clock leads the output by.
+        while time::timestamp_to_index(&api, time::now(&api)) <= to + 200 * PER_MS {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        burst[0].store(u64::MAX, Relaxed);
+        let p = span(&domain.0, &ids[2], from, to);
+        let m = span(&domain.0, &ids[3], from, to);
+        let silent = m.iter().any(|s| s.0 == 0.0 || s.1 == 0.0);
+        let comm = |s: &(f32, f32)| s.0 + s.1;
+        let torn = p
+            .iter()
+            .any(|s| !near(comm(s), 0.0) && !near(comm(s), COMM));
+        // A late commentary block is silence within the burst: whole, the
+        // burst is one run of exactly its length.
+        let on: Vec<usize> = (0..p.len()).filter(|&i| near(comm(&p[i]), COMM)).collect();
+        let whole = on.len() as u64 == end - start
+            && on.first().map(|f| f + on.len() - 1) == on.last().copied();
+        if !silent && !torn && whole {
+            read = Some((p, m));
+            break;
+        }
+        eprintln!("block {block}: burst {attempt} not read whole, once more");
+    }
+    let (p, m) = read.unwrap_or_else(|| panic!("block {block}: no burst read whole"));
+    let after = |what: &str, from: usize, f: &dyn Fn(f32, f32) -> bool| {
+        (from..p.len())
+            .find(|&i| f(p[i].0, p[i].1))
+            .unwrap_or_else(|| panic!("block {block}: {what} not after sample {from}"))
+    };
+    // The burst's edges in the output: the commentary on the left leg.
+    let on = after("the burst", 0, &|l, _| l > COMM);
+    let off = after("the burst's end", on, &|l, _| l < COMM);
+    // The ambience on the right leg starts down within an edge of the
+    // burst and reaches its depth over the attack.
+    let down = after("the duck", 0, &|_, r| !near(r, AMB[1]));
+    let ducked = p[off - 1].1;
+    let deep = after("the depth", down, &|_, r| r == ducked);
+    let within = |what: &str, got: usize, want: u64| {
+        assert!(
+            (got as u64).abs_diff(want) <= EDGE,
+            "block {block}: {what} took {got} samples, {want} +/- {EDGE}"
+        );
+    };
+    assert!(
+        (on..=on + EDGE as usize).contains(&down),
+        "block {block}: the burst at {on}, the duck from {down}"
+    );
+    within("the attack", deep - down, ATTACK_MS * PER_MS);
+    let depth = 20.0 * (ducked / AMB[1]).log10();
+    assert!(
+        (depth + DEPTH).abs() <= 0.5,
+        "block {block}: ducked by {depth} dB, not -{DEPTH}"
+    );
+    assert!(
+        p[deep..off].iter().all(|s| s.1 == ducked),
+        "block {block}: steady at depth"
+    );
+    // After the burst: the hold, then the release back to the ambience.
+    let up = after("the release", off, &|_, r| r != ducked);
+    let back = after("the recovery", up, &|_, r| near(r, AMB[1]));
+    within("the hold", up - off, hold);
+    within("the release", back - up, release);
+    assert!(
+        p[back..].iter().all(|s| near(s.1, AMB[1])),
+        "block {block}: recovered"
+    );
+    // The M&E carries the same ambience and never moves, bit for bit.
+    let me_bits = |s: &(f32, f32)| (s.0.to_bits(), s.1.to_bits());
+    let want = (AMB[0].to_bits(), AMB[1].to_bits());
+    assert!(
+        m.iter().all(|s| me_bits(s) == want),
+        "block {block}: the M&E moved"
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_ducks_the_programme_at_block_48() {
+    a_burst_ducks_the_programme_but_not_the_me(48).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_ducks_the_programme_at_block_55() {
+    a_burst_ducks_the_programme_but_not_the_me(55).await;
 }

@@ -1675,13 +1675,22 @@ async function duckTile(page: Page, request: APIRequestContext) {
   };
 }
 
+/**
+ * The lamp of a group held or latched in: the mock reports the envelope
+ * at full depth, so it reads the reduction of its deepest target, St 1 at
+ * 15 dB; the backend runs no engine here, so no meter frame reports one
+ * and the lamp reads the state.
+ */
+const HELD = BACKEND ? 'DUCK HELD' : 'DUCK -15.0';
+const LATCHED = BACKEND ? 'DUCK ON' : 'DUCK -15.0';
+
 test('holds a duck group in while DUCK is held, by pointer and by Space, and latches it with a tap', async ({ page, request }) => {
   const { key, lamp, holder, duck, owner } = await duckTile(page, request);
   try {
     await key.hover();
     await page.mouse.down();
     await expect.poll(async () => (await duck()).hold).toBe(true);
-    await expect(lamp).toHaveText('DUCK HELD');
+    await expect(lamp).toHaveText(HELD);
     await expect(holder).toHaveText('you');
     await expect(page.getByTestId('duck-chip-ch13')).toHaveAccessibleName(/ducked now by Commentary/);
     await page.waitForTimeout(400);
@@ -1705,7 +1714,7 @@ test('holds a duck group in while DUCK is held, by pointer and by Space, and lat
     await expect.poll(async () => (await duck()).mode).toBe('on');
     await expect.poll(async () => (await duck()).hold).toBe(false);
     await expect(key).toHaveAccessibleName('Commentary duck, latched, Shift+D+1');
-    await expect(lamp).toHaveText('DUCK ON');
+    await expect(lamp).toHaveText(LATCHED);
     await key.click();
     await expect.poll(async () => (await duck()).mode).toBe('auto');
     await expect(lamp).toHaveText('AUTO');
@@ -1780,7 +1789,7 @@ test('a second client sees who holds a duck, cannot take the hold but can latch,
     // The key's face names the holder, read from across the desk.
     await expect(b.key).toHaveText(handleTag(tag.handle));
     await expect(a.key).toHaveText('you');
-    await expect(b.lamp).toHaveText('DUCK HELD');
+    await expect(b.lamp).toHaveText(HELD);
     await expect(b.key).toHaveAccessibleName(`Commentary duck, held by web client ${handleTag(tag.handle)}, Shift+D+1`);
     // B's press holds nothing and names the holder; its tap still latches.
     await b.key.click();
@@ -1793,11 +1802,63 @@ test('a second client sees who holds a duck, cannot take the hold but can latch,
     await expect.poll(b.owner).toBeUndefined();
     await expect(b.holder).toHaveText('');
     await expect(b.key).toHaveText('DUCK');
-    await expect(b.lamp).toHaveText('DUCK ON');
+    await expect(b.lamp).toHaveText(LATCHED);
   } finally {
     await other.close();
     await patch(request, '/ducks/comm/mode', 'auto');
   }
+});
+
+test('the duck tile and strip chips show the key level, the gain reduction and the trigger from the meter frames', { tag: '@mock' }, async ({ page, request }) => {
+  // Without automation the mock keys every group in use at a steady -50 dBFS.
+  const { lamp, key } = await duckTile(page, request);
+  const level = page.getByTestId('duck-key-level-comm');
+  const marker = page.getByTestId('duck-keymeter-comm').locator('.marker');
+  const target = page.getByTestId('duck-chip-ch13');
+  const trigger = page.getByTestId('duck-chip-ch1');
+  const scale = () => level.evaluate((el) => new DOMMatrix(getComputedStyle(el).transform).a);
+  const right = async () => {
+    const b = (await level.boundingBox())!;
+    return b.x + b.width;
+  };
+  try {
+    // -50 dBFS on the -60..0 scale of the threshold, short of its marker at -30.
+    await expect.poll(scale).toBeCloseTo(10 / 60, 3);
+    expect(await right()).toBeLessThan((await marker.boundingBox())!.x);
+    await expect(lamp).toHaveText('AUTO');
+    await expect(target).toHaveText('DK');
+    await expect(trigger).toHaveText('KEY');
+    await expect(trigger).not.toHaveClass(/\bon\b/);
+
+    // Held in: the lamp and the target's chip read the reduction, ch13 by
+    // the deeper of Commentary's 10 dB and Remote comm's 8 dB.
+    await key.hover();
+    await page.mouse.down();
+    await expect(lamp).toHaveText('DUCK -15.0');
+    await expect(target).toHaveText('-10');
+    await expect(target).toHaveClass(/\bon\b/);
+    await expect(target).toHaveAccessibleName(/reducing now/);
+    // Past LATCH_MS: a hold, not a tap that would latch it on.
+    await page.waitForTimeout(400);
+    await page.mouse.up();
+    await expect(lamp).toHaveText('AUTO');
+    await expect(target).toHaveText('DK');
+
+    // A threshold below the key: the detector engages in auto, the key
+    // level passes the marker, the trigger's chip lights.
+    await patch(request, '/ducks/comm/threshold', -55);
+    await expect(lamp).toHaveText('DUCK -15.0');
+    await expect.poll(async () => (await right()) > (await marker.boundingBox())!.x).toBe(true);
+    await expect(trigger).toHaveClass(/\bon\b/);
+    await expect(trigger).toHaveAccessibleName(/keying Commentary now/);
+    await expect(target).toHaveText('-10');
+  } finally {
+    await page.mouse.up();
+    await patch(request, '/ducks/comm/mode', 'auto');
+    await patch(request, '/ducks/comm/threshold', -30);
+  }
+  await expect(lamp).toHaveText('AUTO');
+  await expect(trigger).not.toHaveClass(/\bon\b/);
 });
 
 test("a strip's duck chip shows only on a member, is a 24 px target, and opens the Duck section of its panel", async ({ page, request }) => {

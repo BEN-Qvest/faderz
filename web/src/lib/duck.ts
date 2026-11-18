@@ -1,9 +1,13 @@
-// Duck groups on the console: what a group's state reads as, which groups
-// a channel keys or is lowered by, and the DUCK key. The meter frames carry
-// no duck telemetry yet, so everything here follows the state alone: a
-// hold or mode on means the duck is in, auto means the key decides.
+// Duck groups on the console: what a group's state and its readings in the
+// meter frames read as, which groups a channel keys or is lowered by, and
+// the DUCK key. A hold or mode on puts the duck in, auto lets the key
+// decide; the frames tell how far it is in (envelope) and whether the key
+// triggers it (engaged).
 
-import type { DuckMode, DuckShape, DuckState, Shape, State } from './contract/types';
+import type { DuckMeter, DuckMode, DuckShape, DuckState, Shape, State } from './contract/types';
+import { fit } from './format';
+import { STALE_MS } from './meters/layer';
+import type { MeterStore } from './meters/store';
 import type { MixerStore } from './state/mixer.svelte';
 import { duckPath } from './state/paths';
 
@@ -19,16 +23,68 @@ export const DUCK_MODES: ReadonlyArray<{ id: DuckMode; key: string; label: strin
 /** Characters the activity text takes at most, a live reading such as "DUCK -40.0" included. */
 export const LAMP_WIDTH = 10;
 
-/** What a group does now, in words: held, latched, bypassed or keyed. */
-export function lampText(d: DuckState): string {
+/**
+ * What a group does now, in words. With its readings: while the envelope
+ * is above 0, how far its deepest target is lowered, "DUCK -12.0"; else
+ * held, latched, bypassed or auto, with KEY while the key triggers it.
+ * Without readings, the state alone.
+ */
+export function lampText(d: DuckState, live: DuckMeter | null = null): string {
+  if (live && live.envelope > 0) return `DUCK -${(deepestDepth(d) * live.envelope).toFixed(1)}`;
   if (d.hold) return 'DUCK HELD';
   if (d.mode === 'on') return 'DUCK ON';
-  if (d.mode === 'off') return 'BYPASS';
-  return 'AUTO';
+  if (d.mode === 'off') return live?.engaged ? 'BYPASS KEY' : 'BYPASS';
+  return live?.engaged ? 'KEY' : 'AUTO';
 }
+
+/** The lamp is lit: the duck is forced in or its envelope is above 0. */
+export const lampLit = (d: DuckState, live: DuckMeter | null) => forced(d) || (live?.envelope ?? 0) > 0;
 
 /** The duck is in whatever the key does: held or latched on. */
 export const forced = (d: DuckState) => d.hold || d.mode === 'on';
+
+/** Depth of the group's deepest target, dB; 0 without a target. */
+export function deepestDepth(d: DuckState): number {
+  let depth = 0;
+  for (const m of Object.values(d.channels)) if (m.target && m.depth > depth) depth = m.depth;
+  return depth;
+}
+
+/**
+ * A group's readings while meter frames arrive, else null: a stale frame
+ * is no reading. `now` is on the clock of MeterStore.ingest.
+ */
+export function liveDuck(meters: MeterStore, id: string, now: number): DuckMeter | null {
+  if (meters.receivedAt <= 0 || now - meters.receivedAt >= STALE_MS) return null;
+  return meters.duck(id) ?? null;
+}
+
+/**
+ * How far `channel` is lowered now, dB, 0 or more: the deepest of its
+ * groups' depth times envelope, as the engine attenuates a target by the
+ * deepest of its groups. `live` gives a group's readings, or null.
+ */
+export function channelReduction(state: State, targets: readonly DuckShape[], channel: string, live: (id: string) => DuckMeter | null): number {
+  let gr = 0;
+  for (const g of targets) {
+    const depth = state.ducks[g.id]?.channels[channel]?.depth ?? 0;
+    gr = Math.max(gr, depth * (live(g.id)?.envelope ?? 0));
+  }
+  return gr;
+}
+
+/** Characters a strip's gain reduction takes. */
+export const GR_WIDTH = 4;
+
+/**
+ * A gain reduction of `db` (0 or more) as a strip's duck chip shows it,
+ * in GR_WIDTH characters: one decimal below 10 dB, "-3.5", whole dB from
+ * there, " -12".
+ */
+export function reductionText(db: number): string {
+  const tenths = Math.round(db * 10);
+  return fit(tenths < 100 ? `-${(tenths / 10).toFixed(1)}` : `-${Math.round(db)}`, GR_WIDTH);
+}
 
 /** The groups a channel triggers and those that lower it. */
 export function channelDucks(shape: Shape, state: State, channel: string): { triggers: DuckShape[]; targets: DuckShape[] } {

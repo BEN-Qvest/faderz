@@ -1,14 +1,18 @@
 //! Duck groups in the state: the initial state of each group, the rules a
-//! group keeps beyond what the schema says, and the recall-safe group of
-//! each of its leaves.
+//! group keeps beyond what the schema says, the recall-safe group of each
+//! of its leaves, and the engine's duck targets the state gives
+//! ([`targets`], [`masks`], [`columns`]).
 //!
 //! Ranges (in the schema) and defaults (here) are those of samplez-dsp's
 //! `duck` module: `THRESHOLD_DB`, `HYSTERESIS_DB`, `KEY_HPF_FREQ`,
 //! `KEY_LPF_FREQ`, `ATTACK_MS`, `HOLD_MS`, `RELEASE_MS`, `DEPTH_DB`,
 //! `MAX_KEYS` and `DetectorParams::DEFAULT`.
 
+use samplez::DuckTargets;
+use samplez_dsp::{DetectorParams, DuckMode, KeyFilter};
 use serde_json::{Map, Value, json};
 
+use crate::mix;
 use crate::shape::Shape;
 
 /// Trigger channels a group takes at most: samplez-dsp `duck::MAX_KEYS`.
@@ -110,9 +114,320 @@ pub fn recall_group(key: &[String]) -> Option<&'static str> {
     }
 }
 
+/// The engine's settings of each duck group of `shape` in `state`, one
+/// per group in shape order, which is the engine's group number: the
+/// detector, a key per trigger channel in shape order at the gain its
+/// `keyTap` gives ([`key_gain`]), the mode, the hold, and per input slot
+/// the depth of a target channel, 0 dB for any other.
+pub fn targets(shape: &Shape, state: &Value) -> Vec<DuckTargets> {
+    (shape.ducks.iter())
+        .map(|d| group(shape, state, &state["ducks"][&d.id]))
+        .collect()
+}
+
+fn group(shape: &Shape, state: &Value, g: &Value) -> DuckTargets {
+    let f = |v: &Value| v.as_f64().unwrap_or(0.0) as f32;
+    let filter = |v: &Value| KeyFilter {
+        enabled: v["enabled"] == true,
+        freq: f(&v["freq"]),
+    };
+    let params = DetectorParams {
+        threshold_db: f(&g["threshold"]),
+        hysteresis_db: f(&g["hysteresis"]),
+        hpf: filter(&g["keyHpf"]),
+        lpf: filter(&g["keyLpf"]),
+        attack_ms: f(&g["attackMs"]),
+        hold_ms: f(&g["holdMs"]),
+        release_ms: f(&g["releaseMs"]),
+    };
+    let member = |id: &str| &g["channels"][id];
+    let tap = g["keyTap"].as_str().unwrap_or_default();
+    let keys = (shape.channels.iter().enumerate())
+        .filter(|(_, c)| member(&c.id)["trigger"] == true)
+        .map(|(slot, c)| (slot, key_gain(state, &c.id, tap)))
+        .collect();
+    let mode = match g["mode"].as_str() {
+        Some("on") => DuckMode::On,
+        Some("off") => DuckMode::Off,
+        _ => DuckMode::Auto,
+    };
+    let depths = (shape.channels.iter())
+        .map(|c| match member(&c.id) {
+            m if m["target"] == true => f(&m["depth"]),
+            _ => 0.0,
+        })
+        .collect();
+    DuckTargets {
+        params,
+        keys,
+        mode,
+        held: g["hold"] == true,
+        depths,
+    }
+}
+
+/// The gain channel `id` keys a group at, after its strip: 1 at
+/// `preFader`; at `preFaderOpen` 1 while the channel reaches a bus (fader
+/// open, not muted, no VCA mute), else 0; at `postFader` its fader, mute
+/// and VCA gain.
+pub fn key_gain(state: &Value, id: &str, tap: &str) -> f32 {
+    match tap {
+        "preFader" => 1.0,
+        "postFader" => mix::post_fader(state, id) as f32,
+        _ => f32::from(u8::from(mix::post_fader(state, id) > 0.0)),
+    }
+}
+
+/// The duck mask of each coefficient of the matrix ([`mix::matrix`]),
+/// shaped as it: bit `g` for group `g` where the row's channel is a
+/// target of `g` and the column carries a destination of `g`: an output
+/// or meter column of that bus, aux or mix-minus output, or a monitor
+/// output while the monitor's source is one, so the monitor plays and
+/// meters what goes out. None without duck groups.
+pub fn masks(shape: &Shape, state: &Value) -> Vec<Vec<u8>> {
+    if shape.ducks.is_empty() {
+        return Vec::new();
+    }
+    let groups = |is: &dyn Fn(&Value) -> bool| -> u8 {
+        (shape.ducks.iter().enumerate())
+            .filter(|(_, d)| is(&state["ducks"][&d.id]))
+            .fold(0, |bits, (g, _)| bits | 1 << g)
+    };
+    let carried = |id: &str| groups(&|d| d["destinations"][id] == true);
+    let monitored = carried(state["monitor"]["source"].as_str().unwrap_or_default());
+    let columns: Vec<u8> = (mix::columns(shape).into_iter())
+        .flat_map(|(id, width)| {
+            let monitor = shape.monitor_outputs.iter().any(|m| m.id == id);
+            let bits = if monitor { monitored } else { carried(id) };
+            std::iter::repeat_n(bits, width)
+        })
+        .collect();
+    (shape.channels.iter())
+        .flat_map(|c| {
+            let lowered = groups(&|d| d["channels"][&c.id]["target"] == true);
+            let row: Vec<u8> = columns.iter().map(|&bits| bits & lowered).collect();
+            std::iter::repeat_n(row, c.width)
+        })
+        .collect()
+}
+
+/// The matrix columns a duck mask may duck, the engine's `duckColumns`:
+/// those of every bus, aux, mix-minus and monitor output, any of which a
+/// group can lower; none without duck groups, so a shape without them
+/// pays nothing for ducking.
+pub fn columns(shape: &Shape) -> Vec<usize> {
+    if shape.ducks.is_empty() {
+        return Vec::new();
+    }
+    let mut first = 0;
+    let mut ducked = Vec::new();
+    for (id, width) in mix::columns(shape) {
+        if !shape.is_channel(id) {
+            ducked.extend(first..first + width);
+        }
+        first += width;
+    }
+    ducked
+}
+
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
+    use samplez_dsp::DuckMode;
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::shape::tests::small;
+    use crate::state::set_at;
+
+    /// The small shape with a second group, `rem`: rows ch1, ch2, st1 L
+    /// and R; columns pgm L R (its output), then the engine meters of cf
+    /// L R, aux1, mm1 L R and mon L R.
+    fn two_groups() -> (Shape, Value) {
+        let mut v = small();
+        v["ducks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "id": "rem", "name": "Remote" }));
+        let shape = Shape::parse(&v).unwrap();
+        let state = shape.initial_state();
+        (shape, state)
+    }
+
+    fn with(state: &mut Value, writes: &[(&str, Value)]) {
+        for (path, value) in writes {
+            set_at(state, path, value.clone());
+        }
+    }
+
+    /// A mask names a group on a target's rows in the columns of the
+    /// group's destinations: the output carrying pgm, the meter columns of
+    /// an element no output carries, and the monitor while its source is a
+    /// destination. Overlapping groups set both bits; a trigger's rows and
+    /// a column of no destination stay 0.
+    #[test]
+    fn masks_name_each_group_on_its_targets_in_its_destinations() {
+        let (shape, mut state) = two_groups();
+        assert!(masks(&shape, &state).iter().flatten().all(|&m| m == 0));
+        with(
+            &mut state,
+            &[
+                ("/ducks/comm/channels/ch2/trigger", json!(true)),
+                ("/ducks/comm/channels/ch1/target", json!(true)),
+                ("/ducks/comm/channels/st1/target", json!(true)),
+                ("/ducks/comm/destinations/mm1", json!(true)),
+                ("/ducks/rem/channels/ch1/target", json!(true)),
+                ("/ducks/rem/destinations/pgm", json!(false)),
+                ("/ducks/rem/destinations/aux1", json!(true)),
+            ],
+        );
+        let m = masks(&shape, &state);
+        // pgm out, cf, aux1, mm1, mon (source pgm).
+        assert_eq!(m[0], [1, 1, 0, 0, 2, 1, 1, 1, 1]);
+        assert_eq!(m[1], [0; 9], "a trigger is not lowered");
+        assert_eq!(m[2], [1, 1, 0, 0, 0, 1, 1, 1, 1]);
+        assert_eq!(m[3], m[2], "every leg of a target");
+        // The monitor follows its source: on aux1 it carries rem, on cf
+        // neither group.
+        set_at(&mut state, "/monitor/source", json!("aux1"));
+        assert_eq!(masks(&shape, &state)[0][7..], [2, 2]);
+        set_at(&mut state, "/monitor/source", json!("cf"));
+        assert_eq!(masks(&shape, &state)[0][7..], [0, 0]);
+        // Both groups on one coefficient.
+        set_at(&mut state, "/ducks/rem/destinations/pgm", json!(true));
+        assert_eq!(masks(&shape, &state)[0][..2], [3, 3]);
+    }
+
+    /// Without duck groups nothing is masked and no column is ducked, so
+    /// such a shape costs the engine nothing; with one, every column but
+    /// a direct out's may be.
+    #[test]
+    fn duck_columns_are_every_column_but_a_direct_outs() {
+        let mut v = small();
+        v["outputs"].as_array_mut().unwrap().insert(
+            0,
+            json!({ "id": "do", "name": "DO", "source": "ch1", "width": 1, "layout": "mono" }),
+        );
+        let shape = Shape::parse(&v).unwrap();
+        assert_eq!(columns(&shape), (1..10).collect::<Vec<_>>());
+        v.as_object_mut().unwrap().remove("ducks");
+        let shape = Shape::parse(&v).unwrap();
+        assert!(columns(&shape).is_empty());
+        assert!(masks(&shape, &shape.initial_state()).is_empty());
+        assert!(targets(&shape, &shape.initial_state()).is_empty());
+    }
+
+    /// A trigger keys at its tap: pre-fader whatever the fader; pre-fader
+    /// while open only with the fader open, unmuted and no VCA mute;
+    /// post-fader at its fader, mute and VCA gain.
+    #[test]
+    fn a_key_takes_the_gain_of_its_tap() {
+        let (_, mut state) = two_groups();
+        let at = |state: &Value, tap| key_gain(state, "ch2", tap);
+        // The initial fader is closed.
+        assert_eq!(
+            [at(&state, "preFader"), at(&state, "preFaderOpen")],
+            [1.0, 0.0]
+        );
+        assert_eq!(at(&state, "postFader"), 0.0);
+        set_at(&mut state, "/channels/ch2/fader", json!(-6));
+        assert_eq!(at(&state, "preFaderOpen"), 1.0);
+        let minus_6 = mix::gain(-6.0) as f32;
+        assert_eq!(at(&state, "postFader").to_bits(), minus_6.to_bits());
+        for (path, closing) in [
+            ("/channels/ch2/mute", json!(true)),
+            ("/vcas/vca1/mute", json!(true)),
+        ] {
+            let mut closed = state.clone();
+            set_at(&mut closed, "/vcas/vca1/members", json!(["ch2"]));
+            set_at(&mut closed, path, closing);
+            assert_eq!(at(&closed, "preFader"), 1.0, "{path}");
+            assert_eq!(at(&closed, "preFaderOpen"), 0.0, "{path}");
+            assert_eq!(at(&closed, "postFader"), 0.0, "{path}");
+        }
+        // A VCA offset moves the post-fader key, not the open one.
+        set_at(&mut state, "/vcas/vca1/members", json!(["ch2"]));
+        set_at(&mut state, "/vcas/vca1/offset", json!(-6));
+        let minus_12 = mix::gain(-12.0) as f32;
+        assert_eq!(at(&state, "postFader").to_bits(), minus_12.to_bits());
+        assert_eq!(at(&state, "preFaderOpen"), 1.0);
+    }
+
+    /// A group's targets: its detector as the state sets it, a key per
+    /// trigger in shape order at its tap's gain, the depth of each target
+    /// slot and 0 dB for every other slot.
+    #[test]
+    fn a_group_gives_its_detector_keys_and_depths() {
+        let (shape, mut state) = two_groups();
+        with(
+            &mut state,
+            &[
+                ("/ducks/comm/threshold", json!(-24.5)),
+                ("/ducks/comm/hysteresis", json!(3)),
+                (
+                    "/ducks/comm/keyHpf",
+                    json!({ "enabled": false, "freq": 200 }),
+                ),
+                (
+                    "/ducks/comm/keyLpf",
+                    json!({ "enabled": true, "freq": 6000 }),
+                ),
+                ("/ducks/comm/attackMs", json!(10)),
+                ("/ducks/comm/holdMs", json!(300)),
+                ("/ducks/comm/releaseMs", json!(800)),
+                ("/ducks/comm/keyTap", json!("preFaderOpen")),
+                ("/ducks/comm/channels/st1/trigger", json!(true)),
+                ("/ducks/comm/channels/ch1/trigger", json!(true)),
+                ("/channels/ch1/fader", json!(0)),
+                ("/ducks/comm/channels/ch2/target", json!(true)),
+                ("/ducks/comm/channels/ch2/depth", json!(15)),
+                ("/ducks/comm/channels/st1/depth", json!(20)),
+            ],
+        );
+        let t = targets(&shape, &state);
+        assert_eq!(t.len(), 2);
+        let p = t[0].params;
+        assert_eq!(
+            (
+                p.threshold_db,
+                p.hysteresis_db,
+                p.attack_ms,
+                p.hold_ms,
+                p.release_ms
+            ),
+            (-24.5, 3.0, 10.0, 300.0, 800.0)
+        );
+        assert_eq!(
+            (p.hpf.enabled, p.hpf.freq, p.lpf.enabled, p.lpf.freq),
+            (false, 200.0, true, 6000.0)
+        );
+        // ch1 open, st1 closed: slots in shape order.
+        assert_eq!(t[0].keys, [(0, 1.0), (2, 0.0)]);
+        // st1 is no target, so its depth is not the engine's.
+        assert_eq!(t[0].depths, [0.0, 15.0, 0.0]);
+        // The other group as it starts: samplez-dsp's defaults.
+        assert_eq!(t[1].params, DetectorParams::DEFAULT);
+        assert!(t[1].keys.is_empty());
+    }
+
+    /// Mode and hold go to the engine as they are, whose detector decides
+    /// by them: a held group ducks whatever the mode, on ducks whatever
+    /// the key, off bypasses.
+    #[test]
+    fn mode_and_hold_go_to_the_engine_as_set() {
+        let (shape, mut state) = two_groups();
+        for (mode, want) in [
+            ("auto", DuckMode::Auto),
+            ("on", DuckMode::On),
+            ("off", DuckMode::Off),
+        ] {
+            for hold in [false, true] {
+                set_at(&mut state, "/ducks/comm/mode", json!(mode));
+                set_at(&mut state, "/ducks/comm/hold", json!(hold));
+                let t = &targets(&shape, &state)[0];
+                assert_eq!((t.mode, t.held), (want, hold), "{mode} {hold}");
+            }
+        }
+    }
 
     /// The schema bounds a duck group by samplez-dsp's `duck` ranges and
     /// its detector count, so no value the state takes is one the engine

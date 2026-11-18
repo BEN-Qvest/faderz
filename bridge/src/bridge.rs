@@ -51,7 +51,7 @@ pub struct Options {
 enum Net {
     Opened(LinkId),
     Text(LinkId, String),
-    Binary(LinkId),
+    Binary(LinkId, Vec<u8>),
     Closed(LinkId),
 }
 
@@ -136,8 +136,8 @@ async fn link(
                 Some(Ok(Message::Text(t))) => {
                     let _ = events.send(Net::Text(id, t.as_str().to_owned()));
                 }
-                Some(Ok(Message::Binary(_))) => {
-                    let _ = events.send(Net::Binary(id));
+                Some(Ok(Message::Binary(b))) => {
+                    let _ = events.send(Net::Binary(id, b.to_vec()));
                 }
                 Some(Ok(Message::Close(frame))) => {
                     tracing::info!(link = id, ?frame, "closed by the server");
@@ -256,7 +256,7 @@ pub async fn run(options: Options, ports: Vec<Port>, shutdown: impl Future<Outpu
             Some(n) = net_rx.recv() => match n {
                 Net::Opened(id) => engine.opened(id, now()),
                 Net::Text(id, text) => engine.received(id, &text, now()),
-                Net::Binary(id) => engine.binary(id, now()),
+                Net::Binary(id, frame) => engine.binary(id, &frame, now()),
                 Net::Closed(id) => {
                     links.remove(&id);
                     engine.closed(id, now());

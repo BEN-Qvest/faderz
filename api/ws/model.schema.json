@@ -3268,6 +3268,37 @@
         }
       }
     },
+    "DuckMeter": {
+      "description": "A duck group's readings over the last 10 ms the engine computed it in. A target is lowered by its depth times envelope, in dB.",
+      "type": "object",
+      "required": [
+        "key",
+        "envelope",
+        "engaged"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "description": "Largest level of the group's keys after their key filters and key gains, dBFS; null while the group is not in use.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -120,
+          "maximum": 30
+        },
+        "envelope": {
+          "description": "How far the group ducks its targets, 0 (not at all) to 1 (by their full depth).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "engaged": {
+          "description": "The detector is triggered or holding.",
+          "type": "boolean"
+        }
+      }
+    },
     "Counters": {
       "description": "Engine counters by name, each a total since the engine started and named with the suffix _total. Each counts an event an operator acts on, such as a missed deadline or a late input block; none counts normal work, such as blocks processed.",
       "type": "object",

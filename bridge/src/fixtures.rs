@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use crate::engine::tests::{engine, sent};
 use crate::engine::{Action, Engine};
 use crate::mcu::Device;
+use crate::meters::Layout;
 use crate::surface::{Surface, UnitSpec};
 
 fn hex(text: &str) -> Vec<u8> {
@@ -20,7 +21,7 @@ fn hex(text: &str) -> Vec<u8> {
 /// a program bus and two duck groups.
 fn twenty() -> Engine {
     let channels: Vec<Value> = (1..=20)
-        .map(|i| json!({ "id": format!("ch{i}"), "name": format!("Chan {i}") }))
+        .map(|i| json!({ "id": format!("ch{i}"), "name": format!("Chan {i}"), "width": 1 }))
         .collect();
     let state: serde_json::Map<String, Value> = (1..=20)
         .map(|i| {
@@ -34,7 +35,7 @@ fn twenty() -> Engine {
     let snapshot = json!({
         "type": "snapshot", "replica": { "id": "r1", "role": "leader" },
         "you": {}, "epoch": "1", "revision": 1,
-        "shape": { "channels": channels, "buses": [{ "id": "pgm", "kind": "program" }],
+        "shape": { "channels": channels, "buses": [{ "id": "pgm", "kind": "program", "width": 2 }],
             "ducks": [{ "id": "comm", "name": "Commentary A" }, { "id": "comm-b", "name": "Commentary B" }] },
         "state": { "channels": state, "buses": { "pgm": { "fader": 0 } }, "consoles": [],
             "ducks": { "comm": duck, "comm-b": duck } },
@@ -89,7 +90,7 @@ impl Replay {
         self.commands.extend(
             sent(&actions, 1)
                 .into_iter()
-                .filter(|m| !matches!(m["type"].as_str(), Some("ping" | "pong"))),
+                .filter(|m| !matches!(m["type"].as_str(), Some("ping" | "pong" | "credit"))),
         );
         self.midi.extend(
             self.surface
@@ -149,6 +150,17 @@ impl Replay {
                 delta["replica"] = json!({ "id": "r1", "role": "leader" });
                 delta["revision"] = json!(self.revision);
                 self.engine.received(1, &delta.to_string(), self.now);
+                self.settle();
+            }
+            "~" => {
+                let layout = Layout::of(&self.engine.mirror().shape).expect("a layout");
+                let ducks: Vec<[i16; 3]> = (rest.split(',').map(str::split_whitespace))
+                    .map(|mut v| {
+                        let mut next = || v.next().expect("a value").parse().expect("an int16");
+                        [-2000, next(), next()]
+                    })
+                    .collect();
+                self.engine.binary(1, &layout.frame(&ducks), self.now);
                 self.settle();
             }
             "!" => {

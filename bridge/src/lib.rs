@@ -8,6 +8,7 @@ pub mod engine;
 #[cfg(test)]
 mod fixtures;
 pub mod mcu;
+pub mod meters;
 pub mod midi;
 pub mod mirror;
 pub mod rtpmidi;

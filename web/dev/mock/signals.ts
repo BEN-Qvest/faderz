@@ -7,6 +7,8 @@ import { METER_PERIOD_MS as FRAME_MS } from '../../src/lib/contract/protocol.ts'
 import type {
   BusMeter,
   ChannelMeter,
+  DuckMeter,
+  DuckState,
   ElementShape,
   Layout,
   Limiter,
@@ -293,15 +295,53 @@ function foldPeaks(from: Layout, peaks: number[], to: Layout, downmix: 'loRo' | 
   });
 }
 
+/**
+ * Key level of every duck group in use when keys are 'steady', dBFS:
+ * below any threshold, so a group ducks only while held or on.
+ */
+export const STEADY_KEY_DB = -50;
+
+/** A duck group's detector and envelope in one replica. */
+export interface Detector {
+  triggered: boolean;
+  /** ms the detector still holds after the key fell. */
+  holdLeft: number;
+  envelope: number;
+}
+
+/**
+ * One meter period of a duck group's detector: triggered above the
+ * threshold, released below it by the hysteresis, then engaged for holdMs
+ * more; the envelope rises to 1 over attackMs while held, on or engaged
+ * in auto, and falls to 0 over releaseMs otherwise.
+ */
+export function stepDetector(det: Detector, d: DuckState, key: number): void {
+  if (key > d.threshold) det.triggered = true;
+  else if (key < d.threshold - d.hysteresis) det.triggered = false;
+  det.holdLeft = det.triggered ? d.holdMs : Math.max(0, det.holdLeft - FRAME_MS);
+  const engaged = det.triggered || det.holdLeft > 0;
+  const target = d.hold || d.mode === 'on' || (d.mode === 'auto' && engaged) ? 1 : 0;
+  if (target > det.envelope) det.envelope = Math.min(1, det.envelope + FRAME_MS / d.attackMs);
+  else if (target < det.envelope) det.envelope = Math.max(0, det.envelope - FRAME_MS / d.releaseMs);
+}
+
 /** Metering of one replica. */
 export class ReplicaMeters {
   private readonly loudness = new Map<string, LoudnessMeter>();
+  private readonly detectors = new Map<string, Detector>();
   private readonly shape: Shape;
   private readonly channelShapes: Map<string, ElementShape>;
+  private readonly keys: 'triggers' | 'steady';
 
-  constructor(shape: Shape) {
+  /**
+   * keys 'triggers': a duck group keys from the levels of its triggers,
+   * so speech on them ducks it now and then; 'steady': every group in
+   * use reads STEADY_KEY_DB.
+   */
+  constructor(shape: Shape, keys: 'triggers' | 'steady' = 'triggers') {
     this.shape = shape;
     this.channelShapes = new Map(shape.channels.map((c) => [c.id, c]));
+    this.keys = keys;
   }
 
   resetLoudness(ids: readonly string[]): void {
@@ -471,6 +511,31 @@ export class ReplicaMeters {
       const found = all.find(([e]) => e.id === state.monitor.source);
       return { peak: found ? foldPeaks(found[0].layout, found[1].peak, out.layout, state.monitor.downmix) : LAYOUT_LABELS[out.layout].map(() => SILENCE) };
     });
-    return { channels, buses, auxes, mixMinus, monitor };
+
+    // A group is in use here while it has a trigger and a target. Its key
+    // is the loudest trigger leg as a peak, at the gain its keyTap gives.
+    const ducks = (this.shape.ducks ?? []).map((g): DuckMeter => {
+      const d = state.ducks[g.id]!;
+      const members = Object.entries(d.channels);
+      if (!members.some(([, m]) => m.trigger) || !members.some(([, m]) => m.target)) {
+        this.detectors.delete(g.id);
+        return { key: null, envelope: 0, engaged: false };
+      }
+      let key = STEADY_KEY_DB;
+      if (this.keys === 'triggers') {
+        key = SILENCE;
+        for (const [id, m] of members) {
+          if (!m.trigger) continue;
+          const gain = d.keyTap === 'preFader' ? 1 : d.keyTap === 'postFader' ? post(id) : post(id) > 0 ? 1 : 0;
+          if (gain <= 0) continue;
+          for (const l of channelLevels.get(id) ?? []) key = Math.max(key, l + 9 + 20 * Math.log10(gain));
+        }
+      }
+      let det = this.detectors.get(g.id);
+      if (!det) this.detectors.set(g.id, (det = { triggered: false, holdLeft: 0, envelope: 0 }));
+      stepDetector(det, d, key);
+      return { key: r1(key), envelope: Math.round(det.envelope * 10000) / 10000, engaged: det.triggered || det.holdLeft > 0 };
+    });
+    return { channels, buses, auxes, mixMinus, monitor, ducks };
   }
 }

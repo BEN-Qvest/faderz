@@ -1,6 +1,6 @@
 //! Meter frames (api/ws/server-message.schema.json `MeterFrame`, format
-//! 3): a 12-byte header, the replica id, then Int16 centi-dB values in
-//! shape order.
+//! 4): a 12-byte header, the replica id, then Int16 values in shape
+//! order, the duck groups' readings last.
 //!
 //! A channel's peak and momentary loudness are the engine's meter of its
 //! input after the strip, which is both the input and the pre-fader tap
@@ -18,14 +18,20 @@
 //! output is metered after its level, dim, cut, mono and speaker mutes
 //! rather than before them as `MonitorMeter` says. A level of digital
 //! silence reads the floor, -120 dB; null is a value not measured.
+//!
+//! A duck group reads the engine's `DuckMeter` of its group over the
+//! last meter slice of 10 ms it was computed in: the largest key level,
+//! the largest envelope and whether its detector was engaged.
 
-use samplez::{InputMeters, OutputMeters, Status};
+use samplez::{DuckMeter, InputMeters, OutputMeters, Status};
 
 use crate::mix::MeterTap;
 use crate::shape::Shape;
 
 const MAGIC: u8 = 0x4d;
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
+/// Full envelope, full depth: the envelope 0 to 1 in ten-thousandths.
+const ENVELOPE_FULL: f64 = 10_000.0;
 /// No value: not measured.
 const NULL: i16 = i16::MIN;
 /// Digital silence: -120 dB, the floor of a level.
@@ -56,6 +62,8 @@ pub struct Readings<'a> {
     pub outputs: Vec<&'a OutputMeters>,
     pub meters: Vec<&'a OutputMeters>,
     pub inputs: Vec<&'a InputMeters>,
+    /// Each duck group's readings, numbered as the shape's ducks.
+    pub ducks: &'a [DuckMeter],
     /// Each channel's tap gains ([`crate::mix::meter_taps`]).
     pub taps: &'a [MeterTap],
 }
@@ -66,6 +74,7 @@ impl<'a> Readings<'a> {
             outputs: status.outputs.iter().map(|o| &o.meters).collect(),
             meters: status.meters.iter().map(|m| &m.meters).collect(),
             inputs: status.inputs.iter().map(|i| &i.meters).collect(),
+            ducks: &status.ducks,
             taps,
         }
     }
@@ -75,6 +84,8 @@ impl<'a> Readings<'a> {
 pub struct Layout {
     /// Kind, legs and source of each element.
     elements: Vec<(Kind, usize, Source)>,
+    /// Duck groups, one engine group each in shape order.
+    ducks: usize,
     /// FNV-1a 32-bit of the layout text.
     pub fingerprint: u32,
 }
@@ -120,8 +131,12 @@ impl Layout {
         for m in &shape.monitor_outputs {
             add(Kind::Monitor, "o", &m.id, m.width, source(&m.id));
         }
+        for d in &shape.ducks {
+            text.push_str(&format!("d/{}/1;", d.id));
+        }
         Layout {
             elements,
+            ducks: shape.ducks.len(),
             fingerprint: fnv1a(&text),
         }
     }
@@ -197,7 +212,30 @@ impl Layout {
             put(NULL);
             put(m.map_or(0, flags));
         }
+        for g in 0..self.ducks {
+            let [key, envelope, flags] = duck(r.ducks.get(g));
+            put(key);
+            put(envelope);
+            put(flags);
+        }
         b
+    }
+}
+
+/// A duck group's values: its key level in centi-dBFS, null while the
+/// group is not in use; its envelope in ten-thousandths, 0 while not in
+/// use; flags, bit 0 engaged (triggered or holding).
+fn duck(m: Option<&DuckMeter>) -> [i16; 3] {
+    match m {
+        Some(m) if m.slice.is_some() => {
+            let envelope = (f64::from(m.envelope) * ENVELOPE_FULL + 0.5).floor();
+            [
+                level(f64::from(m.key)),
+                envelope.clamp(0.0, ENVELOPE_FULL) as i16,
+                i16::from(m.engaged),
+            ]
+        }
+        _ => [NULL, 0, 0],
     }
 }
 
@@ -253,7 +291,7 @@ mod tests {
     #[test]
     fn the_fingerprint_is_the_clients() {
         let layout = Layout::of(&Shape::parse(&small()).unwrap());
-        let text = "c/ch1/1;c/ch2/1;c/st1/2;b/pgm/2;b/cf/2;a/aux1/1;m/mm1/2;o/mon/2;";
+        let text = "c/ch1/1;c/ch2/1;c/st1/2;b/pgm/2;b/cf/2;a/aux1/1;m/mm1/2;o/mon/2;d/comm/1;";
         assert_eq!(layout.fingerprint, fnv1a(text));
         assert_eq!(fnv1a("a"), 0xe40c_292c);
     }
@@ -311,11 +349,17 @@ mod tests {
             outputs: vec![&pgm],
             meters: vec![&cf, &none, &none, &mon],
             inputs: vec![&ch1, &ch2, &st1],
+            ducks: &[DuckMeter {
+                slice: Some(3),
+                key: 0.5,
+                envelope: 0.25,
+                engaged: true,
+            }],
             taps: &[TAP; 3],
         };
         let f = layout.frame("r1", 7, &r);
-        // Channels 2*legs+1, buses 3*legs+8, monitor legs.
-        let values = 3 + 3 + 5 + (6 + 8) * 2 + (3 + 8) + (6 + 8) + 2;
+        // Channels 2*legs+1, buses 3*legs+8, monitor legs, ducks 3.
+        let values = 3 + 3 + 5 + (6 + 8) * 2 + (3 + 8) + (6 + 8) + 2 + 3;
         assert_eq!(f.len(), 12 + 2 + 2 * values);
         assert_eq!(&f[..4], &[MAGIC, VERSION, 2, 0]);
         assert_eq!(u32::from_le_bytes(f[4..8].try_into().unwrap()), 7);
@@ -333,8 +377,32 @@ mod tests {
         assert_eq!([v(11), v(12), v(17)], [-602, FLOOR, -2300]);
         // cf, from its engine meter.
         assert_eq!([v(25), v(26)], [-1204, -1204]);
-        // The monitor, the last two values.
-        assert_eq!([v(values - 2), v(values - 1)], [-602, -602]);
+        // The monitor, then the duck group: key -6.02 dBFS, envelope a
+        // quarter, engaged.
+        assert_eq!([v(values - 5), v(values - 4)], [-602, -602]);
+        assert_eq!(
+            [v(values - 3), v(values - 2), v(values - 1)],
+            [-602, 2500, 1]
+        );
+    }
+
+    /// A duck group not in use reads a null key, no envelope and no flag;
+    /// a silent key the floor; the envelope rounds to ten-thousandths and
+    /// stays within 0 to 10000.
+    #[test]
+    fn a_duck_group_reads_its_engine_meter() {
+        let m = |slice, key, envelope, engaged| DuckMeter {
+            slice,
+            key,
+            envelope,
+            engaged,
+        };
+        assert_eq!(duck(None), [NULL, 0, 0]);
+        assert_eq!(duck(Some(&m(None, 0.5, 0.5, true))), [NULL, 0, 0]);
+        assert_eq!(duck(Some(&m(Some(0), 0.0, 0.0, false))), [FLOOR, 0, 0]);
+        assert_eq!(duck(Some(&m(Some(9), 1.0, 1.0, true))), [0, 10_000, 1]);
+        assert_eq!(duck(Some(&m(Some(9), 1.0, 0.123_45, false))), [0, 1235, 0]);
+        assert_eq!(duck(Some(&m(Some(9), 1.0, 1.5, false)))[1], 10_000);
     }
 
     /// A channel's meter follows its meterTap: the gain of a post-fader
@@ -351,6 +419,7 @@ mod tests {
             outputs: vec![&none],
             meters: vec![&none; 4],
             inputs: vec![&ch1, &ch1, &st1],
+            ducks: &[],
             taps: &[tap(0.5, 1.0), tap(0.0, 1.0), TAP],
         };
         let f = layout.frame("r1", 0, &r);
@@ -382,6 +451,7 @@ mod tests {
                 outputs: vec![&direct, &none],
                 meters: vec![&none; 4],
                 inputs: vec![&ch1, &ch1, &ch1],
+                ducks: &[],
                 taps: &[t, TAP, TAP],
             };
             let f = layout.frame("r1", 0, &r);
@@ -422,6 +492,7 @@ mod tests {
             "channels": [{ "id": "ch1", "name": "c", "width": 1, "layout": "mono", "altInput": false }],
             "buses": [{ "id": "pgm", "name": "p", "kind": "program", "width": 2, "layout": "stereo" }],
             "auxes": [], "mixMinus": [], "vcas": [], "monitorOutputs": [],
+            "ducks": [{ "id": "comm", "name": "c" }],
             "outputs": [
                 { "id": "do", "name": "d", "source": "ch1", "width": 1, "layout": "mono" },
                 { "id": "out", "name": "o", "source": "pgm", "width": 2, "layout": "stereo" },
@@ -450,6 +521,12 @@ mod tests {
             outputs: vec![&direct, &pgm],
             meters: Vec::new(),
             inputs: vec![&ch1],
+            ducks: &[DuckMeter {
+                slice: Some(0),
+                key: lin(-20.0),
+                envelope: 0.5,
+                engaged: true,
+            }],
             taps: &[TAP],
         };
         let got = Layout::of(&shape).frame("rep", 258, &r);

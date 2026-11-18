@@ -3,7 +3,8 @@
 //! standby on another replica; heartbeats; failover by promote or by
 //! reconnecting; commands with ids and seqs, sent again after a 503 or a
 //! failover and dropped 3 s after they were issued; continuous writes
-//! coalesced to 50 per second. Deadlines follow the measured round trip
+//! coalesced to 50 per second; meter credits on the primary, whose
+//! frames' duck section is kept. Deadlines follow the measured round trip
 //! as the web client's sync engine sizes them
 //! (web/src/lib/sync/engine.ts).
 //!
@@ -15,6 +16,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use serde_json::{Value, json};
 
+use crate::meters::{Layout, Mismatch};
 use crate::mirror::Mirror;
 
 pub const HEARTBEAT_MS: u64 = 250;
@@ -50,6 +52,10 @@ pub const CONSOLE_RETRY_MS: u64 = 500;
 pub const CONSOLE_RETRY_CAP_MS: u64 = 4000;
 /// A replica that cannot commit is left only when that holds this long.
 pub const COMMIT_SETTLE_MS: u64 = HEARTBEAT_MS;
+/// Meter credits a connection holds at most.
+pub const METER_CREDIT_CAP: u32 = 8;
+/// Credits are topped up to the cap once this many or fewer are left.
+pub const CREDIT_REFILL_AT: u32 = METER_CREDIT_CAP / 2;
 
 pub type LinkId = u64;
 
@@ -217,6 +223,16 @@ struct Entry {
     sent_in: u64,
 }
 
+/// A duck group's latest reading from a meter frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Duck {
+    /// 0 (not ducking) to 1 (by the targets' full depth).
+    pub envelope: f64,
+    pub engaged: bool,
+    /// When the frame arrived.
+    pub at: u64,
+}
+
 /// A console registration and when it last went out.
 #[derive(Debug, Clone)]
 struct Console {
@@ -263,6 +279,13 @@ pub struct Engine {
     /// Registrations refused with 409 in a row, and when they go out again.
     console_refusals: u32,
     console_retry_at: Option<u64>,
+    /// The meter frame layout of the last snapshot's shape.
+    layout: Option<Layout>,
+    /// A resync went out for a frame of another layout.
+    layout_resync_sent: bool,
+    /// Meter frames the primary may still send.
+    credits: u32,
+    ducks: BTreeMap<String, Duck>,
     actions: Vec<Action>,
     events: Vec<Event>,
     ids: Box<dyn FnMut() -> String + Send>,
@@ -313,6 +336,10 @@ impl Engine {
             consoles: BTreeMap::new(),
             console_refusals: 0,
             console_retry_at: None,
+            layout: None,
+            layout_resync_sent: false,
+            credits: 0,
+            ducks: BTreeMap::new(),
             actions: Vec::new(),
             events: Vec::new(),
             ids,
@@ -364,6 +391,11 @@ impl Engine {
     /// Whether `owner` is this session.
     pub fn mine(&self, owner: &Value) -> bool {
         owner["handle"] == self.handle.as_str()
+    }
+
+    /// Duck group `id`'s latest reading, when a meter frame carried one.
+    pub fn duck(&self, id: &str) -> Option<&Duck> {
+        self.ducks.get(id)
     }
 
     /// Whether a touch of `path` is waiting for its answer.
@@ -546,6 +578,7 @@ impl Engine {
         self.connect_timeouts[role as usize] = 0;
         match role {
             Role::Primary => {
+                self.credits = 0;
                 self.sync = Sync::Syncing;
                 self.sync_by = Some(now + self.sync_timeout());
                 let hello = self.hello("primary");
@@ -624,6 +657,8 @@ impl Engine {
             l.handover = false;
         }
         self.handover = false;
+        // No credit was granted on it as a standby.
+        self.credits = 0;
         self.primary_index = endpoint;
         self.primary_attempts = 0;
         let promote = json!({
@@ -722,11 +757,54 @@ impl Engine {
 
     // ---- server messages ---------------------------------------------------
 
-    /// A binary message (a meter frame): traffic only.
-    pub fn binary(&mut self, link: LinkId, now: u64) {
-        if let Some(l) = self.link_mut(link) {
-            l.last_rx = now;
+    /// A binary message, a meter frame: on the primary it uses a credit,
+    /// and the duck section of one that matches the layout is kept. One of
+    /// another layout asks for a snapshot, once per layout.
+    pub fn binary(&mut self, link: LinkId, frame: &[u8], now: u64) {
+        let Some(l) = self.link_mut(link) else { return };
+        l.last_rx = now;
+        if l.role != Role::Primary {
+            return;
         }
+        self.credits = self.credits.saturating_sub(1);
+        if let Some(layout) = &self.layout {
+            match layout.ducks(frame) {
+                Ok(readings) => {
+                    for (id, m) in layout.ducks.iter().zip(readings) {
+                        let duck = Duck {
+                            envelope: m.envelope,
+                            engaged: m.engaged,
+                            at: now,
+                        };
+                        self.ducks.insert(id.clone(), duck);
+                    }
+                }
+                Err(Mismatch::Fingerprint)
+                    if self.sync == Sync::Live && !self.layout_resync_sent =>
+                {
+                    self.layout_resync_sent = true;
+                    self.resync(true, now);
+                }
+                Err(_) => {}
+            }
+        }
+        self.grant_credits();
+    }
+
+    /// Tops the primary's meter credits up to the cap once half are used,
+    /// while it is live on a shape with duck groups: the bridge reads
+    /// meter frames for their duck section only.
+    fn grant_credits(&mut self) {
+        let ducks = self.layout.as_ref().is_some_and(|l| !l.ducks.is_empty());
+        if self.sync != Sync::Live || !ducks || self.credits > CREDIT_REFILL_AT {
+            return;
+        }
+        let Some(p) = self.primary().filter(|p| p.opened).map(|p| p.id) else {
+            return;
+        };
+        let n = METER_CREDIT_CAP - self.credits;
+        self.send(p, &json!({ "type": "credit", "n": n }));
+        self.credits = METER_CREDIT_CAP;
     }
 
     pub fn received(&mut self, link: LinkId, text: &str, now: u64) {
@@ -820,6 +898,11 @@ impl Engine {
         }
         let answering = self.sync == Sync::Syncing;
         self.mirror.snapshot(msg);
+        let layout = Layout::of(&self.mirror.shape);
+        if layout != self.layout {
+            self.layout = layout;
+            self.layout_resync_sent = false;
+        }
         // A snapshot can stand in for the deltas that answered commands
         // sent before the request it answers: those go out again.
         let before = if answering {
@@ -888,6 +971,7 @@ impl Engine {
         }
         self.flush_consoles(now);
         self.transmit(now);
+        self.grant_credits();
         if let Some(s) = self.standby() {
             let id = s.id;
             if s.synced && !self.standby_suitable(s) {
@@ -1795,6 +1879,123 @@ pub(crate) mod tests {
                 (json!("touch"), json!("/channels/ch1/fader")),
             ]
         );
+    }
+
+    /// A snapshot on `replica` of `shape` with the duck group comm in auto.
+    fn meter_snapshot(replica: &str, revision: u64, shape: Value) -> String {
+        json!({
+            "type": "snapshot", "replica": { "id": replica, "role": "leader" },
+            "you": {}, "epoch": "1", "revision": revision, "shape": shape,
+            "state": { "channels": {}, "ducks": { "comm": { "mode": "auto", "hold": false } }, "consoles": [] },
+            "owners": {},
+        })
+        .to_string()
+    }
+
+    fn credits(actions: &[Action], link: LinkId) -> Vec<Value> {
+        sent(actions, link)
+            .into_iter()
+            .filter(|m| m["type"] == "credit")
+            .map(|m| m["n"].clone())
+            .collect()
+    }
+
+    #[test]
+    fn meter_credits_go_to_the_primary_topped_up_once_half_are_used() {
+        let frame = crate::meters::tests::example();
+        let mut e = engine(2);
+        e.start(0);
+        e.opened(1, 0);
+        e.received(
+            1,
+            &meter_snapshot("r1", 5, crate::meters::tests::shape()),
+            0,
+        );
+        assert_eq!(credits(&e.take_actions(), 1), vec![json!(METER_CREDIT_CAP)]);
+        // The standby gets none, and its frames use none of the primary's.
+        let sb = e.standby().unwrap().id;
+        e.opened(sb, 1);
+        e.received(
+            sb,
+            &meter_snapshot("r2", 5, crate::meters::tests::shape()),
+            2,
+        );
+        e.binary(sb, &frame, 3);
+        assert!(credits(&e.take_actions(), sb).is_empty());
+        for t in [40, 80, 120] {
+            e.binary(1, &frame, t);
+        }
+        assert!(credits(&e.take_actions(), 1).is_empty());
+        e.binary(1, &frame, 160);
+        assert_eq!(credits(&e.take_actions(), 1), vec![json!(4)]);
+        // Promoted, the standby holds none until it is granted the cap.
+        e.closed(1, 200);
+        e.received(
+            sb,
+            &json!({ "type": "resume", "replica": { "id": "r2", "role": "leader" },
+            "you": {}, "epoch": "1", "revision": 5, "deltas": [] })
+            .to_string(),
+            210,
+        );
+        assert_eq!(e.primary().map(|p| p.id), Some(sb));
+        assert_eq!(
+            credits(&e.take_actions(), sb),
+            vec![json!(METER_CREDIT_CAP)]
+        );
+        // A shape without duck groups: the bridge reads no meter frames.
+        let mut shape = crate::meters::tests::shape();
+        shape["ducks"] = json!([]);
+        let mut e = engine(1);
+        e.start(0);
+        e.opened(1, 0);
+        e.received(1, &meter_snapshot("r1", 5, shape), 0);
+        assert!(credits(&e.take_actions(), 1).is_empty());
+    }
+
+    #[test]
+    fn a_meter_frame_keeps_the_duck_readings_and_another_layout_asks_once() {
+        let shape = crate::meters::tests::shape();
+        let frame = crate::meters::tests::example();
+        let mut e = engine(1);
+        e.start(0);
+        e.opened(1, 0);
+        e.received(1, &meter_snapshot("r1", 5, shape.clone()), 0);
+        e.take_actions();
+        e.binary(1, &frame, 40);
+        let read = Duck {
+            envelope: 0.5,
+            engaged: true,
+            at: 40,
+        };
+        assert_eq!(e.duck("comm"), Some(&read));
+        // Of another length: dropped.
+        e.binary(1, &frame[..frame.len() - 2], 80);
+        assert_eq!(e.duck("comm"), Some(&read));
+        // Of another layout: dropped, and one resync asks for the shape.
+        let mut other = frame.clone();
+        other[8] ^= 1;
+        let resyncs = |e: &mut Engine| -> Vec<Value> {
+            sent(&e.take_actions(), 1)
+                .into_iter()
+                .filter(|m| m["type"] == "resync")
+                .collect()
+        };
+        e.binary(1, &other, 120);
+        assert_eq!(e.duck("comm"), Some(&read));
+        assert_eq!(
+            resyncs(&mut e),
+            vec![json!({ "type": "resync", "lastRevision": 5, "epoch": "1", "full": true })]
+        );
+        // The same shape again: its frames are dropped without asking.
+        e.received(1, &meter_snapshot("r1", 5, shape.clone()), 130);
+        e.binary(1, &other, 160);
+        assert!(resyncs(&mut e).is_empty());
+        // A new shape: asked again.
+        let mut two = shape;
+        two["ducks"] = json!([{ "id": "comm", "name": "C" }, { "id": "b", "name": "B" }]);
+        e.received(1, &meter_snapshot("r1", 5, two), 170);
+        e.binary(1, &other, 200);
+        assert_eq!(resyncs(&mut e).len(), 1);
     }
 
     #[test]

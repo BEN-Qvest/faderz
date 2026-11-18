@@ -76,8 +76,8 @@ test('README screenshots', async ({ browser }) => {
   await sam.mouse.move(duck.x + duck.width / 2, duck.y + duck.height / 2);
   await sam.mouse.down();
   await view(alex, 'MIXER');
-  await expect(alex.getByTestId('duck-lamp-comm')).toHaveText('DUCK HELD');
-  await expect(alex.getByTestId('duck-lamp-remote')).toHaveText('DUCK ON');
+  await expect(alex.getByTestId('duck-lamp-comm')).toHaveText('DUCK -15.0');
+  await expect(alex.getByTestId('duck-lamp-remote')).toHaveText('DUCK -12.0');
   await alex.waitForTimeout(1000);
   const band = alex.getByRole('group', { name: 'Duck groups' });
   await alex.screenshot({ path: `${OUT}/duck-tiles.png`, clip: await around(alex, [band, alex.locator('[data-master="pgm51"]')], 8) });

@@ -243,8 +243,9 @@ test('nothing moves while duck groups fire every second, on the mixer and in the
   try {
     expect((await request.post('/__mock/ducks/script?ms=1000')).ok()).toBe(true);
     // Twelve seconds of a console holding and letting go of every group.
-    await expect(lamp).toHaveText('DUCK HELD', { timeout: 3000 });
-    await expect(lamp).toHaveText('AUTO', { timeout: 3000 });
+    await expect(lamp).toHaveText('DUCK -15.0', { timeout: 3000 });
+    // Let go, the envelope releases: the reduction falls frame by frame.
+    await expect(lamp).not.toHaveText('DUCK -15.0', { timeout: 3000 });
     await page.waitForTimeout(4000);
     await expectNoShift(page, 'ducks firing on the mixer');
     await showView(page, 'Duck');
