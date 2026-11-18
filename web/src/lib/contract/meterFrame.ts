@@ -2,8 +2,8 @@
 // #/$defs/MeterFrame. Pure: no DOM or Node APIs, so it runs in a page, a
 // Web Worker and Node alike.
 
-import { METER_FRAME_MAGIC, METER_FRAME_VERSION, METER_MAX, METER_MIN, METER_NULL } from './protocol.ts';
-import type { BusMeter, ChannelMeter, Id, Loudness, MonitorMeter, Shape } from './types';
+import { METER_ENVELOPE_FULL, METER_FRAME_MAGIC, METER_FRAME_VERSION, METER_MAX, METER_MIN, METER_NULL } from './protocol.ts';
+import type { BusMeter, ChannelMeter, DuckMeter, Id, Loudness, MonitorMeter, Shape } from './types';
 
 /** Header bytes before the replica id. */
 const FIXED_HEADER = 12;
@@ -12,6 +12,8 @@ const FNV_OFFSET = 2166136261;
 const FNV_PRIME = 16777619;
 /** Loudness values (momentary, shortTerm, integrated, lra, maxMomentary, maxShortTerm), correlation and flags per bus. */
 const BUS_TAIL = 8;
+/** Key, envelope and flags per duck group. */
+const DUCK_VALUES = 3;
 const SILENCE_DB = -120;
 const MAX_DB = 30;
 const MAX_LRA = 100;
@@ -30,6 +32,8 @@ export interface MeterLayout {
   readonly auxes: readonly MeterElement[];
   readonly mixMinus: readonly MeterElement[];
   readonly monitor: readonly MeterElement[];
+  /** Duck groups, each with legs 1. */
+  readonly ducks: readonly MeterElement[];
   /** FNV-1a 32-bit of the layout text; the frame header carries it. */
   readonly fingerprint: number;
   /** Int16 values per frame. */
@@ -50,6 +54,7 @@ export interface MeterValues {
   auxes: BusMeter[];
   mixMinus: BusMeter[];
   monitor: MonitorMeter[];
+  ducks: DuckMeter[];
 }
 
 export type MeterFrame = MeterFrameHeader & MeterValues;
@@ -71,7 +76,7 @@ export class MeterFrameError extends Error {
   }
 }
 
-type MeteredShape = Pick<Shape, 'channels' | 'buses' | 'auxes' | 'mixMinus' | 'monitorOutputs'>;
+type MeteredShape = Pick<Shape, 'channels' | 'buses' | 'auxes' | 'mixMinus' | 'monitorOutputs' | 'ducks'>;
 
 /** Layout of the meter frames of a replica running with this shape. */
 export function deriveMeterLayout(shape: MeteredShape): MeterLayout {
@@ -81,6 +86,7 @@ export function deriveMeterLayout(shape: MeteredShape): MeterLayout {
   const auxes = elements(shape.auxes);
   const mixMinus = elements(shape.mixMinus);
   const monitor = elements(shape.monitorOutputs);
+  const ducks = (shape.ducks ?? []).map((d) => ({ id: d.id, legs: 1 }));
 
   let text = '';
   let valueCount = 0;
@@ -98,7 +104,11 @@ export function deriveMeterLayout(shape: MeteredShape): MeterLayout {
     text += `o/${e.id}/${e.legs};`;
     valueCount += e.legs;
   }
-  return { channels, buses, auxes, mixMinus, monitor, fingerprint: fnv1a(text), valueCount };
+  for (const d of ducks) {
+    text += `d/${d.id}/1;`;
+    valueCount += DUCK_VALUES;
+  }
+  return { channels, buses, auxes, mixMinus, monitor, ducks, fingerprint: fnv1a(text), valueCount };
 }
 
 /** FNV-1a 32-bit over the char codes of an ASCII string. */
@@ -185,6 +195,15 @@ export function encodeMeterFrame(layout: MeterLayout, header: MeterFrameHeader, 
   section('auxes', layout.auxes, values.auxes, bus);
   section('mixMinus', layout.mixMinus, values.mixMinus, bus);
   section('monitor', layout.monitor, values.monitor, (m, e) => legs(`${e.id} peak`, m.peak, e.legs));
+  section('ducks', layout.ducks, values.ducks, (m) => {
+    // A silent key is the floor, not null: null means the group is not in use.
+    put(m.key === -Infinity ? SILENCE_DB : m.key);
+    const envelope = Math.floor(m.envelope * METER_ENVELOPE_FULL + 0.5);
+    view.setInt16(o, Number.isNaN(envelope) ? 0 : clamp(envelope, 0, METER_ENVELOPE_FULL), true);
+    o += 2;
+    view.setInt16(o, m.engaged ? 1 : 0, true);
+    o += 2;
+  });
   return bytes;
 }
 
@@ -194,7 +213,8 @@ export function encodeMeterFrame(layout: MeterLayout, header: MeterFrameHeader, 
  * fingerprint or byte length do not match. The result validates against
  * model.schema.json: legs are clamped to -120..30 dB with METER_NULL read
  * as -120, loudness to -120..30 LUFS, LRA to 0..100 LU and correlation
- * to -1..1, with METER_NULL read as null.
+ * to -1..1, with METER_NULL read as null; a duck key to -120..30 dBFS
+ * with METER_NULL read as null, a duck envelope to 0..1.
  */
 export function decodeMeterFrame(layout: MeterLayout, data: ArrayBuffer | ArrayBufferView): MeterFrame {
   const view = ArrayBuffer.isView(data)
@@ -276,5 +296,10 @@ export function decodeMeterFrame(layout: MeterLayout, data: ArrayBuffer | ArrayB
   const auxes = layout.auxes.map(bus);
   const mixMinus = layout.mixMinus.map(bus);
   const monitor = layout.monitor.map((e): MonitorMeter => ({ peak: legs(e.legs) }));
-  return { sequence: view.getUint32(4, true), replica, channels, buses, auxes, mixMinus, monitor };
+  const ducks = layout.ducks.map((): DuckMeter => {
+    const key = optional(SILENCE_DB, MAX_DB);
+    const envelope = clamp(next() / METER_ENVELOPE_FULL, 0, 1);
+    return { key, envelope, engaged: (next() & 1) === 1 };
+  });
+  return { sequence: view.getUint32(4, true), replica, channels, buses, auxes, mixMinus, monitor, ducks };
 }

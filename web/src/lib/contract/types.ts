@@ -391,6 +391,15 @@ export interface BusMeter {
 export interface MonitorMeter {
   peak: number[];
 }
+/** A duck group's readings: its targets are lowered by their depth times envelope, dB. */
+export interface DuckMeter {
+  /** Largest level of the group's keys after their key filters and key gains, dBFS; null while the group is not in use. */
+  key: number | null;
+  /** 0 (not at all) to 1 (by the full depth). */
+  envelope: number;
+  /** The detector is triggered or holding. */
+  engaged: boolean;
+}
 
 // WebSocket client messages
 export interface HelloMessage {

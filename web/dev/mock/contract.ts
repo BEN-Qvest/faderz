@@ -46,7 +46,7 @@ export class Contract {
   private readonly cache = new Map<string, ValidateFunction | null>();
   readonly clientMessage: ValidateFunction;
   readonly serverMessage: ValidateFunction;
-  /** Decoded meter frame values: arrays of ChannelMeter and BusMeter. */
+  /** Decoded meter frame values: arrays of ChannelMeter, BusMeter, MonitorMeter and DuckMeter. */
   readonly meterValues: ValidateFunction;
 
   constructor() {
@@ -65,13 +65,20 @@ export class Contract {
     const meter = (def: string) => ({ type: 'array', items: { $ref: `${ID_BASE}ws/model.schema.json#/$defs/${def}` } });
     this.meterValues = this.ajv.compile({
       type: 'object',
-      required: ['channels', 'buses', 'auxes', 'mixMinus', 'monitor'],
-      properties: { channels: meter('ChannelMeter'), buses: meter('BusMeter'), auxes: meter('BusMeter'), mixMinus: meter('BusMeter'), monitor: meter('MonitorMeter') },
+      required: ['channels', 'buses', 'auxes', 'mixMinus', 'monitor', 'ducks'],
+      properties: {
+        channels: meter('ChannelMeter'),
+        buses: meter('BusMeter'),
+        auxes: meter('BusMeter'),
+        mixMinus: meter('BusMeter'),
+        monitor: meter('MonitorMeter'),
+        ducks: meter('DuckMeter'),
+      },
     });
   }
 
-  /** Throws when decoded meter values do not match model.schema.json ChannelMeter and BusMeter. */
-  assertMeterValues(values: { channels: unknown[]; buses: unknown[]; auxes: unknown[]; mixMinus: unknown[]; monitor: unknown[] }): void {
+  /** Throws when decoded meter values do not match their model.schema.json meter objects. */
+  assertMeterValues(values: { channels: unknown[]; buses: unknown[]; auxes: unknown[]; mixMinus: unknown[]; monitor: unknown[]; ducks: unknown[] }): void {
     if (!this.meterValues(values)) {
       throw new ContractViolation(`meter frame values violate the contract: ${describe(this.meterValues)}`);
     }

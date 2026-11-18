@@ -26,10 +26,14 @@ three replicas sharing one state, binary meter frames against credit,
 loudness, AFV tally cuts every 8 s and console activity (a fader ride,
 bank changes, and every duck group held for 4 s in every 8 s), and validates
 every message it sends and receives against the contract; each meter
-frame is decoded and its values validated before it is sent.
+frame is decoded and its values validated before it is sent. A duck
+group with a trigger and a target keys from the speech of its triggers,
+with the detector, hold and envelope its settings give.
 
 - `FADERZ_MOCK_AUTOMATION=0` turns off the tally cuts and console
-  activity, so nothing changes state but clients and REST calls.
+  activity, so nothing changes state but clients and REST calls, and
+  keys every duck group in use at a steady -50 dBFS, so a group ducks
+  only while held or on, or with its threshold below -50 dBFS.
 - `FADERZ_MOCK_CHANNELS=<n>` sets the input channel count (default 29):
   mono channels `ch1`... followed by up to four stereo channels and one
   5.1 channel.
@@ -329,13 +333,16 @@ bypassed group (mode OFF, hatched) a tap sends nothing and says so, and
 a press holds the duck in only once it has lasted 0.3 s. OFF takes a
 0.5 s hold, AUTO and ON one press; the mode keys are one tab stop, and
 the arrow keys move the focus among them without selecting. No hold
-starts while nothing commits. The tile says what the group does (DUCK
-HELD, DUCK ON, BYPASS, AUTO) and sets the threshold; its key meter row
-shows the threshold only, as the meter frames carry no duck telemetry
-yet, so no key level or gain reduction is shown. More groups than fit
-one row of tiles scroll within it. A strip in a group carries a DK chip
-(KEY on a trigger), lit while a group that lowers it is held or
-latched in; it opens the Duck section of its processing panel. The
+starts while nothing commits. The tile says what the group does: while
+its envelope is above 0, how far its deepest target is lowered (DUCK
+-12.0), else DUCK HELD, DUCK ON, BYPASS or AUTO, with KEY while the key
+triggers it; it sets the threshold, and its key meter row shows the key
+level against it. More groups than fit one row of tiles scroll within
+it. A strip in a group carries a DK chip (KEY on a trigger), lit while
+a group that lowers it is held or latched in or lowers it now, when it
+reads the gain reduction in place of DK, or, on a trigger, while a
+group it keys is engaged; it opens the Duck section of its processing
+panel. The
 DUCK view sets up every group: mode, key tap, detector and key filters,
 destinations, and per channel TRIG, TARGET and the depth; up to 1280 px
 the detector starts folded to its mode keys. Its channel grid is one

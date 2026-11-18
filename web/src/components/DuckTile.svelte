@@ -1,13 +1,14 @@
 <script lang="ts">
   // Live operation of one duck group in the masters: its mode, the DUCK
-  // key, what it does now in words, who holds it, and its threshold. Every
-  // part has a fixed size, so no state change moves anything. The key
-  // meter row is reserved: until the meter frames carry the key level its
-  // well is empty and shows where the threshold sits.
+  // key, what it does now in words, who holds it, its key level against
+  // its threshold, and the threshold. Every part has a fixed size, so no
+  // state change moves anything.
+  import { onMount } from 'svelte';
   import { fit } from '../lib/format';
   import { tip } from '../lib/tip';
-  import { LAMP_WIDTH, forced, lampText } from '../lib/duck';
-  import type { DuckMode, DuckShape } from '../lib/contract/types';
+  import { LAMP_WIDTH, lampLit, lampText, liveDuck } from '../lib/duck';
+  import type { DuckMeter, DuckMode, DuckShape } from '../lib/contract/types';
+  import { onAnimationFrame } from '../lib/meters/store';
   import { getMixer } from '../lib/state/mixer.svelte';
   import { duckPath } from '../lib/state/paths';
   import { formatDb } from '../lib/audio/db';
@@ -33,8 +34,26 @@
   const members = (key: 'trigger' | 'target') => Object.keys(d.channels).filter((c) => d.channels[c]![key]);
   /** The tile on demand: what keys the group, what it lowers, where, and how it stands. */
   const description = $derived(
-    `${duck.name}: ${lampText(d).toLowerCase()}${holderText ? `, ${holderText.toLowerCase()}` : ''}. Keyed by ${names(members('trigger'))}; lowers ${names(members('target'))} in ${names(Object.keys(d.destinations).filter((k) => d.destinations[k]))}. Threshold ${formatDb(d.threshold)} dBFS. Key level is not reported by this server.`,
+    `${duck.name}: ${lampText(d).toLowerCase()}${holderText ? `, ${holderText.toLowerCase()}` : ''}. Keyed by ${names(members('trigger'))}; lowers ${names(members('target'))} in ${names(Object.keys(d.destinations).filter((k) => d.destinations[k]))}. Threshold ${formatDb(d.threshold)} dBFS.`,
   );
+
+  // The group's readings, polled on the frame clock: each changes at most
+  // once per meter frame, and only what changed renders.
+  let key = $state<number | null>(null);
+  let envelope = $state(0);
+  let engaged = $state(false);
+  onMount(() =>
+    onAnimationFrame((now) => {
+      const m = liveDuck(mixer.meters, duck.id, now);
+      key = m?.key ?? null;
+      envelope = m?.envelope ?? 0;
+      engaged = m?.engaged ?? false;
+    }),
+  );
+  const live = $derived<DuckMeter | null>(key === null && envelope === 0 && !engaged ? null : { key, envelope, engaged });
+  const lit = $derived(lampLit(d, live));
+  /** The key level on the threshold's scale, -60..0 dBFS, 0..1. */
+  const keyAt = $derived(key === null ? 0 : Math.min(1, Math.max(0, (key + 60) / 60)));
 </script>
 
 <section class="tile" aria-label={`Duck ${duck.name}`} data-duck={duck.id}>
@@ -45,13 +64,14 @@
       ><span>{holder ? mixer.ownerShort(holder) : ''}</span></span
     >
   </div>
-  <!-- Not a live region: with a key level it would change per syllable. -->
-  <div class="lamp" class:lit={forced(d)} class:bypass={mode === 'off' && !d.hold} data-testid={`duck-lamp-${duck.id}`}>
-    <span class="fixed">{fit(lampText(d), LAMP_WIDTH)}</span>
+  <!-- Not a live region: with the envelope it changes per syllable. -->
+  <div class="lamp" class:lit class:bypass={!lit && mode === 'off'} data-testid={`duck-lamp-${duck.id}`}>
+    <span class="fixed">{fit(lampText(d, live), LAMP_WIDTH)}</span>
   </div>
   <DuckModes id={duck.id} name={duck.name} />
   <DuckKey id={duck.id} name={duck.name} {shortcut} />
   <div class="keymeter" aria-hidden="true" data-testid={`duck-keymeter-${duck.id}`}>
+    <i class="key" class:over={engaged} style:transform={`scaleX(${keyAt})`} data-testid={`duck-key-level-${duck.id}`}></i>
     <span class="travel" style:transform={`translateX(${((d.threshold + 60) / 60) * 100}%)`}><i class="marker"></i></span>
   </div>
   <div class="sens">
@@ -165,6 +185,17 @@
   .keymeter .travel {
     position: absolute;
     inset: 0 2px 0 0;
+  }
+  /* The key level, scaled from the left on the travel of the marker: at
+     the threshold it ends where the marker starts. */
+  .keymeter .key {
+    position: absolute;
+    inset: 1px 2px 1px 0;
+    transform-origin: left;
+    background: var(--meter-low);
+  }
+  .keymeter .key.over {
+    background: var(--duck);
   }
   .keymeter .marker {
     position: absolute;

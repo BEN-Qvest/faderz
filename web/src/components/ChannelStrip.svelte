@@ -14,7 +14,8 @@
   import { hold } from '../lib/hold';
   import { MediaQuery } from 'svelte/reactivity';
   import { pointer } from '../lib/state/pointer';
-  import { channelDucks, forced } from '../lib/duck';
+  import { channelDucks, channelReduction, forced, liveDuck, reductionText } from '../lib/duck';
+  import { onAnimationFrame } from '../lib/meters/store';
 
   interface Props {
     channel: ChannelShape;
@@ -72,11 +73,29 @@
   const ducks = $derived(hasDucks ? channelDucks(mixer.shape!, mixer.state!, channel.id) : { triggers: [], targets: [] });
   /** Lowered now whatever the key: a group that lowers it is held or latched on. */
   const ducked = $derived(ducks.targets.filter((d) => forced(mixer.state!.ducks[d.id]!)));
+  /** From the meter frames, polled on the frame clock while the channel is in a group: dB it is lowered by, and the groups it keys that are engaged. */
+  let reduction = $state(0);
+  let keying = $state<string[]>([]);
+  $effect(() => {
+    const { triggers, targets } = ducks;
+    if (triggers.length + targets.length === 0) return;
+    const stop = onAnimationFrame((now) => {
+      const live = (id: string) => liveDuck(mixer.meters, id, now);
+      reduction = channelReduction(mixer.state!, targets, channel.id, live);
+      const engaged = triggers.filter((d) => live(d.id)?.engaged).map((d) => d.name);
+      if (engaged.join() !== keying.join()) keying = engaged;
+    });
+    return () => {
+      stop();
+      reduction = 0;
+      keying = [];
+    };
+  });
   const duckText = $derived(
     [
-      ducks.triggers.length > 0 ? `keys ${ducks.triggers.map((d) => d.name).join(', ')}` : '',
+      ducks.triggers.length > 0 ? `keys ${ducks.triggers.map((d) => d.name).join(', ')}${keying.length > 0 ? `; keying ${keying.join(', ')} now` : ''}` : '',
       ducks.targets.length > 0
-        ? `lowered by ${ducks.targets.map((d) => `${d.name} ${mixer.state!.ducks[d.id]!.channels[channel.id]!.depth} dB`).join(', ')}${ducked.length > 0 ? `; ducked now by ${ducked.map((d) => d.name).join(', ')}` : ''}`
+        ? `lowered by ${ducks.targets.map((d) => `${d.name} ${mixer.state!.ducks[d.id]!.channels[channel.id]!.depth} dB`).join(', ')}${ducked.length > 0 ? `; ducked now by ${ducked.map((d) => d.name).join(', ')}` : ''}${reduction > 0 ? '; reducing now' : ''}`
         : '',
     ]
       .filter(Boolean)
@@ -158,23 +177,25 @@
   <!-- In a shape with duck groups the EQ curve shares its row with the duck chip. -->
   <div class="eqrow">
     <button class="eq" onclick={() => onselect(channel.id)} tabindex="-1" aria-hidden="true">
-      <EqCurve eq={st.eq} hpf={st.hpf} width={hasDucks ? 50 : 72} height={18} />
+      <EqCurve eq={st.eq} hpf={st.hpf} width={hasDucks ? 46 : 72} height={18} />
     </button>
-    <!-- KEY on a trigger, DK on a target, lit while a group lowering it
-         is held or latched in; the groups are in its title and accessible
-         name. A channel in no group keeps the slot empty, so joining one
-         moves no chip. -->
+    <!-- KEY on a trigger, lit while a group it keys is engaged; DK on a
+         target, lit while a group lowering it is held or latched in, and
+         its gain reduction in place of DK while above 0. The groups are in
+         its title and accessible name. A channel in no group keeps the
+         slot empty, so joining one moves no chip. -->
     {#if hasDucks && ducks.triggers.length + ducks.targets.length === 0}
       <span class="chip duck blank" aria-hidden="true" data-testid={`duck-chip-${channel.id}`}></span>
     {:else if hasDucks}
       <button
         class="chip duck member"
         tabindex="-1"
-        class:on={ducked.length > 0}
+        class:on={ducked.length > 0 || reduction > 0 || keying.length > 0}
         onclick={() => onselect(channel.id, 'duck')}
         title={`Duck: ${duckText}. Open it in the processing panel`}
         aria-label={`${channel.name} duck, ${duckText}`}
-        data-testid={`duck-chip-${channel.id}`}>{ducks.triggers.length > 0 ? 'KEY' : 'DK'}</button
+        data-testid={`duck-chip-${channel.id}`}
+        >{#if reduction > 0}<span class="fixed gr">{reductionText(reduction)}</span>{:else}{ducks.triggers.length > 0 ? 'KEY' : 'DK'}{/if}</button
       >
     {/if}
   </div>
@@ -483,10 +504,16 @@
     gap: 4px;
     align-items: center;
   }
-  /* 24 px wide and, with its ::before, 24 px tall: a target of its own. */
+  /* 28 px wide, room for a gain reduction of GR_WIDTH characters, and,
+     with its ::before, 24 px tall: a target of its own. */
   .chip.duck {
-    flex: 0 0 24px;
+    flex: 0 0 28px;
     height: 18px;
+  }
+  /* The chip's colour and line, not those of the strip's .fixed text. */
+  .chip.duck .gr {
+    color: inherit;
+    line-height: inherit;
   }
   /* Its 3 px above and below win over the hit areas of the rows next to it. */
   .chip.duck.member::before {

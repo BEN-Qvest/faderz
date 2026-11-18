@@ -325,7 +325,10 @@ export class Cluster {
       view: null,
       waiting: [],
       conns: new Set<Conn>(),
-      meters: new ReplicaMeters(this.shape),
+      // With automation the duck groups key from their triggers' speech;
+      // without it from a steady key below threshold, so tests see a duck
+      // only where they hold or latch one.
+      meters: new ReplicaMeters(this.shape, this.automation ? 'triggers' : 'steady'),
       meterSequence: 0,
       counters: {
         deadline_miss_total: 0,

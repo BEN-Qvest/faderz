@@ -128,7 +128,14 @@ describe('flattened meter frames', () => {
       auxes: layout.auxes.map((e, i) => bus(e.legs, i + 1)),
       mixMinus: layout.mixMinus.map((e, i) => bus(e.legs, i)),
       monitor: layout.monitor.map((e) => ({ peak: legs(e.legs) })),
+      // Not in use, silent, keyed and engaged, at full depth: every flag and null.
+      ducks: layout.ducks.map((_, i) => [
+        { key: null, envelope: 0, engaged: false },
+        { key: -120, envelope: 0.25, engaged: false },
+        { key: -20.5, envelope: 1, engaged: true },
+      ][i % 3]!),
     };
+    expect(layout.ducks.length).toBeGreaterThanOrEqual(2);
     const frame = decodeMeterFrame(layout, encodeMeterFrame(layout, { sequence: 9, replica: 'r3' }, values));
     const store = new MeterStore();
     store.setShape(shape);
@@ -159,8 +166,18 @@ describe('flattened meter frames', () => {
         expect(r.correlation).toBe(want.correlation === null ? null : Math.fround(want.correlation));
       });
     }
+    layout.ducks.forEach((e, i) => {
+      const want = frame.ducks[i]!;
+      expect(store.duck(e.id)).toEqual({ key: want.key === null ? null : Math.fround(want.key), envelope: Math.fround(want.envelope), engaged: want.engaged });
+      // A duck group is no level meter.
+      expect(store.get('ducks', e.id)).toBeUndefined();
+      expect(store.hasTruePeak('ducks', e.id)).toBe(false);
+    });
+    // The duck values come last, after the monitor outputs: every other element reads as before.
+    expect(store.duck(layout.ducks[1]!.id)).toEqual({ key: -120, envelope: 0.25, engaged: false });
     store.clear();
     expect(store.get('channels', 'ch1')).toBeUndefined();
+    expect(store.duck(layout.ducks[0]!.id)).toBeUndefined();
   });
 });
 
