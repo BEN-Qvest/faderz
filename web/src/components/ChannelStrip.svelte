@@ -14,6 +14,7 @@
   import { hold } from '../lib/hold';
   import { MediaQuery } from 'svelte/reactivity';
   import { pointer } from '../lib/state/pointer';
+  import { channelDucks, forced } from '../lib/duck';
 
   interface Props {
     channel: ChannelShape;
@@ -65,6 +66,22 @@
   const badge = $derived(channel.layout === 'mono' ? '' : channel.layout === 'stereo' ? 'ST' : channel.layout);
   const short = (bus: { name: string; kind: string }) =>
     bus.kind === 'cleanFeed' ? 'CF' : bus.kind === 'me' ? 'ME' : (bus.name.split(' ').at(-1) ?? bus.name).slice(0, 4);
+
+  /** The groups this channel keys and those that lower it; none in a shape without duck groups. */
+  const hasDucks = $derived((mixer.shape?.ducks ?? []).length > 0);
+  const ducks = $derived(hasDucks ? channelDucks(mixer.shape!, mixer.state!, channel.id) : { triggers: [], targets: [] });
+  /** Lowered now whatever the key: a group that lowers it is held or latched on. */
+  const ducked = $derived(ducks.targets.filter((d) => forced(mixer.state!.ducks[d.id]!)));
+  const duckText = $derived(
+    [
+      ducks.triggers.length > 0 ? `keys ${ducks.triggers.map((d) => d.name).join(', ')}` : '',
+      ducks.targets.length > 0
+        ? `lowered by ${ducks.targets.map((d) => `${d.name} ${mixer.state!.ducks[d.id]!.channels[channel.id]!.depth} dB`).join(', ')}${ducked.length > 0 ? `; ducked now by ${ducked.map((d) => d.name).join(', ')}` : ''}`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('; ') || 'in no duck group',
+  );
 
   function toggleSolo(mode: Exclude<Solo, 'off'>): void {
     mixer.set(channelPath(channel.id, 'solo'), solo === mode ? 'off' : mode);
@@ -138,9 +155,29 @@
       >
     {/each}
   </div>
-  <button class="eq" onclick={() => onselect(channel.id)} tabindex="-1" aria-hidden="true">
-    <EqCurve eq={st.eq} hpf={st.hpf} width={72} height={18} />
-  </button>
+  <!-- In a shape with duck groups the EQ curve shares its row with the duck chip. -->
+  <div class="eqrow">
+    <button class="eq" onclick={() => onselect(channel.id)} tabindex="-1" aria-hidden="true">
+      <EqCurve eq={st.eq} hpf={st.hpf} width={hasDucks ? 50 : 72} height={18} />
+    </button>
+    <!-- KEY on a trigger, DK on a target, lit while a group lowering it
+         is held or latched in; the groups are in its title and accessible
+         name. A channel in no group keeps the slot empty, so joining one
+         moves no chip. -->
+    {#if hasDucks && ducks.triggers.length + ducks.targets.length === 0}
+      <span class="chip duck blank" aria-hidden="true" data-testid={`duck-chip-${channel.id}`}></span>
+    {:else if hasDucks}
+      <button
+        class="chip duck member"
+        tabindex="-1"
+        class:on={ducked.length > 0}
+        onclick={() => onselect(channel.id, 'duck')}
+        title={`Duck: ${duckText}. Open it in the processing panel`}
+        aria-label={`${channel.name} duck, ${duckText}`}
+        data-testid={`duck-chip-${channel.id}`}>{ducks.triggers.length > 0 ? 'KEY' : 'DK'}</button
+      >
+    {/if}
+  </div>
 
   <!-- Every bus is an output that leaves the mixer: assigning or removing
        a channel takes a hold, as muting an output does. -->
@@ -441,6 +478,33 @@
     color: var(--afl-ink);
     background: var(--afl);
   }
+  .eqrow {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+  /* 24 px wide and, with its ::before, 24 px tall: a target of its own. */
+  .chip.duck {
+    flex: 0 0 24px;
+    height: 18px;
+  }
+  /* Its 3 px above and below win over the hit areas of the rows next to it. */
+  .chip.duck.member::before {
+    z-index: 1;
+  }
+  .chip.duck.blank {
+    background: none;
+    cursor: default;
+  }
+  /* In a group: an edge, so membership reads without colour. */
+  .chip.duck.member {
+    box-shadow: inset 0 0 0 1px var(--key-edge);
+  }
+  .chip.duck.on {
+    color: var(--duck-ink);
+    background: var(--duck);
+    box-shadow: none;
+  }
   .routes .chip.on {
     color: var(--on-ink);
     background: var(--on);
@@ -576,6 +640,7 @@
   }
   .holder.held {
     background: var(--owned);
+    color: var(--owned-ink);
   }
   .holder.held.mine {
     background: var(--on);
@@ -643,6 +708,11 @@
       display: flex;
       align-items: center;
     }
+    /* Its own target here, not a row's: 24 px tall. */
+    .chip.duck {
+      height: 24px;
+      pointer-events: auto;
+    }
     .pan {
       min-height: 28px;
     }
@@ -668,7 +738,7 @@
       contain-intrinsic-size: auto 86px auto 280px;
     }
     .proc,
-    .eq,
+    .eqrow,
     .routes,
     .vca {
       display: none;

@@ -128,3 +128,58 @@ test('shows no title over a TALK key a finger holds, since that hold talks', asy
   await expect(page.getByTestId('touch-info')).toHaveCount(0);
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
 });
+
+test('operates a duck group from the MASTERS sheet without a scroll, a whole bank of strips under it', async ({ page, request }) => {
+  await live(page);
+  const width = page.viewportSize()!.width;
+  const box = (await page.locator('.scroller').boundingBox())!;
+  if (width >= 8 * STRIP_W + 20) expect(box.width).toBeGreaterThanOrEqual(8 * STRIP_W);
+  await page.getByRole('button', { name: 'MASTERS' }).click();
+  // The tiles come first in the sheet: every control of one is on screen as it opens.
+  const view = page.viewportSize()!;
+  const tile = page.locator('[data-duck="comm"]');
+  for (const control of await tile.locator('button, [role="slider"]').all()) {
+    const r = (await control.boundingBox())!;
+    expect(r.x >= 0 && r.y >= 0 && r.x + r.width <= view.width && r.y + r.height <= view.height, `${await control.getAttribute('aria-label')} at ${JSON.stringify(r)}`).toBe(true);
+  }
+  const mode = async () => (await serverState(request)).state.ducks['comm']!.mode;
+  try {
+    // A tap latches it on and the next one sets it back.
+    await page.getByTestId('duck-key-comm').tap();
+    await expect.poll(mode).toBe('on');
+    await page.getByTestId('duck-key-comm').tap();
+    await expect.poll(mode).toBe('auto');
+  } finally {
+    await patch(request, '/ducks/comm/mode', 'auto');
+  }
+});
+
+test('gives every duck key, switch and depth field a 44 px target on touch', async ({ page }) => {
+  await live(page);
+  await page.getByRole('button', { name: 'MASTERS' }).click();
+  const h = async (loc: ReturnType<typeof page.locator>) => (await loc.boundingBox())!.height;
+  const tile = page.locator('[data-duck="comm"]');
+  expect(await h(page.getByTestId('duck-key-comm'))).toBeGreaterThanOrEqual(44);
+  for (const radio of await tile.getByRole('radio').all()) expect(await h(radio)).toBeGreaterThanOrEqual(44);
+  await page.getByRole('button', { name: 'MASTERS' }).click();
+  // A short screen has no chip rows; elsewhere the chip is a target of its own.
+  const chip = page.getByTestId('duck-chip-ch13');
+  if (await chip.isVisible()) {
+    const box = (await chip.boundingBox())!;
+    expect(Math.min(box.width, box.height)).toBeGreaterThanOrEqual(24);
+  }
+  await page.locator('[data-channel="ch13"] .head').click();
+  const section = page.locator('[data-section="duck"]');
+  await section.scrollIntoViewIfNeeded();
+  expect(await h(section.getByRole('button', { name: 'Amb 1 is lowered by Commentary' }))).toBeGreaterThanOrEqual(44);
+  expect(await h(section.getByRole('textbox', { name: 'Depth value, type to set' }).first())).toBeGreaterThanOrEqual(44);
+  await page.keyboard.press('Escape');
+  const tab = page.getByRole('button', { name: 'Duck', exact: true });
+  if (await tab.isVisible()) await tab.click();
+  else await page.getByRole('combobox', { name: 'View' }).selectOption({ label: 'Duck' });
+  expect(await h(page.getByRole('switch', { name: 'Pres 1 triggers Commentary' }))).toBeGreaterThanOrEqual(44);
+  expect(await h(page.getByRole('textbox', { name: /^Pres 1 depth under Commentary/ }))).toBeGreaterThanOrEqual(44);
+  expect(await h(page.getByRole('button', { name: 'Commentary lowers its targets in M&E' }))).toBeGreaterThanOrEqual(44);
+  await page.getByRole('button', { name: 'Detector settings' }).click();
+  expect(await h(page.getByRole('button', { name: /^Commentary preset heavy/ }))).toBeGreaterThanOrEqual(44);
+});
