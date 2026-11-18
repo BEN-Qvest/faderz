@@ -1,6 +1,8 @@
 # F1 and F2 of an X-Touch in MC mode (notes 54 and 55, 0x36 and 0x37)
 # drive the shape's duck groups comm and comm-b in order. Several
-# commands on one ! line are separated by " ; ".
+# commands on one ! line are separated by " ; ". A ~ line is a meter
+# frame: per duck group in shape order its envelope in ten-thousandths
+# and its flags, groups separated by ",".
 
 # Both groups are in auto: the keys are dark.
 + 5
@@ -41,3 +43,21 @@
 + 100
 > 90 36 00
 ! touch /ducks/comm/hold ; set /ducks/comm/hold true ; set /ducks/comm/mode "on" ; release /ducks/comm/hold
+# Unanswered, the latches are dropped after 3 s: both groups show their
+# state, auto. A key then lights while its group ducks its targets by
+# the meter frames, and goes dark once they stop for 120 ms.
++ 3000
+< 90 36 00, 90 37 00
+~ 5000 1, 0 0
+< 90 36 7f
++ 40
+~ 2500 1, 0 0
+< none-of 90
+~ 0 0, 0 0
+< 90 36 00
+~ 10000 1, 0 0
+< 90 36 7f
++ 115
+< none-of 90
++ 5
+< 90 36 00
