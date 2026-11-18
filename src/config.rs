@@ -825,8 +825,9 @@ impl Config {
     /// The engine configuration of the `mxl` section, with a matrix of
     /// zeros: one input per channel reading its flow of input a, one
     /// output per output of the shape writing this replica's flow
-    /// ([`Config::member_flows`]), and one meter per bus, aux,
-    /// mix-minus and monitor output no output carries.
+    /// ([`Config::member_flows`]), one meter per bus, aux,
+    /// mix-minus and monitor output no output carries, and the columns a
+    /// duck group can lower ([`crate::duck::columns`]).
     fn audio(&self, shape: &Shape) -> Result<Option<samplez::Config>, String> {
         let Some(mxl) = &self.mxl else {
             return Ok(None);
@@ -958,6 +959,7 @@ impl Config {
         v["inputs"] = json!(inputs);
         v["meters"] = json!(meters);
         v["matrix"] = json!(vec![vec![0.0f32; columns]; rows]);
+        v["duckColumns"] = json!(crate::duck::columns(shape));
         v["rt"] = Value::Object(self.rt.clone());
         // samplez checks the flows of each ordinal; this replica runs its
         // own.
@@ -1447,6 +1449,9 @@ mod tests {
             .collect();
         assert_eq!(meters, [("cf", 2), ("aux1", 1), ("mm1", 2), ("mon", 2)]);
         assert_eq!((e.columns(), e.matrix[0].len()), (9, 9));
+        // The shape has a duck group: every column but a direct out's
+        // may be ducked.
+        assert_eq!(e.duck_columns, (0..9).collect::<Vec<_>>());
         let stereo = Some(vec!["L".to_owned(), "R".to_owned()]);
         assert_eq!(e.inputs[2].loudness_channels, stereo);
         assert_eq!(e.meters[0].loudness_channels, stereo);

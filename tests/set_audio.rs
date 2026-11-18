@@ -2,7 +2,8 @@
 //! runs on a runtime of its own, so killing one ends every task it ran
 //! and drops its engine. They read the same input flows, each writes its
 //! own member flow, and what they write agrees, through a busy command
-//! sequence and a replica killed and started again.
+//! sequence with a duck group keying and releasing, and a replica killed
+//! and started again.
 
 mod common;
 
@@ -35,10 +36,28 @@ fn shape() -> Value {
         ],
         "buses": [{ "id": "pgm", "name": "PGM", "kind": "program", "width": 2, "layout": "stereo" }],
         "auxes": [], "mixMinus": [], "vcas": [], "monitorOutputs": [],
+        "ducks": [{ "id": "talk", "name": "Talk" }],
         "outputs": [
             { "id": "out-pgm", "name": "PGM out", "source": "pgm", "width": 2, "layout": "stereo" },
         ],
     })
+}
+
+/// The duck group: ch1 keys it after its fader, so the faders of
+/// [`command`] trigger and release it (ch1's sine at -6 dBFS reaches the
+/// threshold with its fader above -14 dB), and it lowers ch2 in the
+/// programme. Short times, so it moves between commands.
+fn ducking() -> Vec<(&'static str, Value)> {
+    vec![
+        ("/ducks/talk/channels/ch1/trigger", json!(true)),
+        ("/ducks/talk/channels/ch2/target", json!(true)),
+        ("/ducks/talk/channels/ch2/depth", json!(12)),
+        ("/ducks/talk/keyTap", json!("postFader")),
+        ("/ducks/talk/threshold", json!(-20)),
+        ("/ducks/talk/attackMs", json!(10)),
+        ("/ducks/talk/holdMs", json!(50)),
+        ("/ducks/talk/releaseMs", json!(100)),
+    ]
 }
 
 /// What every replica of the set shares, and what each one keeps across
@@ -408,9 +427,14 @@ async fn request(api: std::net::SocketAddr, body: &str) -> String {
 
 /// The `i`th command of a console session: faders, trims, mutes and
 /// routes, and every seventh switches ch2 between its inputs a and b,
-/// once together with a fader.
+/// once together with a fader; every eleventh latches the duck group on
+/// or back to auto.
 fn command(i: usize) -> Vec<(&'static str, Value)> {
     let db = |k: usize| json!(-((k * 7 % 40) as i64));
+    if i % 11 == 10 {
+        let mode = if i % 22 == 10 { "on" } else { "auto" };
+        return vec![("/ducks/talk/mode", json!(mode))];
+    }
     match i % 7 {
         0 if i.is_multiple_of(14) => vec![("/channels/ch2/input", json!("b"))],
         0 => vec![
@@ -496,7 +520,8 @@ fn steady(nodes: &[Option<Node>], n: usize) {
 /// Two replicas of the three form no set: neither starts contact, so
 /// neither is ready, until the third is a voter too. Every replica of the
 /// set then writes the same audio through a session of faders, trims,
-/// mutes, routes and input switches. A follower killed meanwhile misses
+/// mutes, routes and input switches, with a duck group keyed by one
+/// channel's fader lowering the other. A follower killed meanwhile misses
 /// commands, input switches among them; started again on its volume it
 /// catches up, commits again and writes what the others write. The leader
 /// killed, the other two elect another and go on writing alike; it comes
@@ -544,11 +569,18 @@ fn replicas_write_equal_audio_and_a_restarted_one_catches_up() {
         steady(&nodes, n);
     }
 
+    write(&nodes, 0, &ducking());
     let from = Outputs::now() + 1;
+    // The largest envelope the duck group reached on a replica.
+    let mut ducked = 0.0f32;
     for i in 0..42 {
         write(&nodes, i, &command(i));
         std::thread::sleep(Duration::from_millis(40));
+        let engine = node(&nodes, i % REPLICAS).server.audio.clone().unwrap();
+        let status = engine.engine().status();
+        ducked = (status.ducks.iter()).fold(ducked, |e, d| e.max(d.envelope));
     }
+    assert!(ducked > 0.5, "the duck group never ducked: {ducked}");
     std::thread::sleep(Duration::from_millis(500));
     agree(&nodes, &outputs, from, 500);
 

@@ -49,15 +49,15 @@ The engine applies the channel strip (trim, leg trim, polarity,
 high-pass, EQ, gate, compressor), faders, mutes, VCA offsets and mutes,
 AFV open and closed with the off level, mono pan and the fold-down of
 wider channels, bus routing, sends, the bus, aux and mix-minus faders and
-mutes, bus and aux polarity, mix-minus exclusions, and the monitor's
-source, fold-down, level, dim, cut, mono and speaker mutes and solos. The
-rest of the state is kept, shown and replicated but not applied to the
+mutes, bus and aux polarity, mix-minus exclusions, the monitor's
+source, fold-down, level, dim, cut, mono and speaker mutes and solos, and
+duck groups. The rest of the state is kept, shown and replicated but not applied to the
 audio in this version: channel delay, PFL and AFL listening, VCA solo,
 front/rear pan, divergence and LFE send, the stereo image setting of a
 channel and of the monitor, the monitor's talkback dim, bus and aux
 processing (EQ, dynamics, limiter, delay), the line-up tone, mix-minus
-talkback interrupts, the AFV rise, hold and fall times, duck groups, and
-the scene crossfade time.
+talkback interrupts, the AFV rise, hold and fall times, and the scene
+crossfade time.
 
 ## The console
 
@@ -87,6 +87,20 @@ Duck groups lower ambience and music under commentary. The DUCK view
 sets up each group's triggers, targets with their depth, destinations
 and detector; a tile per group in the masters latches, holds, bypasses
 and sets the threshold on air.
+
+Each group is a samplez duck detector keyed by its trigger channels
+after their strips, at the gain its key tap gives: 1 pre-fader, 1 or 0
+pre-fader while open (fader open, not muted, no VCA mute), the fader,
+mute and VCA gain post-fader. It lowers each target channel by its depth
+in the outputs and engine meters of the group's destinations, and in
+the monitor while the monitor's source is one of them; overlapping
+groups lower a channel by the deepest. A shape with duck groups gives
+the engine every column of a bus, aux, mix-minus or monitor output as a
+`duckColumns` column. samplez counts each coefficient of such a column
+six times against 150 coefficients per sample of the block, refuses a
+configuration that exceeds that and names the `engine.blockSize` that
+takes it. The meter frames carry each group's key level, envelope and
+whether it is engaged.
 
 ![The DUCK view with the Commentary and Remote comm groups: mode, detector, presets, destinations, and the trigger, target and depth of every channel](docs/screenshots/duck-view.png)
 
@@ -313,8 +327,8 @@ so a change of `flows` changes that list in the same change.
 
 The engine follows the replicated log (samplez's replicated mode). Each
 log entry's engine entries are derived from the mixer state as the entry
-applies: the difference between the gains, strip parameters and input
-flows the state sets before and after it. So every replica hands its
+applies: the difference between the gains, strip parameters, duck group
+settings and masks and input flows the state sets before and after it. So every replica hands its
 engine the same entries at the same sample index. The engines hash the
 pages they compute and the set compares them; a replica whose pages
 differ is withdrawn and resynced from another replica's engine core.

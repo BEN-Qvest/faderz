@@ -2158,7 +2158,7 @@ dependencies = [
 [[package]]
 name = "samplez"
 version = "0.7.0"
-source = "git+https://github.com/danielclasen/samplez?tag=v0.7.0#3becb6cab98b8fe0a31f948d437f370d98aee9b6"
+source = "git+https://github.com/danielclasen/samplez?rev=40307f33b027c33ee10a118aa09ca07d5055ed1e#40307f33b027c33ee10a118aa09ca07d5055ed1e"
 dependencies = [
  "libc",
  "mxl-sys",
@@ -2173,7 +2173,7 @@ dependencies = [
 [[package]]
 name = "samplez-dsp"
 version = "0.7.0"
-source = "git+https://github.com/danielclasen/samplez?tag=v0.7.0#3becb6cab98b8fe0a31f948d437f370d98aee9b6"
+source = "git+https://github.com/danielclasen/samplez?rev=40307f33b027c33ee10a118aa09ca07d5055ed1e#40307f33b027c33ee10a118aa09ca07d5055ed1e"
 dependencies = [
  "libm",
  "serde",
@@ -2182,7 +2182,7 @@ dependencies = [
 [[package]]
 name = "samplez-mxl"
 version = "0.7.0"
-source = "git+https://github.com/danielclasen/samplez?tag=v0.7.0#3becb6cab98b8fe0a31f948d437f370d98aee9b6"
+source = "git+https://github.com/danielclasen/samplez?rev=40307f33b027c33ee10a118aa09ca07d5055ed1e#40307f33b027c33ee10a118aa09ca07d5055ed1e"
 dependencies = [
  "mxl",
  "mxl-sys",
@@ -2192,7 +2192,7 @@ dependencies = [
 [[package]]
 name = "samplez-replica"
 version = "0.7.0"
-source = "git+https://github.com/danielclasen/samplez?tag=v0.7.0#3becb6cab98b8fe0a31f948d437f370d98aee9b6"
+source = "git+https://github.com/danielclasen/samplez?rev=40307f33b027c33ee10a118aa09ca07d5055ed1e#40307f33b027c33ee10a118aa09ca07d5055ed1e"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2218,7 +2218,7 @@ dependencies = [
 [[package]]
 name = "samplez-service"
 version = "0.7.0"
-source = "git+https://github.com/danielclasen/samplez?tag=v0.7.0#3becb6cab98b8fe0a31f948d437f370d98aee9b6"
+source = "git+https://github.com/danielclasen/samplez?rev=40307f33b027c33ee10a118aa09ca07d5055ed1e#40307f33b027c33ee10a118aa09ca07d5055ed1e"
 dependencies = [
  "axum",
  "base64 0.22.1",

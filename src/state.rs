@@ -23,7 +23,7 @@ use crate::shape::Shape;
 /// state, in [`Mixer::config_hash`]: a change to the derivation that
 /// gives other targets for one state takes another version, so replicas
 /// deriving differently never form one set.
-pub const DERIVATION_VERSION: u32 = 1;
+pub const DERIVATION_VERSION: u32 = 2;
 
 /// The layout [`Product::save`] writes. A snapshot carries it beside
 /// the state, which binaries before it read from the top level: they
@@ -3168,6 +3168,10 @@ mod tests {
         Apply { generation }
     }
 
+    fn flows(ids: &[&str]) -> Vec<Option<String>> {
+        ids.iter().map(|id| Some((*id).to_owned())).collect()
+    }
+
     fn gain_bits(t: &Targets) -> Vec<Vec<u32>> {
         let row = |r: &Vec<f32>| r.iter().map(|g| g.to_bits()).collect();
         t.gains.iter().map(row).collect()
@@ -3226,7 +3230,7 @@ mod tests {
             })
         );
         assert_eq!(format!("{:?}", t.strips), format!("{strips:?}"));
-        assert_eq!(t.flows, ["b1", "a2", "a3"]);
+        assert_eq!(t.flows, flows(&["b1", "a2", "a3"]));
         // ch1 under the VCA, -10 - 6 dB, panned centre onto PGM left.
         let pgm_left = (10f64.powf(-16.0 / 20.0) * std::f64::consts::FRAC_PI_4.cos()) as f32;
         assert_eq!(t.gains[0][0].to_bits(), pgm_left.to_bits());
@@ -3362,7 +3366,7 @@ mod tests {
             let some = |next: &mut dyn FnMut(u64) -> u64| -> Value {
                 json!(channels.iter().filter(|_| next(3) == 0).collect::<Vec<_>>())
             };
-            match next(30) {
+            match next(35) {
                 0 => (format!("/channels/{ch}/fader"), db),
                 1 => (format!("/channels/{ch}/mute"), flag),
                 2 => (
@@ -3449,6 +3453,19 @@ mod tests {
                     json!(["a", "b"][next(2) as usize]),
                 ),
                 28 => (format!("/channels/{ch}/meterTap"), json!("preFader")),
+                29 | 30 => {
+                    let key = ["trigger", "target"][next(2) as usize];
+                    (format!("/ducks/comm/channels/{ch}/{key}"), flag)
+                }
+                31 => (format!("/ducks/comm/channels/{ch}/depth"), json!(next(41))),
+                32 => (
+                    format!("/ducks/comm/destinations/{}", sources[next(5) as usize]),
+                    flag,
+                ),
+                33 => (
+                    "/ducks/comm/keyTap".into(),
+                    json!(["preFader", "preFaderOpen", "postFader"][next(3) as usize]),
+                ),
                 _ => ("/metering/loudness/preset".into(), json!("atsc")),
             }
         };
@@ -3540,6 +3557,12 @@ mod tests {
                     "{at}"
                 );
                 assert_eq!(kept.flows, whole.flows, "{at}");
+                assert_eq!(
+                    format!("{:?}", kept.ducks),
+                    format!("{:?}", whole.ducks),
+                    "{at}"
+                );
+                assert_eq!(kept.masks, whole.masks, "{at}");
             }
         }
         assert!(
@@ -3612,14 +3635,14 @@ mod tests {
         ));
         assert!(refused(&m, "c"));
         assert_eq!(at(&m, "/channels/ch1/input"), &json!("a"));
-        assert_eq!(m.targets().unwrap().flows[0], "a1");
+        assert_eq!(m.targets().unwrap().flows[0].as_deref(), Some("a1"));
         for generation in [Some(true), None] {
             let mut m = wired();
             assert!(matches!(
                 apply_as(&mut m, &off, generation),
                 Effect::Changed(_)
             ));
-            assert_eq!(m.targets().unwrap().flows[0], "b1");
+            assert_eq!(m.targets().unwrap().flows[0].as_deref(), Some("b1"));
         }
         // Commands that switch no input apply off it.
         let mut m = wired();
@@ -3655,7 +3678,7 @@ mod tests {
         for m in [&mut m, &mut other] {
             assert!(matches!(apply_as(m, &two, Some(true)), Effect::Unchanged));
             assert!(refused(m, "r2"));
-            assert_eq!(m.targets().unwrap().flows, ["b1", "b2", "a3"]);
+            assert_eq!(m.targets().unwrap().flows, flows(&["b1", "b2", "a3"]));
         }
         // The writer's classification of it is both slots.
         assert_eq!(
@@ -3673,7 +3696,7 @@ mod tests {
             apply_as(&mut m, &one, Some(true)),
             Effect::Changed(_)
         ));
-        assert_eq!(m.targets().unwrap().flows, ["a1", "a2", "a3"]);
+        assert_eq!(m.targets().unwrap().flows, flows(&["a1", "a2", "a3"]));
     }
 
     /// The configuration hash follows the shape, the declared consoles,
