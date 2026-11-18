@@ -46,6 +46,9 @@ pub struct App {
     /// The engine's counters last read ([`App::count`]); none without an
     /// engine.
     counters: Mutex<Option<Value>>,
+    /// The engine's inputs and outputs last read ([`App::count`]); none
+    /// without an engine.
+    engine: Mutex<Option<Value>>,
 }
 
 /// A connection counted by [`App::connected`]; dropping it counts it
@@ -132,6 +135,7 @@ impl App {
             },
             requests: Mutex::default(),
             counters: Mutex::default(),
+            engine: Mutex::default(),
         })
     }
 
@@ -213,6 +217,39 @@ impl App {
         Some(m.to_string())
     }
 
+    /// The model `Status` of `GET /status`: this replica as the replicated
+    /// state sees it, its audio replica's state in contact, and the
+    /// engine's inputs and outputs as last read.
+    pub fn status(&self) -> Value {
+        use samplez_replica::state::ReplicaState as S;
+        let info = self.replica.replica();
+        let contact = self.replica.contact_metrics();
+        let in_contact = contact.as_ref().map(|m| m.in_contact);
+        // None for a replica without an engine, and until the first step.
+        let state = (contact.and_then(|m| m.replica?.state)).map(|s| match s {
+            S::Starting => "starting",
+            S::Committing => "committing",
+            S::Withdrawn => "withdrawn",
+            S::Diverged => "diverged",
+            S::VersionMismatch => "versionMismatch",
+            S::Resync => "resync",
+        });
+        json!({
+            "replica": {
+                "id": self.name,
+                "node": self.replica.id().to_string(),
+                "role": info.role,
+                "leader": info.leader,
+                "inSync": info.in_sync,
+                "ready": info.ready,
+                "commitable": info.commitable,
+                "inContact": in_contact,
+                "state": state,
+            },
+            "engine": self.engine.lock().expect("engine lock poisoned").clone(),
+        })
+    }
+
     /// Reads the engine's counters every [`COUNTERS_PERIOD`] and sends
     /// them to every connection, standby ones included, so a promoted
     /// standby has them at once; a connection not sent the last yet gets
@@ -222,7 +259,9 @@ impl App {
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             ticks.tick().await;
-            *self.counters.lock().expect("counters lock poisoned") = Some(audio.counters());
+            let (counters, engine) = audio.readings();
+            *self.counters.lock().expect("counters lock poisoned") = Some(counters);
+            *self.engine.lock().expect("engine lock poisoned") = Some(engine);
             if let Some(m) = self.counters_message() {
                 self.hub.publish(Frame::Counters(m.into()));
             }

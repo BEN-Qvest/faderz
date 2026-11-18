@@ -517,10 +517,12 @@ fn steady(nodes: &[Option<Node>], n: usize) {
     assert!(steady, "replica {n} did not commit: {}", states(nodes));
 }
 
-/// Two replicas of the three form no set: neither starts contact, so
-/// neither is ready, until the third is a voter too. Every replica of the
-/// set then writes the same audio through a session of faders, trims,
-/// mutes, routes and input switches, with a duck group keyed by one
+/// Contact runs from each replica's start. The set forms with the first
+/// replica alone and grows by two voters at once: with two of the three
+/// running the first commits alone and the second stays a learner, and
+/// once the third starts all three are voters and commit. Every replica
+/// of the set then writes the same audio through a session of faders,
+/// trims, mutes, routes and input switches, with a duck group keyed by one
 /// channel's fader lowering the other. A follower killed meanwhile misses
 /// commands, input switches among them; started again on its volume it
 /// catches up, commits again and writes what the others write. The leader
@@ -543,31 +545,83 @@ fn replicas_write_equal_audio_and_a_restarted_one_catches_up() {
     for n in 0..2 {
         nodes[n] = Some(set.start(n, listeners[n].take()));
     }
-    // Joined and caught up, on the replica's terms; the third is not a
-    // voter yet, so neither starts contact or is ready.
-    let joined = until(30, || {
-        (0..2).all(|n| node(&nodes, n).ops("/healthz").1["replica"]["ready"] == true)
+    let membership = |nodes: &[Option<Node>]| {
+        let raft = node(nodes, 0)
+            .server
+            .app
+            .replica
+            .raft()
+            .metrics()
+            .borrow()
+            .clone();
+        let m = raft.membership_config.membership().clone();
+        (m.voter_ids().count(), m.learner_ids().count())
+    };
+    // The set forms with the first replica alone, and grows by two
+    // voters at once, never to an even count: with two of three running,
+    // the first commits as a set of one and the second stays a learner.
+    steady(&nodes, 0);
+    let learner = until(30, || membership(&nodes) == (1, 1));
+    assert!(
+        learner,
+        "the second replica is no learner: {}",
+        states(&nodes)
+    );
+    // Contact runs on the learner too, which reports to be promoted, and
+    // a learner is never ready; the first replica, alone a voter, is.
+    let contact = until(10, || {
+        node(&nodes, 1)
+            .server
+            .app
+            .replica
+            .contact_metrics()
+            .is_some()
     });
-    assert!(joined, "two replicas did not join: {}", states(&nodes));
+    assert!(
+        contact,
+        "the learner's contact does not run: {}",
+        states(&nodes)
+    );
     for _ in 0..10 {
-        for n in 0..2 {
-            let node = node(&nodes, n);
-            assert_eq!(
-                node.ops("/readyz").0,
-                503,
-                "replica {n}: {}",
-                states(&nodes)
-            );
-            assert!(node.server.app.replica.contact_metrics().is_none());
-        }
+        assert_eq!(membership(&nodes), (1, 1), "{}", states(&nodes));
+        assert_eq!(node(&nodes, 1).ops("/readyz").0, 503, "{}", states(&nodes));
+        assert_eq!(node(&nodes, 0).ops("/readyz").0, 200, "{}", states(&nodes));
         std::thread::sleep(Duration::from_millis(100));
     }
     nodes[2] = Some(set.start(2, listeners[2].take()));
     let engines = (0..REPLICAS).map(|n| node(&nodes, n).engine()).collect();
     let (outputs, reader) = Outputs::read(set.domain.0.clone(), set.members.clone(), engines);
+    let three = until(60, || membership(&nodes) == (REPLICAS, 0));
+    assert!(
+        three,
+        "the set did not grow to three voters: {}",
+        states(&nodes)
+    );
     for n in 0..REPLICAS {
         steady(&nodes, n);
     }
+    // Each replica's status: committing, a leader or a follower, its
+    // leader named by node id as it names itself.
+    let mut leaders = std::collections::BTreeSet::new();
+    let mut nodes_ids = std::collections::BTreeSet::new();
+    for n in 0..REPLICAS {
+        let node = node(&nodes, n);
+        let (code, body) = node
+            .runtime
+            .block_on(get(node.server.api, "/api/v1/status"));
+        assert_eq!(code, 200, "{body}");
+        let status: Value = serde_json::from_str(&body).unwrap();
+        let r = &status["replica"];
+        assert_eq!(r["state"], "committing", "{status}");
+        assert!(
+            ["leader", "follower"].contains(&r["role"].as_str().unwrap()),
+            "{status}"
+        );
+        nodes_ids.insert(r["node"].as_str().unwrap().to_owned());
+        leaders.insert(r["leader"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(leaders.len(), 1, "one leader: {leaders:?}");
+    assert!(nodes_ids.is_superset(&leaders), "{nodes_ids:?} {leaders:?}");
 
     write(&nodes, 0, &ducking());
     let from = Outputs::now() + 1;

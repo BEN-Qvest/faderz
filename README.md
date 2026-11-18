@@ -333,13 +333,11 @@ engine the same entries at the same sample index. The engines hash the
 pages they compute and the set compares them; a replica whose pages
 differ is withdrawn and resynced from another replica's engine core.
 
-- A replica starts contact with the set, and its engine computes, once
-  it is a voter of a membership that is not changing and has applied
-  what the set committed. Until the set has formed, every replica must
-  be a voter and none a learner; the replica then writes `set-formed`
-  to `replica.dataDir` and from then on needs only to be a voter. While it
-  waits it logs why, and which replicas it waits for, at most every
-  30 s. Contact or the rollout failing to start exits faderz non-zero.
+- A replica starts contact with the set, and its engine with it, as it
+  starts: joining, a learner or catching up. samplez promotes a learner
+  on the reports contact sends, and rebuilds the engine of a replica
+  that took entries past their deadlines from the state it applied.
+  Contact or the rollout failing to start exits faderz non-zero.
 - A replica starts with its engine idle and builds the engine's core
   from the state it applied once its clock is verified; it commits its
   outputs once its pages match the others'. A replica restarted on its
@@ -395,6 +393,7 @@ committed.
 | `GET /api/v1/state` | shape, live state, owners and the revision |
 | `PATCH /api/v1/state` | write one or more controls atomically |
 | `GET /api/v1/replicas` | the replica set as the serving replica sees it |
+| `GET /api/v1/status` | the serving replica's role, readiness and contact state, and its engine's inputs (state, flow, blocks copied, late and too late) and outputs |
 | `POST /api/v1/scenes`, `PUT` and `DELETE /api/v1/scenes/{id}` | store, overwrite or rename, and delete scenes |
 | `POST /api/v1/scenes/{id}/recall` | recall a scene |
 | `POST /api/v1/afv/tally`, `PUT /api/v1/afv/tally` | one source's tally change, or the full tally state |
@@ -422,11 +421,16 @@ ready and, in a set of one, the engine plays the state.
 - A set of one with an `mxl` section: both pass once the engine runs.
 - A set of one without an `mxl` section: both answer 503.
 - A set of more than one replica with an `mxl` section: `/healthz` passes
-  while the engine runs, with or without a core. `/readyz` fails until
-  the replica's contact runs ([Engines in a set](#engines-in-a-set)),
-  then passes once the replica has joined and caught up and commits its
-  outputs, or while no other replica in contact with it commits; a withdrawn, diverged or
-  resyncing replica beside committing ones fails it.
+  while the engine runs, with or without a core. `/readyz` passes once
+  the replica has joined and caught up and commits its outputs, or while
+  no other replica in contact with it commits. A replica with outputs
+  fails it while diverged, resyncing or of another compatibility key
+  than the set's baseline, and while withdrawn once the set applied its
+  first baseline: such a replica writes none of what it computes.
+  Before that first baseline a withdrawn replica passes, so the first
+  replicas of a new set turn ready. A learner is never ready. The set's
+  only voter is ready once it has joined and caught up, whatever its
+  state.
 - A set of more than one replica without an `mxl` section: `/readyz`
   follows the replica alone and passes once it has joined and caught up,
   while `/healthz` answers 503. A liveness probe on `/healthz` restarts
