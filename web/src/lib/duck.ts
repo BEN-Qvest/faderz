@@ -268,3 +268,61 @@ export class DuckPress {
     this.mixer.release(hold);
   }
 }
+
+/** Width of a duck tile in the masters band, px, and the gap after it. */
+export const TILE_W = 141;
+/**
+ * The least width the band's summary takes, px; narrower than 300 px
+ * it drops the reduction bar (DuckSummary.svelte). Each group takes two
+ * rows, so the band's height holds SUMMARY_MAX_GROUPS of them.
+ */
+export const SUMMARY_MIN_W = 180;
+export const SUMMARY_MAX_GROUPS = 4;
+
+/**
+ * Whether the masters band shows its summary beside `groups` tiles in
+ * `width` px: only with a fine pointer, outside the narrow layout where
+ * the masters lie over the strips, for at most SUMMARY_MAX_GROUPS, and
+ * where the tiles leave it its least width. Otherwise the band keeps its
+ * tiles alone.
+ */
+export function summaryFits(width: number, groups: number, coarse: boolean, narrow: boolean): boolean {
+  return !coarse && !narrow && groups > 0 && groups <= SUMMARY_MAX_GROUPS && width - groups * TILE_W >= SUMMARY_MIN_W;
+}
+
+/** What a group lowers and where, by name: its destinations (buses, auxes, mix-minus outputs) and its targets, each in shape order. */
+export function duckReach(shape: Shape, d: DuckState): { targets: string; into: string } {
+  const targets = shape.channels.filter((c) => d.channels[c.id]?.target).map((c) => c.name);
+  const into = [...shape.buses, ...shape.auxes, ...shape.mixMinus].filter((e) => d.destinations[e.id]).map((e) => e.name);
+  return { targets: targets.join(', ') || 'no targets', into: into.join(', ') || 'no outputs' };
+}
+
+/** Characters a key level readout takes, "-23.4" or "-inf". */
+export const KEY_WIDTH = 5;
+
+/**
+ * A group's key level in a summary line's readings: dBFS with one
+ * decimal, "-inf" at -100 and below as other level readouts
+ * (format.ts), "--" while the group reports none.
+ */
+export function keyText(key: number | null): string {
+  if (key === null) return fit('--', KEY_WIDTH);
+  return fit(key <= -100 ? '-inf' : key.toFixed(1), KEY_WIDTH);
+}
+
+/** A gain reduction of `db` (0 or more) as the summary shows it: one decimal, as the tile's lamp, in 5 characters. */
+export function summaryReduction(db: number): string {
+  return fit(db > 0 ? `-${db.toFixed(1)}` : '0.0', 5);
+}
+
+/**
+ * How much of the summary's reduction bar is lit: the reduction on one
+ * scale for every line, 0 to `scale` dB (the deepest depth of any
+ * group), so equal bars are equal reductions; 0..1.
+ */
+export function reductionShare(gr: number, scale: number): number {
+  return scale > 0 ? Math.min(1, Math.max(0, gr / scale)) : 0;
+}
+
+/** A key level on the threshold's scale, -60..0 dBFS, as 0..1; none for no reading. */
+export const keyShare = (key: number | null): number => (key === null ? 0 : Math.min(1, Math.max(0, (key + 60) / 60)));
