@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::contract::{check, contract};
+use crate::mix::Wiring;
 use crate::shape::{Shape, loudness_channels};
 use crate::state::Console;
 
@@ -59,6 +60,10 @@ pub struct Config {
     /// with a matrix of zeros: the matrix comes from the live state.
     #[serde(skip)]
     pub audio: Option<samplez::Config>,
+    /// Each channel's input a and b flows and their domain, from the
+    /// `mxl` section; empty without one.
+    #[serde(skip)]
+    pub wiring: Vec<Wiring>,
     /// The replica set [`Config::parse`] read from `replica`; none for a
     /// set of one.
     #[serde(skip)]
@@ -70,6 +75,9 @@ pub struct Config {
 
 /// The variable naming the marker ConfigMap (`replica.marker`).
 pub const MARKER_ENV: &str = "FADERZ_REPLICA_MARKER";
+/// The variable carrying the pod's `controller-revision-hash` label, the
+/// revision a rollout of a set compares with its StatefulSet's.
+pub const REVISION_ENV: &str = "FADERZ_POD_REVISION";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -80,8 +88,8 @@ pub struct Mxl {
     pub domains: Vec<Domain>,
     /// The flows each channel reads, by channel id; every channel has one.
     pub inputs: BTreeMap<String, Input>,
-    /// The flow each output of the shape writes, by output id; every
-    /// output has one.
+    /// The flows each output of the shape writes, by output id; every
+    /// output has them.
     pub outputs: BTreeMap<String, Output>,
 }
 
@@ -145,7 +153,15 @@ const MAX_SOURCE: usize = 64;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Output {
-    pub flow: String,
+    /// The flow a set of one replica writes.
+    #[serde(default)]
+    pub flow: Option<String>,
+    /// The member flows of a set of more than one replica, by ordinal:
+    /// as many as `replica.replicas`, each a flow no other output or
+    /// input names. Each replica writes its own; a set writes no flow
+    /// together.
+    #[serde(default)]
+    pub flows: Option<Vec<String>>,
     /// Required with more than one domain.
     #[serde(default)]
     pub domain: Option<String>,
@@ -208,6 +224,19 @@ pub struct ReplicaConfig {
     /// (`podManagementPolicy: Parallel`): one at a time, each waiting to be
     /// ready, the first would wait for the others forever.
     pub marker: Option<String>,
+    /// The most a set's apply deadline may lead the engine's processed
+    /// index, ms, in [`MAX_APPLY_LEAD_MS`]: samplez-replica's
+    /// `maxApplyLeadMs`, read by a set of more than one replica that runs
+    /// an engine.
+    #[serde(default = "default_max_apply_lead_ms")]
+    pub max_apply_lead_ms: u64,
+}
+
+/// The values `replica.maxApplyLeadMs` takes.
+pub const MAX_APPLY_LEAD_MS: std::ops::RangeInclusive<u64> = 30..=120;
+
+fn default_max_apply_lead_ms() -> u64 {
+    50
 }
 
 impl Default for ReplicaConfig {
@@ -220,6 +249,7 @@ impl Default for ReplicaConfig {
             peers: Vec::new(),
             peer: None,
             marker: None,
+            max_apply_lead_ms: default_max_apply_lead_ms(),
         }
     }
 }
@@ -237,6 +267,14 @@ pub struct Set {
     pub peers: Vec<String>,
     pub peer: Listener,
     pub marker: String,
+    /// The StatefulSet the replica's pod belongs to: the replica name
+    /// without its `-<ordinal>`, when it ends in one.
+    pub statefulset: Option<String>,
+    /// The pod's `controller-revision-hash` label, from
+    /// [`REVISION_ENV`].
+    pub revision: Option<String>,
+    /// `replica.maxApplyLeadMs`.
+    pub max_apply_lead: std::time::Duration,
 }
 
 impl Set {
@@ -249,7 +287,12 @@ impl Set {
 impl ReplicaConfig {
     /// The set these keys describe for the replica named `name`; none for
     /// a set of one, which takes none of the set's keys.
-    fn set(&self, name: &str, env_marker: Option<String>) -> Result<Option<Set>, String> {
+    fn set(
+        &self,
+        name: &str,
+        env_marker: Option<String>,
+        revision: Option<String>,
+    ) -> Result<Option<Set>, String> {
         if self.replicas == 1 {
             let given = [
                 ("ordinal", self.ordinal.is_some()),
@@ -322,12 +365,18 @@ impl ReplicaConfig {
             .clone()
             .or(env_marker)
             .ok_or("replica.marker: required for a set of more than one replica")?;
+        let statefulset = (name.rsplit_once('-'))
+            .filter(|(set, n)| !set.is_empty() && n.parse() == Ok(ordinal))
+            .map(|(set, _)| set.to_owned());
         Ok(Some(Set {
             voters,
             ordinal,
             peers: self.peers.clone(),
             peer,
             marker,
+            statefulset,
+            revision,
+            max_apply_lead: std::time::Duration::from_millis(self.max_apply_lead_ms),
         }))
     }
 }
@@ -669,8 +718,14 @@ impl Config {
             }
         }
         let mut config = config;
-        config.audio = config.audio(&shape)?;
-        config.label_sources(&mut shape)?;
+        if !MAX_APPLY_LEAD_MS.contains(&config.replica.max_apply_lead_ms) {
+            return Err(format!(
+                "replica.maxApplyLeadMs {}: not in {}..={}",
+                config.replica.max_apply_lead_ms,
+                MAX_APPLY_LEAD_MS.start(),
+                MAX_APPLY_LEAD_MS.end()
+            ));
+        }
         let name = config.replica.name.clone().unwrap_or_else(host);
         check(&contract().id, &json!(name)).map_err(|e| {
             format!("replica.name {name:?}: {e}; name the replica in the configuration")
@@ -681,19 +736,38 @@ impl Config {
                 .notes
                 .push(format!("{MARKER_ENV} ignored: replica.replicas is 1"));
         }
-        config.set = config.replica.set(&name, env_marker)?;
-        // samplez 0.5.0's replicated engine takes one engine entry per log
-        // entry, and one mixer command sets many gains.
-        if config.set.is_some() && config.mxl.is_some() {
-            return Err("mxl: a set of more than one replica runs no engine; \
-                        samplez's replicated engine takes one gain per log entry"
-                .into());
+        let revision = env(REVISION_ENV).filter(|r| !r.is_empty());
+        config.set = config.replica.set(&name, env_marker, revision)?;
+        config.audio = config.audio(&shape)?;
+        if let (Some(engine), Some(mxl)) = (&config.audio, &config.mxl) {
+            config.wiring = (shape.channels.iter().zip(&engine.inputs))
+                .map(|(c, input)| Wiring {
+                    a: input.flow_id.clone(),
+                    b: mxl.inputs[&c.id].alt_flow.clone(),
+                    domain: input.domain.clone(),
+                })
+                .collect();
         }
+        config.label_sources(&mut shape)?;
         Ok((config, shape, name))
     }
 }
 
 impl Config {
+    /// What a set's compatibility key hashes besides the engine version
+    /// ([`samplez_replica::rollout::key`]): `product`, the mixer's
+    /// configuration hash, the `engine` settings and each channel's flow
+    /// channel selection, which change the output a replica computes from
+    /// the same log. The member flows, which differ by replica, do not.
+    pub fn compatibility(&self, product: u64) -> Vec<u8> {
+        let channels: BTreeMap<&String, &Option<Vec<u32>>> = (self.mxl.iter())
+            .flat_map(|m| m.inputs.iter().map(|(id, i)| (id, &i.channels)))
+            .collect();
+        json!({ "product": product, "engine": self.engine, "channels": channels })
+            .to_string()
+            .into_bytes()
+    }
+
     /// Appends each channel's flow channel selection to its `source`
     /// label, or makes it the label.
     fn label_sources(&self, shape: &mut Shape) -> Result<(), String> {
@@ -721,9 +795,37 @@ impl Config {
         Ok(())
     }
 
+    /// The flows `output` names, by ordinal: one for a set of one, a
+    /// member flow per replica for a set of more.
+    fn member_flows(&self, at: &str, output: &Output) -> Result<Vec<String>, String> {
+        match (&self.set, &output.flow, &output.flows) {
+            (None, Some(flow), None) => Ok(vec![flow.clone()]),
+            (None, _, Some(_)) => Err(format!(
+                "{at}.flows: a set of one replica writes one flow, `flow`"
+            )),
+            (None, None, None) => Err(format!("{at}.flow: missing")),
+            (Some(_), Some(_), _) => Err(format!(
+                "{at}.flow: every replica of a set writes its own member flow, \
+                 listed by ordinal in `flows`"
+            )),
+            (Some(_), None, None) => Err(format!("{at}.flows: missing")),
+            (Some(set), None, Some(flows)) => {
+                if flows.len() != usize::from(set.voters.replicas) {
+                    return Err(format!(
+                        "{at}.flows: names {} flows, the set has {} replicas",
+                        flows.len(),
+                        set.voters.replicas
+                    ));
+                }
+                Ok(flows.clone())
+            }
+        }
+    }
+
     /// The engine configuration of the `mxl` section, with a matrix of
     /// zeros: one input per channel reading its flow of input a, one
-    /// output per output of the shape, and one meter per bus, aux,
+    /// output per output of the shape writing this replica's flow
+    /// ([`Config::member_flows`]), and one meter per bus, aux,
     /// mix-minus and monitor output no output carries.
     fn audio(&self, shape: &Shape) -> Result<Option<samplez::Config>, String> {
         let Some(mxl) = &self.mxl else {
@@ -782,19 +884,35 @@ impl Config {
             inputs.push(engine_input);
         }
         let mut outputs = Vec::new();
+        // Per output, the flow of each ordinal.
+        let mut members: Vec<Vec<String>> = Vec::new();
         for o in &shape.outputs {
             let at = format!("mxl.outputs.{}", o.id);
             let output = mxl.outputs.get(&o.id).ok_or(format!("{at}: missing"))?;
+            members.push(self.member_flows(&at, output)?);
             outputs.push(json!({
                 "name": o.id,
                 "domain": domain(at, &output.domain)?,
-                "flowId": output.flow,
                 "label": o.name,
                 "group": o.id,
                 "role": "Audio",
                 "channels": o.width,
                 "loudnessChannels": loudness_channels(&o.layout),
             }));
+        }
+        // Inputs may share a flow; an output's flow is written by this
+        // engine alone.
+        let read: std::collections::BTreeSet<&str> = (mxl.inputs.values())
+            .flat_map(|i| std::iter::once(&i.flow).chain(&i.alt_flow))
+            .map(String::as_str)
+            .collect();
+        let mut written = std::collections::BTreeSet::new();
+        for flow in members.iter().flatten() {
+            if read.contains(flow.as_str()) || !written.insert(flow.as_str()) {
+                return Err(format!(
+                    "mxl.outputs: flow {flow} is named by another output, replica or input"
+                ));
+            }
         }
         let columns = shape.meter_columns();
         if columns.len() > samplez::config::MAX_METERS {
@@ -838,12 +956,27 @@ impl Config {
             .map(|d| json!({ "name": d.name, "path": d.path }))
             .collect();
         v["inputs"] = json!(inputs);
-        v["outputs"] = json!(outputs);
         v["meters"] = json!(meters);
         v["matrix"] = json!(vec![vec![0.0f32; columns]; rows]);
         v["rt"] = Value::Object(self.rt.clone());
-        let engine =
-            samplez::Config::parse(&v.to_string()).map_err(|e| format!("engine: {}", e.0))?;
+        // samplez checks the flows of each ordinal; this replica runs its
+        // own.
+        let ordinal = self.set.as_ref().map_or(0, |s| usize::from(s.ordinal));
+        let mut engine = None;
+        for n in 0..members.first().map_or(1, Vec::len) {
+            for (output, flows) in outputs.iter_mut().zip(&members) {
+                output["flowId"] = json!(flows[n]);
+            }
+            v["outputs"] = json!(outputs);
+            let parsed = samplez::Config::parse(&v.to_string()).map_err(|e| match &self.set {
+                Some(_) => format!("engine of replica ordinal {n}: {}", e.0),
+                None => format!("engine: {}", e.0),
+            })?;
+            if n == ordinal {
+                engine = Some(parsed);
+            }
+        }
+        let engine = engine.expect("the ordinal is below the set's replicas");
         if engine.sample_rate != shape.sample_rate {
             return Err(format!(
                 "engine.sampleRate {} differs from the shape's {}",
@@ -979,19 +1112,115 @@ mod tests {
         refused(no_peer, "replica.peer");
     }
 
-    /// A set serves the state alone: no replica of it runs an engine.
-    #[test]
-    fn a_set_runs_no_engine() {
+    /// A set's configuration with an `mxl` section whose output names
+    /// `output`.
+    fn set_with_mxl(output: Value) -> String {
         let mut v: Value = serde_json::from_str(&with(three(json!({})))).unwrap();
-        let id = |n: u8| format!("00000000-0000-4000-8000-00000000000{n}");
         v["mxl"] = json!({
             "domains": [{ "name": "d", "path": "/dev/shm/d" }],
             "inputs": { "ch1": { "flow": id(1), "altFlow": id(5) }, "ch2": { "flow": id(2) },
                         "st1": { "flow": id(3) } },
-            "outputs": { "out-pgm": { "flow": id(4) } },
+            "outputs": { "out-pgm": output },
         });
-        let e = Config::parse(&v.to_string(), || "faderz-0".into()).unwrap_err();
-        assert!(e.starts_with("mxl:"), "{e}");
+        v.to_string()
+    }
+
+    fn id(n: u8) -> String {
+        format!("00000000-0000-4000-8000-00000000000{n}")
+    }
+
+    /// Each replica of a set runs an engine writing the member flow its
+    /// ordinal names, under the cap its configuration sets, and knows
+    /// its StatefulSet from its pod name and its revision from the
+    /// environment.
+    #[test]
+    fn each_replica_of_a_set_writes_its_own_member_flow() {
+        let text = set_with_mxl(json!({ "flows": [id(4), id(6), id(7)] }));
+        let env = |k: &str| (k == REVISION_ENV).then(|| "faderz-5d8f7c".to_owned());
+        let hosts: [(fn() -> String, String); 3] = [
+            (|| "faderz-0".into(), id(4)),
+            (|| "faderz-1".into(), id(6)),
+            (|| "faderz-2".into(), id(7)),
+        ];
+        for (host, flow) in hosts {
+            let (config, _, _) = Config::parse_with(&text, &[], env, host).unwrap();
+            let engine = config.audio.as_ref().expect("an engine");
+            assert_eq!(engine.outputs[0].flow_id, flow);
+            let set = config.set.unwrap();
+            assert_eq!(set.statefulset.as_deref(), Some("faderz"));
+            assert_eq!(set.revision.as_deref(), Some("faderz-5d8f7c"));
+            assert_eq!(set.max_apply_lead, std::time::Duration::from_millis(50));
+        }
+        let named = |name: &str, ordinal: u16| {
+            let mut v: Value = serde_json::from_str(&text).unwrap();
+            v["replica"]["name"] = json!(name);
+            v["replica"]["ordinal"] = json!(ordinal);
+            let (config, _, _) = Config::parse(&v.to_string(), || unreachable!()).unwrap();
+            config.set.unwrap().statefulset
+        };
+        assert_eq!(named("mixer-a-2", 2).as_deref(), Some("mixer-a"));
+        assert_eq!(named("mixer-2", 1), None, "a name of another ordinal");
+        assert_eq!(named("mixer", 1), None);
+    }
+
+    /// Every replica of a set has the same compatibility key, though
+    /// each writes its own member flows; an engine setting or a flow
+    /// channel selection changes it.
+    #[test]
+    fn replicas_of_a_set_share_a_compatibility_key() {
+        let text = set_with_mxl(json!({ "flows": [id(4), id(6), id(7)] }));
+        let key = |text: &str, host: fn() -> String| {
+            let (config, _, _) = Config::parse(text, host).unwrap();
+            config.compatibility(7)
+        };
+        let zero = key(&text, || "faderz-0".into());
+        assert_eq!(zero, key(&text, || "faderz-2".into()));
+        let (config, _, _) = Config::parse(&text, || "faderz-0".into()).unwrap();
+        assert_ne!(
+            zero,
+            config.compatibility(8),
+            "another product configuration"
+        );
+        let mut v: Value = serde_json::from_str(&text).unwrap();
+        v["engine"] = json!({ "rampSamples": 960 });
+        assert_ne!(zero, key(&v.to_string(), || "faderz-0".into()));
+        let mut v: Value = serde_json::from_str(&text).unwrap();
+        v["mxl"]["inputs"]["st1"]["flow"] = json!(id(8));
+        v["mxl"]["inputs"]["st1"]["channels"] = json!([2, 1]);
+        assert_ne!(zero, key(&v.to_string(), || "faderz-0".into()));
+    }
+
+    /// A set of one writes `flow`, a set of more one member flow per
+    /// replica in `flows`, no two outputs or replicas the same one and
+    /// none an input reads; samplez checks the flows of every ordinal,
+    /// not only this replica's.
+    #[test]
+    fn member_flows_are_checked() {
+        let refused = |output: Value, key: &str| {
+            let e = Config::parse(&set_with_mxl(output), || "faderz-0".into()).unwrap_err();
+            assert!(e.starts_with(key), "{key}: {e}");
+        };
+        refused(json!({ "flow": id(4) }), "mxl.outputs.out-pgm.flow");
+        refused(json!({}), "mxl.outputs.out-pgm.flows");
+        refused(
+            json!({ "flows": [id(4), id(6)] }),
+            "mxl.outputs.out-pgm.flows",
+        );
+        refused(json!({ "flows": [id(4), id(6), id(4)] }), "mxl.outputs:");
+        refused(json!({ "flows": [id(4), id(6), id(1)] }), "mxl.outputs:");
+        refused(json!({ "flows": [id(4), id(6), id(5)] }), "mxl.outputs:");
+        refused(
+            json!({ "flows": [id(4), id(6), "x"] }),
+            "engine of replica ordinal 2",
+        );
+        let mut one: Value = serde_json::from_str(&set_with_mxl(json!({}))).unwrap();
+        one["replica"] = json!({ "name": "r1" });
+        one["mxl"]["outputs"]["out-pgm"] = json!({ "flows": [id(4)] });
+        let e = Config::parse(&one.to_string(), || unreachable!()).unwrap_err();
+        assert!(e.starts_with("mxl.outputs.out-pgm.flows"), "{e}");
+        one["mxl"]["outputs"]["out-pgm"] = json!({ "flow": id(4) });
+        let (config, _, _) = Config::parse(&one.to_string(), || unreachable!()).unwrap();
+        assert_eq!(config.audio.unwrap().outputs[0].flow_id, id(4));
     }
 
     /// The marker's name can come from the environment.
@@ -1373,5 +1602,73 @@ mod tests {
         Config::parse(&config(max - 3), || unreachable!()).unwrap();
         let e = Config::parse(&config(max - 2), || unreachable!()).unwrap_err();
         assert!(e.contains(&format!("at most {max}")), "{e}");
+    }
+
+    /// Each channel's wiring names its input a and b flows and the domain
+    /// the engine reads them in: the given one, or the only one there is.
+    #[test]
+    fn the_wiring_names_each_channels_flows_and_domain() {
+        let id = |n: u8| format!("00000000-0000-4000-8000-00000000000{n}");
+        let config = |domains: Value, st1: Value| {
+            json!({
+                "replica": { "name": "r1" },
+                "shape": small(),
+                "mxl": {
+                    "domains": domains,
+                    "inputs": { "ch1": { "flow": id(1), "altFlow": id(5), "domain": "d" },
+                                "ch2": { "flow": id(2), "domain": "d" }, "st1": st1 },
+                    "outputs": { "out-pgm": { "flow": id(4), "domain": "d" } },
+                },
+            })
+            .to_string()
+        };
+        let d = json!({ "name": "d", "path": "/dev/shm/d" });
+        let e = json!({ "name": "e", "path": "/dev/shm/e" });
+        let two = config(json!([d, e]), json!({ "flow": id(3), "domain": "e" }));
+        let (c, ..) = Config::parse(&two, || unreachable!()).unwrap();
+        let wiring = |a: u8, b: Option<u8>, domain: &str| Wiring {
+            a: id(a),
+            b: b.map(id),
+            domain: domain.into(),
+        };
+        assert_eq!(
+            c.wiring,
+            [
+                wiring(1, Some(5), "d"),
+                wiring(2, None, "d"),
+                wiring(3, None, "e")
+            ]
+        );
+        let one = config(json!([d]), json!({ "flow": id(3) }));
+        let (c, ..) = Config::parse(&one, || unreachable!()).unwrap();
+        assert_eq!(c.wiring[2], wiring(3, None, "d"));
+        // Without an engine there is nothing to wire.
+        let none = json!({ "replica": { "name": "r1" }, "shape": small() }).to_string();
+        assert!(
+            Config::parse(&none, || unreachable!())
+                .unwrap()
+                .0
+                .wiring
+                .is_empty()
+        );
+    }
+
+    /// `replica.maxApplyLeadMs` is 50 unless set, and is taken from 30 to
+    /// 120 alone.
+    #[test]
+    fn the_apply_lead_cap_is_50_ms_and_bounded() {
+        let config = |replica: Value| json!({ "replica": replica, "shape": small() }).to_string();
+        let lead = |replica: Value| {
+            Config::parse(&config(replica), || unreachable!())
+                .map(|c| c.0.replica.max_apply_lead_ms)
+        };
+        assert_eq!(lead(json!({ "name": "r1" })), Ok(50));
+        for ms in [30, 80, 120] {
+            assert_eq!(lead(json!({ "name": "r1", "maxApplyLeadMs": ms })), Ok(ms));
+        }
+        for ms in [29, 121] {
+            let e = lead(json!({ "name": "r1", "maxApplyLeadMs": ms })).unwrap_err();
+            assert!(e.starts_with("replica.maxApplyLeadMs"), "{e}");
+        }
     }
 }

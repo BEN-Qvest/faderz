@@ -2,20 +2,33 @@
 //! the configured shape, touch ownership, the last seq per session and
 //! control, scenes and consoles. Every replica applies the same commands
 //! in log order through [`Product`], so all of it is decided here and
-//! nowhere else.
+//! nowhere else, the engine targets included ([`Product::targets`]).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
+use samplez::Targets;
 use samplez_replica::entry::{Origin, SessionKey};
-use samplez_replica::state_machine::{Changed, Effect, Product};
+use samplez_replica::state_machine::{Apply, Changed, Effect, Factory, Product};
 use samplez_service::OwnerHandle;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::contract::{check, contract};
 use crate::duck;
+use crate::mix::{self, Wiring};
 use crate::shape::Shape;
+
+/// The version of how [`Mixer::targets`] derives engine targets from the
+/// state, in [`Mixer::config_hash`]: a change to the derivation that
+/// gives other targets for one state takes another version, so replicas
+/// deriving differently never form one set.
+pub const DERIVATION_VERSION: u32 = 1;
+
+/// The layout [`Product::save`] writes. A snapshot carries it beside
+/// the state, which binaries before it read from the top level: they
+/// refuse it as missing their fields rather than load part of it.
+const FORMAT: u32 = 2;
 
 /// A client's command as the replicated log carries it. `id` is the
 /// client's command id, under which a refusal or a stored scene is kept
@@ -195,7 +208,8 @@ pub enum Answer {
     /// The scene a `StoreScene` stored.
     Scene { scene: String },
     /// 409 with a message alone: a console connected to another session,
-    /// or a declared or connected one to remove.
+    /// a declared or connected one to remove, or inputs a command switches
+    /// that it may not ([`Product::apply`]).
     Refused { message: String },
     /// The console a `PutConsole` created.
     Created,
@@ -277,6 +291,19 @@ pub struct Mixer {
     consoles: Vec<Registered>,
     /// The configuration's consoles, which a loaded state is merged with.
     declared: Vec<Console>,
+    /// Each channel's input flows and domain; empty without an engine.
+    wiring: Vec<Wiring>,
+    /// The engine targets of the state, kept by every write; none
+    /// without an engine. Derived from the state alone, so neither
+    /// replicated nor saved.
+    derived: Option<mix::Derived>,
+}
+
+/// A snapshot from [`FORMAT`] on.
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    format: u32,
+    mixer: Saved,
 }
 
 /// The state as snapshots carry it.
@@ -302,15 +329,111 @@ impl Mixer {
     /// A state with the `declared` consoles of the configuration, not
     /// connected yet.
     pub fn with_consoles(shape: Shape, declared: Vec<Console>) -> Mixer {
+        Mixer::configured(shape, declared, Vec::new())
+    }
+
+    /// [`Mixer::with_consoles`] whose channels' inputs are `wiring`, one
+    /// per channel: the state it derives engine targets from
+    /// ([`Product::targets`]).
+    pub fn configured(shape: Shape, declared: Vec<Console>, wiring: Vec<Wiring>) -> Mixer {
         let mut m = Mixer {
             state: shape.initial_state(),
             shape: Some(Arc::new(shape)),
             consoles: declared.iter().map(Mixer::declared_entry).collect(),
             declared,
+            wiring,
             ..Mixer::default()
         };
         m.state["consoles"] = m.console_list();
+        m.derive();
         m
+    }
+
+    /// Derives the engine targets of the whole state again.
+    fn derive(&mut self) {
+        self.derived = match (self.shape.as_deref(), self.wiring.is_empty()) {
+            (Some(shape), false) => Some(mix::Derived::new(shape, &self.wiring, &self.state)),
+            _ => None,
+        };
+    }
+
+    /// Builds [`Mixer::configured`]: the empty state every replica of a
+    /// set opens and installs snapshots into.
+    pub fn factory(shape: Shape, declared: Vec<Console>, wiring: Vec<Wiring>) -> Factory<Mixer> {
+        Arc::new(move || Mixer::configured(shape.clone(), declared.clone(), wiring.clone()))
+    }
+
+    /// The channel slots whose selected flow `written` changes, applied to
+    /// the state as it is, ascending.
+    fn rerouted(&self, written: &[(String, Value)]) -> Vec<u32> {
+        let (Some(shape), false) = (self.shape.as_deref(), self.wiring.is_empty()) else {
+            return Vec::new();
+        };
+        let mut after = Map::new();
+        for (path, value) in written {
+            if let [group, id, leaf] = tokens(path).as_slice()
+                && group == "channels"
+                && leaf == "input"
+            {
+                after.insert(id.clone(), value.clone());
+            }
+        }
+        let flow = |w: &Wiring, input: Option<&Value>| match (input.and_then(Value::as_str), &w.b) {
+            (Some("b"), Some(b)) => b.clone(),
+            _ => w.a.clone(),
+        };
+        (shape.channels.iter().zip(&self.wiring).enumerate())
+            .filter(|(_, (c, w))| {
+                after.get(&c.id).is_some_and(|input| {
+                    flow(w, Some(input)) != flow(w, self.state["channels"][&c.id].get("input"))
+                })
+            })
+            .map(|(slot, _)| slot as u32)
+            .collect()
+    }
+
+    /// Why a command writing `written`, ordered as `ctx` says, is refused
+    /// for the inputs it re-routes: off the generation path, or across
+    /// more than one MXL domain, which one engine generation cannot
+    /// switch together. A command the writer did not classify
+    /// (`generation` `None`) is taken as it was before.
+    fn reroute_refusal(&self, ctx: &Apply, written: &[(String, Value)]) -> Option<Answer> {
+        let generation = ctx.generation?;
+        let slots = self.rerouted(written);
+        if slots.is_empty() {
+            return None;
+        }
+        if !generation {
+            let message =
+                "the command switches inputs and was not ordered to: send it again".into();
+            return Some(Answer::Refused { message });
+        }
+        let domains: BTreeSet<&str> = (slots.iter())
+            .map(|&s| self.wiring[s as usize].domain.as_str())
+            .collect();
+        (domains.len() > 1).then(|| Answer::Refused {
+            message: format!(
+                "the command switches inputs in more than one MXL domain ({})",
+                domains.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        })
+    }
+
+    /// The leaves a command would write, applied to the state as it is,
+    /// for the writer's classification ([`Product::reroutes`]): those of a
+    /// set, a patch or a recall, the only commands that write an input
+    /// selection.
+    fn writes_of(&self, command: &Command) -> Vec<(String, Value)> {
+        match command {
+            Command::Control(c) if c.action == Action::Set => {
+                vec![(c.path.clone(), c.value.clone().unwrap_or(Value::Null))]
+            }
+            Command::Patch { changes, .. } => (changes.iter())
+                .map(|c| (c.path.clone(), c.value.clone()))
+                .collect(),
+            Command::Recall { scene, .. } => self.recall_writes(scene).unwrap_or_default(),
+            _ => Vec::new(),
+        }
     }
 
     fn declared_entry(console: &Console) -> Registered {
@@ -474,9 +597,11 @@ impl Mixer {
     /// Writes `written` and what follows from it, and returns every leaf
     /// that changed: loudness target and tolerance from a preset, preset
     /// `custom` from a written target or tolerance, AFV stages from
-    /// bindings and tally.
+    /// bindings and tally. The engine targets follow the leaves changed.
     fn write(&mut self, written: Vec<(String, Value)>) -> Vec<(String, Value)> {
         let all = derived(written);
+        let vcas = (self.derived.is_some() && all.iter().any(|(p, _)| p.starts_with("/vcas")))
+            .then(|| self.state["vcas"].clone());
         let afv = all
             .iter()
             .any(|(p, _)| p.starts_with("/afv/") || p.starts_with("/tally/"));
@@ -496,6 +621,11 @@ impl Mixer {
                     changed.push((path, json!(open)));
                 }
             }
+        }
+        if let (Some(d), Some(shape)) = (&mut self.derived, self.shape.as_deref()) {
+            let vcas = vcas.as_ref().unwrap_or(&Value::Null);
+            let paths = changed.iter().map(|(p, _)| p.as_str());
+            d.update(shape, &self.wiring, &self.state, vcas, paths);
         }
         changed
     }
@@ -529,7 +659,7 @@ impl Mixer {
             .collect()
     }
 
-    fn control(&mut self, origin: &Origin, c: &Control) -> Effect<Edits> {
+    fn control(&mut self, origin: &Origin, c: &Control, ctx: &Apply) -> Effect<Edits> {
         let (id, action, kind, seq, path) = (
             c.id.as_str(),
             c.action,
@@ -611,6 +741,9 @@ impl Mixer {
                 if let Some((_, message)) = self.broken_duck(&written) {
                     return self.refuse(&session, id, Answer::Invalid { message });
                 }
+                if let Some(answer) = self.reroute_refusal(ctx, &written) {
+                    return self.refuse(&session, id, answer);
+                }
                 self.seen(&session, path, seq);
                 let values = self.write(written);
                 if values.is_empty() {
@@ -633,7 +766,13 @@ impl Mixer {
             .insert(path.to_owned(), seq);
     }
 
-    fn patch(&mut self, session: &SessionKey, id: &str, changes: &[Write]) -> Effect<Edits> {
+    fn patch(
+        &mut self,
+        session: &SessionKey,
+        id: &str,
+        changes: &[Write],
+        ctx: &Apply,
+    ) -> Effect<Edits> {
         let conflicts: Vec<Value> = changes
             .iter()
             .filter_map(|c| Some(self.conflict(&c.path, self.owners.get(&c.path)?)))
@@ -657,6 +796,9 @@ impl Mixer {
             .collect();
         if let Some((_, message)) = self.broken_duck(&written) {
             return self.refuse(session, id, Answer::Invalid { message });
+        }
+        if let Some(answer) = self.reroute_refusal(ctx, &written) {
+            return self.refuse(session, id, answer);
         }
         changed(self.write(written))
     }
@@ -771,11 +913,28 @@ impl Mixer {
     /// Recalls `scene`: every stored leaf whose recall-safe group its
     /// element does not keep, owned controls included, and
     /// `sceneRecalled`.
-    fn recall(&mut self, session: &SessionKey, id: &str, scene: &str, at: &str) -> Effect<Edits> {
-        let Some(data) = self.scenes.get(scene) else {
+    fn recall(
+        &mut self,
+        session: &SessionKey,
+        id: &str,
+        scene: &str,
+        at: &str,
+        ctx: &Apply,
+    ) -> Effect<Edits> {
+        let Some(mut written) = self.recall_writes(scene) else {
             let message = format!("unknown scene {scene}");
             return self.refuse(session, id, Answer::NotFound { message });
         };
+        if let Some(answer) = self.reroute_refusal(ctx, &written) {
+            return self.refuse(session, id, answer);
+        }
+        written.push(("/sceneRecalled".into(), json!({ "id": scene, "at": at })));
+        changed(self.write(written))
+    }
+
+    /// The leaves a recall of `scene` writes, none for an unknown scene.
+    fn recall_writes(&self, scene: &str) -> Option<Vec<(String, Value)>> {
+        let data = self.scenes.get(scene)?;
         let mut written: Vec<(String, Value)> = self
             .recalled(data)
             .into_iter()
@@ -797,8 +956,7 @@ impl Mixer {
             );
             written.retain(|(p, _)| duck::routing_of(p) != Some(group.as_str()));
         }
-        written.push(("/sceneRecalled".into(), json!({ "id": scene, "at": at })));
-        changed(self.write(written))
+        Some(written)
     }
 
     /// The leaves of the scene `data` a recall writes: those of the groups
@@ -819,74 +977,6 @@ impl Mixer {
             }
         }
         written
-    }
-
-    /// The leaves the mix plays that `command` can set, from the command
-    /// and the shape alone, so every replica names the same ones whatever
-    /// state it applied up to: each leaf a write names and those the write
-    /// derives from it (a loudness preset's, the AFV stage of a written
-    /// binding). A touch sets none, nor does a release but of a momentary
-    /// control. A recall names every leaf a recall can write in the shape,
-    /// a tally every AFV stage. The leaves the mix does not play
-    /// ([`unplayed`]: scenes, the recalled scene, tally, consoles) are
-    /// never named: a restamp moves only what the engine plays, and which
-    /// of them a command writes depends on the state.
-    pub fn paths_of(&self, command: &Command) -> Vec<String> {
-        let Some(shape) = self.shape.as_deref() else {
-            return Vec::new();
-        };
-        let afv_stages = || -> Vec<(String, Value)> {
-            (shape.channels.iter())
-                .map(|c| (format!("/afv/{}/open", escape(&c.id)), Value::Null))
-                .collect()
-        };
-        let writes = |path: &str, value: &Value| {
-            let mut leaves = leaves_or_self(value, path);
-            let t = tokens(path);
-            if t.first().is_some_and(|g| g == "afv") {
-                match t.get(1) {
-                    Some(channel) => {
-                        leaves.push((format!("/afv/{}/open", escape(channel)), Value::Null))
-                    }
-                    None => leaves.extend(afv_stages()),
-                }
-            }
-            leaves
-        };
-        let written = match command {
-            Command::Control(c) => match c.action {
-                Action::Set => writes(&c.path, c.value.as_ref().unwrap_or(&Value::Null)),
-                Action::Touch => Vec::new(),
-                Action::Release if momentary(&c.path) => vec![(c.path.clone(), json!(false))],
-                Action::Release => Vec::new(),
-            },
-            Command::Patch { changes, .. } => changes
-                .iter()
-                .flat_map(|w| writes(&w.path, &w.value))
-                .collect(),
-            Command::Recall { .. } => {
-                let mut leaves: Vec<(String, Value)> = leaves(&shape.initial_state(), "")
-                    .into_iter()
-                    .filter(|(path, _)| recall_group(path).is_some())
-                    .collect();
-                leaves.extend(afv_stages());
-                leaves
-            }
-            Command::Tally { .. } => afv_stages(),
-            Command::StoreScene { .. }
-            | Command::DeleteScene { .. }
-            | Command::Register { .. }
-            | Command::PutConsole { .. }
-            | Command::RemoveConsole { .. } => Vec::new(),
-        };
-        let mut paths: Vec<String> = derived(written)
-            .into_iter()
-            .map(|(p, _)| p)
-            .filter(|p| !unplayed(p))
-            .collect();
-        paths.sort();
-        paths.dedup();
-        paths
     }
 
     fn tally(
@@ -1142,14 +1232,19 @@ impl Mixer {
 impl Product for Mixer {
     type Change = Edits;
 
-    fn apply(&mut self, origin: &Origin, command: &[u8]) -> Effect<Edits> {
+    const DRIVES_ENGINE: bool = true;
+
+    /// A command that switches an input is refused as [`Answer::Refused`]
+    /// when the writer ordered it off the generation path, or when it
+    /// switches inputs in more than one MXL domain.
+    fn apply(&mut self, origin: &Origin, command: &[u8], ctx: &Apply) -> Effect<Edits> {
         let Ok(command) = serde_json::from_slice::<Command>(command) else {
             return Effect::Unchanged;
         };
         let session = origin.key();
         match &command {
-            Command::Control(c) => self.control(origin, c),
-            Command::Patch { id, changes } => self.patch(&session, id, changes),
+            Command::Control(c) => self.control(origin, c, ctx),
+            Command::Patch { id, changes } => self.patch(&session, id, changes, ctx),
             Command::StoreScene {
                 id,
                 scene,
@@ -1157,7 +1252,7 @@ impl Product for Mixer {
                 at,
             } => self.store_scene(&session, id, scene.as_deref(), name.as_deref(), at),
             Command::DeleteScene { id, scene } => self.delete_scene(&session, id, scene),
-            Command::Recall { id, scene, at } => self.recall(&session, id, scene, at),
+            Command::Recall { id, scene, at } => self.recall(&session, id, scene, at, ctx),
             Command::Tally {
                 id,
                 sources,
@@ -1171,6 +1266,30 @@ impl Product for Mixer {
             Command::PutConsole { id, console } => self.put_console(&session, id, console),
             Command::RemoveConsole { id, console } => self.remove_console(&session, id, console),
         }
+    }
+
+    /// [`mix::targets`] of the state, as every write keeps them; none
+    /// without an engine's wiring.
+    fn targets(&self) -> Option<Targets> {
+        self.derived.as_ref().map(|d| d.targets().clone())
+    }
+
+    fn reroutes(&self, _origin: &Origin, command: &[u8]) -> Vec<u32> {
+        serde_json::from_slice::<Command>(command)
+            .map_or_else(|_| Vec::new(), |c| self.rerouted(&self.writes_of(&c)))
+    }
+
+    /// XXH3 over [`DERIVATION_VERSION`], the shape, the declared consoles
+    /// and the wiring: what [`Product::apply`], [`Product::load`] and
+    /// [`Product::targets`] read besides the state.
+    fn config_hash(&self) -> u64 {
+        let config = json!({
+            "derivation": DERIVATION_VERSION,
+            "shape": self.shape,
+            "consoles": self.declared,
+            "wiring": self.wiring,
+        });
+        xxhash_rust::xxh3::xxh3_64(config.to_string().as_bytes())
     }
 
     /// Releases every control `session` holds and disconnects its
@@ -1283,13 +1402,28 @@ impl Product for Mixer {
             scenes_created: self.scenes_created,
             consoles: self.consoles.clone(),
         };
-        serde_json::to_vec(&saved).expect("the state serializes")
+        let snapshot = Snapshot {
+            format: FORMAT,
+            mixer: saved,
+        };
+        serde_json::to_vec(&snapshot).expect("the state serializes")
     }
 
     /// A state with a configured shape keeps it ([`Mixer::reconcile`]); a
     /// [`Default`] one, as a snapshot install builds, takes the saved one.
+    /// A snapshot of another format than [`FORMAT`] is refused, one taken
+    /// before formats were kept is read as it was written.
     fn load(&mut self, saved: &[u8]) -> Result<(), String> {
-        let saved: Saved = serde_json::from_slice(saved).map_err(|e| e.to_string())?;
+        let value: Value = serde_json::from_slice(saved).map_err(|e| e.to_string())?;
+        let saved: Saved = match value.get("format") {
+            None => serde_json::from_value(value).map_err(|e| e.to_string())?,
+            Some(f) if *f == FORMAT => {
+                let snapshot: Snapshot =
+                    serde_json::from_value(value).map_err(|e| e.to_string())?;
+                snapshot.mixer
+            }
+            Some(f) => return Err(format!("snapshot format {f}: this binary reads {FORMAT}")),
+        };
         self.seqs = saved
             .seqs
             .iter()
@@ -1315,13 +1449,8 @@ impl Product for Mixer {
             self.dropped = Vec::new();
             self.consoles = saved.consoles;
         }
+        self.derive();
         Ok(())
-    }
-
-    /// [`Mixer::paths_of`]; none for a body that is not a command.
-    fn paths(&self, command: &[u8]) -> Vec<String> {
-        serde_json::from_slice::<Command>(command)
-            .map_or_else(|_| Vec::new(), |c| self.paths_of(&c))
     }
 }
 
@@ -1351,16 +1480,6 @@ fn derived(written: Vec<(String, Value)>) -> Vec<(String, Value)> {
         }
     }
     all
-}
-
-/// A leaf the mix does not play: the scenes, the scene recalled, tally
-/// and consoles.
-pub fn unplayed(path: &str) -> bool {
-    let group = tokens(path).into_iter().next().unwrap_or_default();
-    matches!(
-        group.as_str(),
-        "scenes" | "sceneRecalled" | "tally" | "consoles"
-    )
 }
 
 /// An IFB interrupt or a duck hold, which goes back to off when
@@ -1432,17 +1551,6 @@ fn leaves(value: &Value, base: &str) -> Vec<(String, Value)> {
     out
 }
 
-/// The leaves under `value`, or `value` at `base` when it has none, as
-/// an empty object or array.
-fn leaves_or_self(value: &Value, base: &str) -> Vec<(String, Value)> {
-    let out = leaves(value, base);
-    if out.is_empty() {
-        vec![(base.to_owned(), value.clone())]
-    } else {
-        out
-    }
-}
-
 fn collect(value: &Value, base: &str, out: &mut Vec<(String, Value)>) {
     match value {
         Value::Array(a) if a.iter().all(Value::is_string) => {
@@ -1502,6 +1610,8 @@ fn recall_group(path: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::shape::tests::small;
+    use crate::strip;
+    use samplez_dsp::StripParam;
     use samplez_replica::entry::Command as Entry;
     use samplez_service::Role;
 
@@ -1535,6 +1645,7 @@ mod tests {
         m.apply(
             &origin(session),
             &control(Action::Set, &id, seq, path, Some(value)),
+            &Apply::default(),
         )
     }
 
@@ -1543,6 +1654,7 @@ mod tests {
         m.apply(
             &origin(session),
             &control(Action::Touch, &id, seq, path, None),
+            &Apply::default(),
         )
     }
 
@@ -1551,11 +1663,16 @@ mod tests {
         m.apply(
             &origin(session),
             &control(Action::Release, &id, seq, path, None),
+            &Apply::default(),
         )
     }
 
     fn rest(m: &mut Mixer, command: Command) -> Effect<Edits> {
-        m.apply(&origin("rest"), &serde_json::to_vec(&command).unwrap())
+        m.apply(
+            &origin("rest"),
+            &serde_json::to_vec(&command).unwrap(),
+            &Apply::default(),
+        )
     }
 
     fn patch(m: &mut Mixer, id: &str, changes: &[(&str, Value)]) -> Effect<Edits> {
@@ -1925,10 +2042,6 @@ mod tests {
         ));
     }
 
-    fn paths(m: &Mixer, command: Command) -> Vec<String> {
-        m.paths(&serde_json::to_vec(&command).unwrap())
-    }
-
     fn ctl(action: Action, path: &str, value: Option<Value>) -> Command {
         Command::Control(Control {
             id: "c".into(),
@@ -1938,185 +2051,6 @@ mod tests {
             path: path.into(),
             value,
         })
-    }
-
-    /// A later command on a leaf supersedes an earlier unresolved one on
-    /// it, and one on another leaf does not: each command names the leaves
-    /// it sets, whatever they hold.
-    #[test]
-    fn a_command_names_the_leaves_it_sets() {
-        let m = mixer();
-        let fader = paths(&m, ctl(Action::Set, "/channels/ch1/fader", Some(json!(-3))));
-        assert_eq!(fader, ["/channels/ch1/fader"]);
-        assert_eq!(
-            paths(
-                &m,
-                ctl(Action::Set, "/channels/ch1/fader", Some(json!(-90)))
-            ),
-            fader,
-            "the value it holds already"
-        );
-        for other in ["/channels/ch2/fader", "/channels/ch1/mute"] {
-            let p = paths(&m, ctl(Action::Set, other, Some(json!(true))));
-            assert_eq!(p, [other]);
-        }
-        assert_eq!(
-            paths(
-                &m,
-                ctl(Action::Set, "/channels/st1/legTrim", Some(json!([1, 2])))
-            ),
-            ["/channels/st1/legTrim/0", "/channels/st1/legTrim/1"],
-            "one leaf per leg"
-        );
-        let patch = Command::Patch {
-            id: "p".into(),
-            changes: vec![
-                Write {
-                    path: "/channels/ch2/mute".into(),
-                    value: json!(true),
-                },
-                Write {
-                    path: "/channels/ch1/fader".into(),
-                    value: json!(0),
-                },
-            ],
-        };
-        assert_eq!(
-            paths(&m, patch),
-            ["/channels/ch1/fader", "/channels/ch2/mute"]
-        );
-        assert_eq!(
-            paths(
-                &m,
-                ctl(Action::Set, "/metering/loudness/preset", Some(json!("ebu")))
-            ),
-            [
-                "/metering/loudness/preset",
-                "/metering/loudness/target",
-                "/metering/loudness/tolerance"
-            ]
-        );
-        assert!(paths(&m, ctl(Action::Touch, "/channels/ch1/fader", None)).is_empty());
-        assert!(paths(&m, ctl(Action::Release, "/channels/ch1/fader", None)).is_empty());
-        let talk = "/mixMinus/mm1/interrupt/active";
-        assert_eq!(paths(&m, ctl(Action::Release, talk, None)), [talk]);
-        assert!(m.paths(b"not a command").is_empty());
-    }
-
-    /// A tally names every AFV stage, a binding write its own: which a
-    /// tally opens depends on the bindings.
-    #[test]
-    fn a_tally_names_every_afv_stage_and_a_binding_its_own() {
-        let m = mixer();
-        let stages = ["/afv/ch1/open", "/afv/ch2/open", "/afv/st1/open"];
-        let tally = Command::Tally {
-            id: "t".into(),
-            sources: BTreeMap::from([("CAM1".to_owned(), "program".to_owned())]),
-            replace: true,
-        };
-        assert_eq!(paths(&m, tally), stages);
-        assert_eq!(
-            paths(&m, ctl(Action::Set, "/afv/ch1/enabled", Some(json!(true)))),
-            ["/afv/ch1/enabled", "/afv/ch1/open"]
-        );
-    }
-
-    /// A recall names every leaf a recall can write in the shape, and no
-    /// command names what the mix does not play.
-    #[test]
-    fn a_recall_names_every_recallable_leaf_and_scenes_name_none() {
-        let m = mixer();
-        let recall = Command::Recall {
-            id: "r".into(),
-            scene: "s1".into(),
-            at: "2026-11-15T12:01:00.000Z".into(),
-        };
-        let p = paths(&m, recall);
-        for leaf in [
-            "/channels/ch1/fader",
-            "/channels/st1/legTrim/1",
-            "/vcas/vca1/members",
-            "/afv/ch2/source",
-            "/afv/ch2/open",
-        ] {
-            assert!(p.contains(&leaf.to_owned()), "{leaf}: {p:?}");
-        }
-        for not in ["/channels/ch1/solo", "/sceneRecalled", "/monitor/level"] {
-            assert!(!p.contains(&not.to_owned()), "{not}");
-        }
-        let store = Command::StoreScene {
-            id: "s".into(),
-            scene: None,
-            name: None,
-            at: "2026-11-15T12:02:00.000Z".into(),
-        };
-        assert!(paths(&m, store).is_empty());
-        let delete = Command::DeleteScene {
-            id: "d".into(),
-            scene: "s1".into(),
-        };
-        assert!(paths(&m, delete).is_empty());
-    }
-
-    /// One command of each kind that changes the played state of
-    /// [`busy`].
-    fn commands_of_each_kind(scene: &str) -> Vec<Command> {
-        let tally = |source: &str, state: &str, replace| Command::Tally {
-            id: format!("t-{source}"),
-            sources: BTreeMap::from([(source.to_owned(), state.to_owned())]),
-            replace,
-        };
-        let patch = Command::Patch {
-            id: "p9".into(),
-            changes: vec![
-                Write {
-                    path: "/channels/ch2/mute".into(),
-                    value: json!(true),
-                },
-                Write {
-                    path: "/afv/ch2/source".into(),
-                    value: json!("CAM1"),
-                },
-            ],
-        };
-        let mut release = ctl(Action::Release, "/mixMinus/mm1/interrupt/active", None);
-        if let Command::Control(c) = &mut release {
-            c.seq = 3;
-        }
-        let mut unhold = ctl(Action::Release, "/ducks/comm/hold", None);
-        if let Command::Control(c) = &mut unhold {
-            c.seq = 3;
-        }
-        vec![
-            ctl(
-                Action::Set,
-                "/ducks/comm/channels/ch1/depth",
-                Some(json!(20)),
-            ),
-            unhold,
-            ctl(Action::Set, "/channels/ch1/fader", Some(json!(-3))),
-            ctl(Action::Set, "/afv/ch1/enabled", Some(json!(false))),
-            ctl(
-                Action::Set,
-                "/metering/loudness/preset",
-                Some(json!("atsc")),
-            ),
-            ctl(Action::Set, "/metering/loudness/target", Some(json!(-20))),
-            release,
-            patch,
-            // Closes both stages, bound to CAM2.
-            tally("CAM2", "preview", false),
-            tally("CAM9", "program", true),
-            Command::Recall {
-                id: "r9".into(),
-                scene: scene.into(),
-                at: "2026-11-15T12:05:00.000Z".into(),
-            },
-            Command::DeleteScene {
-                id: "d9".into(),
-                scene: scene.into(),
-            },
-        ]
     }
 
     /// A state far from the initial one: AFV bound, a tally, a scene
@@ -2166,52 +2100,6 @@ mod tests {
         touch(&mut m, "rest", 1, "/ducks/comm/hold");
         set(&mut m, "rest", 2, "/ducks/comm/hold", json!(true));
         (m, scene)
-    }
-
-    fn copy(m: &Mixer) -> Mixer {
-        let mut copy = mixer();
-        copy.load(&m.save()).unwrap();
-        copy
-    }
-
-    /// Every played leaf a command changes is among its paths, so a
-    /// restamp that keeps only the paths no later entry sets never leaves
-    /// one of its changes behind.
-    #[test]
-    fn a_command_names_every_played_leaf_it_changes() {
-        let (m, scene) = busy();
-        for command in commands_of_each_kind(&scene) {
-            let named = paths(&m, command.clone());
-            let mut applied = copy(&m);
-            let bytes = serde_json::to_vec(&command).unwrap();
-            let effect = applied.apply(&origin("rest"), &bytes);
-            let Effect::Changed(edits) = effect else {
-                panic!("{command:?} changed nothing: {effect:?}");
-            };
-            for (path, value) in &edits.values {
-                for (leaf, _) in leaves_or_self(value, path) {
-                    assert!(
-                        unplayed(&leaf) || named.contains(&leaf),
-                        "{command:?} changed {leaf}, not among {named:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Paths come from the command and the shape alone: replicas that
-    /// applied the log up to different entries name the same ones.
-    #[test]
-    fn paths_do_not_depend_on_the_state() {
-        let (m, scene) = busy();
-        let fresh = mixer();
-        for command in commands_of_each_kind(&scene) {
-            assert_eq!(
-                paths(&m, command.clone()),
-                paths(&fresh, command.clone()),
-                "{command:?}"
-            );
-        }
     }
 
     #[test]
@@ -2264,6 +2152,7 @@ mod tests {
                 id: format!("{s}-1"),
                 at_index: None,
                 body: Vec::new(),
+                generation: None,
             })
             .collect();
         let e1 = values(&set(&mut m, "a", 1, "/channels/ch1/fader", json!(-3)));
@@ -2553,6 +2442,7 @@ mod tests {
         m.apply(
             &origin_of(principal, session),
             &serde_json::to_vec(&command).unwrap(),
+            &Apply::default(),
         )
     }
 
@@ -2572,7 +2462,11 @@ mod tests {
             console: console.clone(),
             bank_offset: bank,
         };
-        m.apply(&origin(session), &serde_json::to_vec(&command).unwrap())
+        m.apply(
+            &origin(session),
+            &serde_json::to_vec(&command).unwrap(),
+            &Apply::default(),
+        )
     }
 
     fn put(
@@ -3229,45 +3123,15 @@ mod tests {
         }
     }
 
-    /// A duck write names its leaf, a hold release the hold, and a recall
-    /// the setup but not mode or hold.
-    #[test]
-    fn duck_commands_name_their_leaves() {
-        let m = mixer();
-        let depth = "/ducks/comm/channels/ch1/depth";
-        assert_eq!(paths(&m, ctl(Action::Set, depth, Some(json!(12)))), [depth]);
-        let hold = "/ducks/comm/hold";
-        assert_eq!(paths(&m, ctl(Action::Release, hold, None)), [hold]);
-        assert!(paths(&m, ctl(Action::Release, "/ducks/comm/mode", None)).is_empty());
-        let recall = Command::Recall {
-            id: "r".into(),
-            scene: "s1".into(),
-            at: "2026-11-15T12:01:00.000Z".into(),
-        };
-        let p = paths(&m, recall);
-        for leaf in [
-            "/ducks/comm/channels/ch1/trigger",
-            "/ducks/comm/channels/st1/target",
-            depth,
-            "/ducks/comm/destinations/pgm",
-            "/ducks/comm/keyHpf/freq",
-            "/ducks/comm/keyTap",
-            "/ducks/comm/releaseMs",
-        ] {
-            assert!(p.contains(&leaf.to_owned()), "{leaf}: {p:?}");
-        }
-        for not in ["/ducks/comm/mode", hold] {
-            assert!(!p.contains(&not.to_owned()), "{not}");
-        }
-    }
-
     /// A snapshot taken before duck groups were kept installs with none.
     #[test]
     fn a_snapshot_without_duck_groups_installs_with_none() {
         let mut v = small();
         v.as_object_mut().unwrap().remove("ducks");
         let old = Mixer::new(Shape::parse(&v).unwrap());
-        let mut saved: Value = serde_json::from_slice(&old.save()).unwrap();
+        // Taken before snapshots carried their format, too.
+        let mut snapshot: Value = serde_json::from_slice(&old.save()).unwrap();
+        let mut saved = snapshot["mixer"].take();
         saved["state"].as_object_mut().unwrap().remove("ducks");
         saved["shape"].as_object_mut().unwrap().remove("ducks");
         let mut installed = Mixer::default();
@@ -3276,5 +3140,591 @@ mod tests {
             .unwrap();
         assert_eq!(installed.state()["ducks"], json!({}));
         check(&contract().state, installed.state()).unwrap();
+    }
+
+    /// The small shape with input b on both mono channels, its channels
+    /// wired to flows `a<n>` and `b<n>`: ch1 and st1 in domain d, ch2 in
+    /// domain e.
+    fn wired() -> Mixer {
+        let mut shape = small();
+        shape["channels"][1]["altInput"] = json!(true);
+        let wire = |a: &str, b: Option<&str>, domain: &str| Wiring {
+            a: a.into(),
+            b: b.map(Into::into),
+            domain: domain.into(),
+        };
+        Mixer::configured(
+            Shape::parse(&shape).unwrap(),
+            Vec::new(),
+            vec![
+                wire("a1", Some("b1"), "d"),
+                wire("a2", Some("b2"), "e"),
+                wire("a3", None, "d"),
+            ],
+        )
+    }
+
+    fn ordered(generation: Option<bool>) -> Apply {
+        Apply { generation }
+    }
+
+    fn gain_bits(t: &Targets) -> Vec<Vec<u32>> {
+        let row = |r: &Vec<f32>| r.iter().map(|g| g.to_bits()).collect();
+        t.gains.iter().map(row).collect()
+    }
+
+    /// The targets of a busy state are what the engine of a set of one is
+    /// sent for it: the gain matrix, each channel's strip and the flow of
+    /// its selected input, bit for bit, also after a save and load.
+    #[test]
+    fn the_targets_are_what_the_engine_is_sent() {
+        let mut m = wired();
+        patch(
+            &mut m,
+            "p1",
+            &[
+                ("/vcas/vca1/members", json!(["ch1", "st1"])),
+                ("/vcas/vca1/offset", json!(-6)),
+                ("/channels/ch1/fader", json!(-10)),
+                ("/channels/ch1/sends/aux1/on", json!(true)),
+                ("/channels/ch1/sends/aux1/level", json!(-3)),
+                ("/channels/ch1/gate/enabled", json!(true)),
+                ("/channels/ch1/gate/threshold", json!(-40)),
+                ("/channels/st1/legTrim/1", json!(3)),
+            ],
+        );
+        let scene = store(&mut m, "s1", None, "Opening");
+        patch(
+            &mut m,
+            "p2",
+            &[
+                ("/channels/ch1/fader", json!(0)),
+                ("/channels/ch2/mute", json!(true)),
+                ("/channels/ch1/input", json!("b")),
+            ],
+        );
+        rest(
+            &mut m,
+            Command::Recall {
+                id: "r1".into(),
+                scene,
+                at: "2026-11-15T12:01:00.000Z".into(),
+            },
+        );
+        assert_eq!(at(&m, "/channels/ch1/fader"), &json!(-10), "recalled");
+        set(&mut m, "s", 1, "/channels/ch1/input", json!("b"));
+        let t = m.targets().unwrap();
+        let shape = m.shape();
+        let strips: Vec<Vec<StripParam>> = (shape.channels.iter())
+            .map(|c| strip::params(&m.state()["channels"][&c.id], c.width))
+            .collect();
+        assert_eq!(
+            gain_bits(&t),
+            gain_bits(&Targets {
+                gains: mix::matrix(shape, m.state()),
+                ..Targets::default()
+            })
+        );
+        assert_eq!(format!("{:?}", t.strips), format!("{strips:?}"));
+        assert_eq!(t.flows, ["b1", "a2", "a3"]);
+        // ch1 under the VCA, -10 - 6 dB, panned centre onto PGM left.
+        let pgm_left = (10f64.powf(-16.0 / 20.0) * std::f64::consts::FRAC_PI_4.cos()) as f32;
+        assert_eq!(t.gains[0][0].to_bits(), pgm_left.to_bits());
+        assert!(t.gains[1].iter().all(|g| *g == 0.0), "ch2 is muted");
+        let mut loaded = wired();
+        loaded.load(&m.save()).unwrap();
+        let back = loaded.targets().unwrap();
+        assert_eq!(gain_bits(&back), gain_bits(&t));
+        assert_eq!(format!("{back:?}"), format!("{t:?}"));
+    }
+
+    /// A mixer without an engine's wiring has no targets.
+    #[test]
+    fn no_wiring_no_targets() {
+        assert_eq!(mixer().targets(), None);
+        assert!(wired().targets().is_some());
+    }
+
+    /// An AFV stage closing and opening by tally, and its off level set
+    /// while closed, move its channel's rows in the targets kept, to
+    /// those of the whole state.
+    #[test]
+    fn an_afv_stage_moves_its_channels_rows() {
+        let mut m = wired();
+        let kept = |m: &Mixer| {
+            let kept = m.targets().unwrap();
+            let whole = mix::targets(m.shape(), &m.wiring, m.state());
+            assert_eq!(gain_bits(&kept), gain_bits(&whole));
+            kept.gains
+        };
+        let tally = |m: &mut Mixer, source: &str, state: &str| {
+            rest(
+                m,
+                Command::Tally {
+                    id: format!("t-{source}-{state}"),
+                    sources: [(source.to_owned(), state.to_owned())].into(),
+                    replace: false,
+                },
+            )
+        };
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        let pgm_left_is = |g: f32, db: f64| (f64::from(g) - h * mix::gain(db)).abs() < 1e-6;
+        patch(
+            &mut m,
+            "p1",
+            &[
+                ("/channels/ch1/fader", json!(0)),
+                ("/channels/ch2/fader", json!(0)),
+                ("/afv/ch1/enabled", json!(true)),
+                ("/afv/ch1/offLevel", json!(-20)),
+                ("/afv/ch1/source", json!("cam1")),
+                ("/afv/ch2/enabled", json!(true)),
+                ("/afv/ch2/offLevel", json!(-30)),
+                ("/afv/ch2/source", json!("cam2")),
+            ],
+        );
+        assert!(pgm_left_is(kept(&m)[0][0], 0.0));
+        tally(&mut m, "cam1", "preview");
+        assert_eq!(at(&m, "/afv/ch1/open"), &json!(false));
+        assert!(pgm_left_is(kept(&m)[0][0], -20.0), "closed by tally");
+        tally(&mut m, "cam1", "program");
+        assert!(pgm_left_is(kept(&m)[0][0], 0.0), "opened by tally");
+        tally(&mut m, "cam2", "preview");
+        assert!(pgm_left_is(kept(&m)[1][0], -30.0), "closed by tally");
+        set(&mut m, "s", 1, "/afv/ch2/offLevel", json!(-10));
+        let gains = kept(&m);
+        assert!(pgm_left_is(gains[1][0], -10.0), "off level set");
+        assert!(pgm_left_is(gains[0][0], 0.0), "ch1 stays open");
+    }
+
+    /// The small shape with more channels, a 5.1 one among them, a
+    /// second VCA, a stereo aux and a direct out, each channel wired to
+    /// flows of its own in one domain.
+    fn wide() -> Mixer {
+        let mut shape = small();
+        let channel = |id: &str, width: usize, layout: &str| json!({ "id": id, "name": id, "width": width, "layout": layout, "altInput": true });
+        let more = [
+            channel("ch3", 1, "mono"),
+            channel("st2", 2, "stereo"),
+            channel("c51", 6, "5.1"),
+            channel("ch4", 1, "mono"),
+        ];
+        shape["channels"].as_array_mut().unwrap().extend(more);
+        shape["vcas"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "id": "vca2", "name": "MUSIC" }));
+        shape["auxes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "id": "aux2", "name": "FX", "width": 2, "layout": "stereo" }));
+        shape["outputs"].as_array_mut().unwrap().push(
+            json!({ "id": "o-ch1", "name": "DO 1", "source": "ch1", "width": 1, "layout": "mono" }),
+        );
+        let shape = Shape::parse(&shape).unwrap();
+        let wiring = (shape.channels.iter())
+            .map(|c| Wiring {
+                a: format!("a-{}", c.id),
+                b: c.alt_input.then(|| format!("b-{}", c.id)),
+                domain: "d".into(),
+            })
+            .collect();
+        Mixer::configured(shape, Vec::new(), wiring)
+    }
+
+    /// The targets a mixer keeps from write to write are those derived
+    /// from its whole state, bit for bit, after every command of random
+    /// sequences: sets, patches, touches and releases, scenes stored and
+    /// recalled, tally, expiries, refused commands and a save and load.
+    #[test]
+    fn the_kept_targets_are_those_of_the_whole_state_bit_for_bit() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let channels = ["ch1", "ch2", "st1", "ch3", "st2", "c51", "ch4"];
+        let elements = [
+            "buses/pgm",
+            "buses/cf",
+            "auxes/aux1",
+            "auxes/aux2",
+            "mixMinus/mm1",
+        ];
+        let sources = ["pgm", "cf", "aux1", "aux2", "mm1"];
+        // One random leaf the targets read, or one beside them.
+        let leaf = |next: &mut dyn FnMut(u64) -> u64| -> (String, Value) {
+            let ch = channels[next(channels.len() as u64) as usize];
+            let db = json!(next(1100) as f64 / 10.0 - 90.0);
+            let flag = json!(next(2) == 0);
+            let some = |next: &mut dyn FnMut(u64) -> u64| -> Value {
+                json!(channels.iter().filter(|_| next(3) == 0).collect::<Vec<_>>())
+            };
+            match next(30) {
+                0 => (format!("/channels/{ch}/fader"), db),
+                1 => (format!("/channels/{ch}/mute"), flag),
+                2 => (
+                    format!("/channels/{ch}/pan/lr"),
+                    json!(next(201) as f64 / 100.0 - 1.0),
+                ),
+                3 => (
+                    format!("/channels/{ch}/routes/{}", ["pgm", "cf"][next(2) as usize]),
+                    flag,
+                ),
+                4 => {
+                    let aux = ["aux1", "aux2"][next(2) as usize];
+                    let key = ["on", "level", "pre", "pan"][next(4) as usize];
+                    let value = match key {
+                        "level" => db,
+                        "pan" => json!(next(201) as f64 / 100.0 - 1.0),
+                        _ => flag,
+                    };
+                    (format!("/channels/{ch}/sends/{aux}/{key}"), value)
+                }
+                5 => (
+                    format!("/channels/{ch}/directOut/tap"),
+                    json!(["input", "preFader", "postFader"][next(3) as usize]),
+                ),
+                6 => (format!("/vcas/vca{}/members", 1 + next(2)), some(next)),
+                7 => (
+                    format!("/vcas/vca{}/offset", 1 + next(2)),
+                    json!(next(400) as f64 / 10.0 - 30.0),
+                ),
+                8 => (format!("/vcas/vca{}/mute", 1 + next(2)), flag),
+                9 => (format!("/{}/fader", elements[next(5) as usize]), db),
+                10 => (format!("/{}/mute", elements[next(5) as usize]), flag),
+                11 => (
+                    format!("/{}/polarity/{}", elements[next(4) as usize], next(2)),
+                    flag,
+                ),
+                12 => ("/mixMinus/mm1/exclude".into(), some(next)),
+                13 => (
+                    format!("/afv/{ch}/{}", ["enabled", "open"][next(2) as usize]),
+                    flag,
+                ),
+                14 => (format!("/afv/{ch}/source"), json!("cam1")),
+                15 => (format!("/afv/{ch}/offLevel"), json!(-(next(60) as f64))),
+                16 => ("/monitor/source".into(), json!(sources[next(5) as usize])),
+                17 => {
+                    let key = ["level", "dim", "cut", "mono", "downmix"][next(5) as usize];
+                    let value = match key {
+                        "level" => db,
+                        "downmix" => json!(["lr", "loRo"][next(2) as usize]),
+                        _ => flag,
+                    };
+                    (format!("/monitor/{key}"), value)
+                }
+                18 => (
+                    format!(
+                        "/monitor/{}/{}",
+                        ["speakerMute", "speakerSolo"][next(2) as usize],
+                        next(2)
+                    ),
+                    flag,
+                ),
+                19 => (
+                    format!("/channels/{ch}/trim"),
+                    json!(next(41) as f64 - 20.0),
+                ),
+                20 => (
+                    format!("/channels/{ch}/legTrim/0"),
+                    json!(next(13) as f64 - 6.0),
+                ),
+                21 => (format!("/channels/{ch}/polarity/0"), flag),
+                22 => (format!("/channels/{ch}/hpf/enabled"), flag),
+                23 => (
+                    format!("/channels/{ch}/eq/bands/{}/gain", next(4)),
+                    json!(next(31) as f64 - 15.0),
+                ),
+                24 => (
+                    format!("/channels/{ch}/gate/threshold"),
+                    json!(-(next(80) as f64)),
+                ),
+                25 => (format!("/channels/{ch}/comp/enabled"), flag),
+                26 => (format!("/channels/{ch}/dynamicsBeforeEq"), flag),
+                27 => (
+                    format!("/channels/{ch}/input"),
+                    json!(["a", "b"][next(2) as usize]),
+                ),
+                28 => (format!("/channels/{ch}/meterTap"), json!("preFader")),
+                _ => ("/metering/loudness/preset".into(), json!("atsc")),
+            }
+        };
+        let mut seq = 0;
+        let mut changed = 0;
+        for round in 0..150 {
+            let mut m = wide();
+            let mut scenes: Vec<String> = Vec::new();
+            for step in 0..60 {
+                seq += 1;
+                let session = ["a", "b"][next(2) as usize];
+                let effect = match next(20) {
+                    0..=9 => {
+                        let (path, value) = leaf(&mut next);
+                        set(&mut m, session, seq, &path, value)
+                    }
+                    10 => {
+                        let writes: Vec<(String, Value)> =
+                            (0..1 + next(8)).map(|_| leaf(&mut next)).collect();
+                        let writes: Vec<(&str, Value)> = writes
+                            .iter()
+                            .map(|(p, v)| (p.as_str(), v.clone()))
+                            .collect();
+                        patch(&mut m, &format!("p{seq}"), &writes)
+                    }
+                    11 => touch(&mut m, session, seq, &leaf(&mut next).0),
+                    12 => release(&mut m, session, seq, &leaf(&mut next).0),
+                    13 => {
+                        scenes.push(store(&mut m, &format!("s{seq}"), None, "S"));
+                        Effect::Unchanged
+                    }
+                    14 => match scenes.get(next(scenes.len().max(1) as u64) as usize) {
+                        Some(scene) => rest(
+                            &mut m,
+                            Command::Recall {
+                                id: format!("r{seq}"),
+                                scene: scene.clone(),
+                                at: "2026-11-15T12:00:00.000Z".into(),
+                            },
+                        ),
+                        None => Effect::Unchanged,
+                    },
+                    15 => {
+                        let state = ["program", "preview", "off"][next(3) as usize];
+                        rest(
+                            &mut m,
+                            Command::Tally {
+                                id: format!("t{seq}"),
+                                sources: [("cam1".to_owned(), state.to_owned())].into(),
+                                replace: next(2) == 0,
+                            },
+                        )
+                    }
+                    16 => m.expire(&origin(session).key()),
+                    // Refused: an unknown control, and an input switch
+                    // off the generation path.
+                    17 => set(&mut m, session, seq, "/channels/nope/fader", json!(0)),
+                    18 => {
+                        let ch = channels[next(channels.len() as u64) as usize];
+                        let other = if m.state()["channels"][ch]["input"] == "a" {
+                            "b"
+                        } else {
+                            "a"
+                        };
+                        apply_as(&mut m, &input(ch, other), Some(false))
+                    }
+                    _ => {
+                        let before = m.targets().unwrap();
+                        let mut loaded = wide();
+                        loaded.load(&m.save()).unwrap();
+                        assert_eq!(
+                            format!("{:?}", loaded.targets()),
+                            format!("{:?}", Some(before))
+                        );
+                        m = loaded;
+                        Effect::Unchanged
+                    }
+                };
+                if let Effect::Changed(_) = effect {
+                    changed += 1;
+                }
+                let kept = m.targets().unwrap();
+                let whole = mix::targets(m.shape(), &m.wiring, m.state());
+                let at = format!("round {round} step {step}");
+                assert_eq!(gain_bits(&kept), gain_bits(&whole), "{at}");
+                assert_eq!(
+                    format!("{:?}", kept.strips),
+                    format!("{:?}", whole.strips),
+                    "{at}"
+                );
+                assert_eq!(kept.flows, whole.flows, "{at}");
+            }
+        }
+        assert!(
+            changed > 150 * 60 / 3,
+            "{changed} commands changed the state"
+        );
+    }
+
+    fn input(ch: &str, value: &str) -> Command {
+        ctl(
+            Action::Set,
+            &format!("/channels/{ch}/input"),
+            Some(json!(value)),
+        )
+    }
+
+    /// The slots a command re-routes are those whose selected flow it
+    /// changes: not a selection it leaves as it is, nor input b of a
+    /// channel without one.
+    #[test]
+    fn a_command_reroutes_the_slots_whose_flow_it_changes() {
+        let mut m = wired();
+        let reroutes =
+            |m: &Mixer, c: &Command| m.reroutes(&origin("rest"), &serde_json::to_vec(c).unwrap());
+        assert_eq!(reroutes(&m, &input("ch1", "b")), [0]);
+        assert_eq!(reroutes(&m, &input("ch1", "a")), Vec::<u32>::new());
+        assert_eq!(reroutes(&m, &input("st1", "b")), Vec::<u32>::new());
+        let fader = ctl(Action::Set, "/channels/ch1/fader", Some(json!(-3)));
+        assert_eq!(reroutes(&m, &fader), Vec::<u32>::new());
+        let both = Command::Patch {
+            id: "p".into(),
+            changes: ["ch1", "ch2"]
+                .map(|ch| Write {
+                    path: format!("/channels/{ch}/input"),
+                    value: json!("b"),
+                })
+                .to_vec(),
+        };
+        assert_eq!(reroutes(&m, &both), [0, 1]);
+        // A recall re-routes the inputs it switches back.
+        let scene = store(&mut m, "s1", None, "A");
+        patch(&mut m, "p1", &[("/channels/ch2/input", json!("b"))]);
+        let recall = Command::Recall {
+            id: "r".into(),
+            scene,
+            at: "2026-11-15T12:00:00.000Z".into(),
+        };
+        assert_eq!(reroutes(&m, &recall), [1]);
+    }
+
+    fn apply_as(m: &mut Mixer, c: &Command, generation: Option<bool>) -> Effect<Edits> {
+        let bytes = serde_json::to_vec(c).unwrap();
+        m.apply(&origin("rest"), &bytes, &ordered(generation))
+    }
+
+    fn refused(m: &Mixer, id: &str) -> bool {
+        matches!(m.answer(&rest_key(), id), Some(Answer::Refused { .. }))
+    }
+
+    /// A command that switches an input applies on the generation path,
+    /// and is refused, changing nothing, off it; one the writer did not
+    /// classify applies as before.
+    #[test]
+    fn a_reroute_off_the_generation_path_is_refused() {
+        let off = ctl(Action::Set, "/channels/ch1/input", Some(json!("b")));
+        let mut m = wired();
+        assert!(matches!(
+            apply_as(&mut m, &off, Some(false)),
+            Effect::Unchanged
+        ));
+        assert!(refused(&m, "c"));
+        assert_eq!(at(&m, "/channels/ch1/input"), &json!("a"));
+        assert_eq!(m.targets().unwrap().flows[0], "a1");
+        for generation in [Some(true), None] {
+            let mut m = wired();
+            assert!(matches!(
+                apply_as(&mut m, &off, generation),
+                Effect::Changed(_)
+            ));
+            assert_eq!(m.targets().unwrap().flows[0], "b1");
+        }
+        // Commands that switch no input apply off it.
+        let mut m = wired();
+        let fader = ctl(Action::Set, "/channels/ch1/fader", Some(json!(-3)));
+        assert!(matches!(
+            apply_as(&mut m, &fader, Some(false)),
+            Effect::Changed(_)
+        ));
+    }
+
+    /// A recall that switches inputs in two domains is refused on the
+    /// generation path, on every replica alike: one engine generation
+    /// cannot switch both. In one domain it applies.
+    #[test]
+    fn a_recall_switching_inputs_in_two_domains_is_refused() {
+        let mut m = wired();
+        let scene = store(&mut m, "s1", None, "B");
+        patch(
+            &mut m,
+            "p1",
+            &[
+                ("/channels/ch1/input", json!("b")),
+                ("/channels/ch2/input", json!("b")),
+            ],
+        );
+        let two = Command::Recall {
+            id: "r2".into(),
+            scene: scene.clone(),
+            at: "2026-11-15T12:00:00.000Z".into(),
+        };
+        let mut other = wired();
+        other.load(&m.save()).unwrap();
+        for m in [&mut m, &mut other] {
+            assert!(matches!(apply_as(m, &two, Some(true)), Effect::Unchanged));
+            assert!(refused(m, "r2"));
+            assert_eq!(m.targets().unwrap().flows, ["b1", "b2", "a3"]);
+        }
+        // The writer's classification of it is both slots.
+        assert_eq!(
+            m.reroutes(&origin("rest"), &serde_json::to_vec(&two).unwrap()),
+            [0, 1]
+        );
+        // In one domain it applies.
+        patch(&mut m, "p2", &[("/channels/ch2/input", json!("a"))]);
+        let one = Command::Recall {
+            id: "r1".into(),
+            scene,
+            at: "2026-11-15T12:00:00.000Z".into(),
+        };
+        assert!(matches!(
+            apply_as(&mut m, &one, Some(true)),
+            Effect::Changed(_)
+        ));
+        assert_eq!(m.targets().unwrap().flows, ["a1", "a2", "a3"]);
+    }
+
+    /// The configuration hash follows the shape, the declared consoles,
+    /// each input's flows and domain, and the derivation version, and
+    /// not the state.
+    #[test]
+    fn the_config_hash_covers_the_configuration_alone() {
+        let mut m = wired();
+        let hash = m.config_hash();
+        assert_eq!(wired().config_hash(), hash);
+        set(&mut m, "s", 1, "/channels/ch1/fader", json!(-3));
+        assert_eq!(m.config_hash(), hash, "not the state");
+        let mut other = wired();
+        other.wiring[1].domain = "d".into();
+        assert_ne!(other.config_hash(), hash, "a domain");
+        let mut other = wired();
+        other.wiring[0].b = Some("b9".into());
+        assert_ne!(other.config_hash(), hash, "a flow");
+        let other = Mixer::configured(m.shape().clone(), vec![desk("x", "X")], m.wiring.clone());
+        assert_ne!(other.config_hash(), hash, "a declared console");
+        assert_ne!(mixer().config_hash(), hash, "the shape and wiring");
+        let config = json!({
+            "derivation": DERIVATION_VERSION + 1,
+            "shape": m.shape,
+            "consoles": m.declared,
+            "wiring": m.wiring,
+        });
+        assert_ne!(
+            xxhash_rust::xxh3::xxh3_64(config.to_string().as_bytes()),
+            hash
+        );
+    }
+
+    /// A snapshot carries its format: a binary that reads the earlier
+    /// layout refuses it, and one of another format is refused, while a
+    /// snapshot of the earlier layout still loads.
+    #[test]
+    fn a_snapshot_carries_its_format() {
+        let (m, _) = busy();
+        let saved = m.save();
+        assert!(
+            serde_json::from_slice::<Saved>(&saved).is_err(),
+            "earlier binaries refuse it"
+        );
+        let mut v: Value = serde_json::from_slice(&saved).unwrap();
+        v["format"] = json!(3);
+        let e = mixer().load(&serde_json::to_vec(&v).unwrap()).unwrap_err();
+        assert!(e.contains("format 3"), "{e}");
+        let earlier = serde_json::to_vec(&v["mixer"]).unwrap();
+        let mut back = mixer();
+        back.load(&earlier).unwrap();
+        assert_eq!(back.state(), m.state());
     }
 }

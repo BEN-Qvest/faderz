@@ -4,25 +4,38 @@
 //! routes at the delta's `atIndex`, and its meters go to the primary
 //! connections as meter frames.
 //!
-//! The engine keeps its own log ([`Engine::start`]): the state is a set
-//! of one voter, so the order the replica applies deltas in is the order
-//! every change reaches the engine.
+//! In a set of one the engine keeps its own log ([`Engine::start`]): the
+//! order the replica applies deltas in is the order every change reaches
+//! the engine. In a set of more ([`Audio::start_set`]) the engine follows
+//! the replicated log ([`Engine::start_replicated`]): samplez-replica
+//! hands it the entries each log entry derived from the state, and this
+//! module only meters it and reports its inputs' health to the log.
 
-use std::sync::Mutex;
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use openraft::ServerState;
 use samplez::rt::ProcessStatus;
-use samplez::{Counters, Engine, EntryError, GainError, InputState, InputStatus};
+use samplez::{
+    Counters, Engine, EntryError, GainError, InputState, InputStatus, Replication, Report,
+};
 use samplez_dsp::StripParam;
 use samplez_replica::Replica;
+use samplez_replica::bridge::EngineAudio;
+use samplez_replica::contact::Timing;
+use samplez_replica::entry::Body;
+use samplez_replica::state_machine::StateMachine;
 use samplez_service::ws::{Frame, Hub};
 use samplez_service::{Counter, Gauge, Metrics, Ops, Position, ReplicatedState};
 use serde_json::{Map, Value, json};
 use tokio::sync::Notify;
 use tokio::time::{Instant, MissedTickBehavior};
 
+use crate::config::Set;
 use crate::meters::{Layout, Readings};
 use crate::shape::Shape;
 use crate::state::{Mixer, set_at};
@@ -37,11 +50,38 @@ const FULL_RETRY: Duration = Duration::from_millis(5);
 /// [`Audio::follow`] waits for it.
 const RESEND_EVERY: Duration = Duration::from_secs(1);
 
+/// A replica's engine in a set of more than one ([`Audio::start_set`]).
+pub struct SetEngine {
+    pub audio: Audio,
+    /// What the replica's contact drives the engine through.
+    pub bridge: EngineAudio,
+    /// The engine's input-health reports ([`report_inputs`]).
+    pub reports: Receiver<Report>,
+    /// The contact timers the bridge was made with ([`timing`]).
+    pub timing: Timing,
+}
+
+/// A set replica's contact timers: samplez-replica's defaults, with the
+/// engine's block, margin, hold and contact window and the set's
+/// `maxApplyLeadMs`.
+pub fn timing(engine: &samplez::Config, set: &Set) -> Timing {
+    Timing {
+        margin: u64::from(engine.reader_margin_samples),
+        hold: Duration::from_millis(u64::from(engine.hold_ms)),
+        contact_window: Duration::from_millis(u64::from(engine.contact_window_ms)),
+        max_apply_lead: set.max_apply_lead,
+        ..Timing::defaults(u64::from(engine.block_size))
+    }
+}
+
 pub struct Audio {
-    engine: Engine,
+    engine: Arc<Engine>,
+    /// The engine follows a set's replicated log: nothing is sent to it
+    /// from here.
+    replicated: bool,
     shape: Shape,
     /// Each channel's flows of input a and b.
-    flows: Vec<(String, Option<String>)>,
+    wiring: Vec<mix::Wiring>,
     /// The flow each channel's input read when the engine started.
     started_on: Vec<String>,
     block: u64,
@@ -98,31 +138,85 @@ impl Audio {
         mut config: samplez::Config,
         process: ProcessStatus,
         shape: &Shape,
-        alt_flows: Vec<Option<String>>,
+        wiring: Vec<mix::Wiring>,
         state: &Value,
         ops: Ops,
     ) -> Result<Audio, String> {
-        let flows: Vec<(String, Option<String>)> = config
-            .inputs
-            .iter()
-            .zip(alt_flows)
-            .map(|(i, b)| (i.flow_id.clone(), b))
-            .collect();
-        let started_on = selected(shape, &flows, state);
+        let started_on = mix::selected(shape, &wiring, state);
         for (input, flow) in config.inputs.iter_mut().zip(&started_on) {
             input.flow_id.clone_from(flow);
         }
         let block = u64::from(config.block_size);
         let ramp = u64::from(config.ramp_samples);
         let engine = Engine::start(config, process, None).map_err(|e| format!("engine: {e}"))?;
+        let mut audio = Audio::new(Arc::new(engine), shape, wiring, state, ops);
+        (audio.started_on, audio.block, audio.ramp) = (started_on, block, ramp);
+        Ok(audio)
+    }
+
+    /// Starts the engine of `config` as a replica of `set`, following the
+    /// replicated log, each channel reading the flow its selected input in
+    /// `state` names.
+    ///
+    /// # Errors
+    ///
+    /// When the engine does not start.
+    pub fn start_set(
+        mut config: samplez::Config,
+        process: ProcessStatus,
+        shape: &Shape,
+        wiring: Vec<mix::Wiring>,
+        state: &Value,
+        ops: Ops,
+        set: &Set,
+    ) -> Result<SetEngine, String> {
+        let timing = timing(&config, set);
+        for (input, flow) in config
+            .inputs
+            .iter_mut()
+            .zip(mix::selected(shape, &wiring, state))
+        {
+            input.flow_id = flow;
+        }
+        let (reports, reports_rx) = std::sync::mpsc::sync_channel(64);
+        let (statuses, statuses_rx) = std::sync::mpsc::sync_channel(1 << 12);
+        let (hashes, hashes_rx) = std::sync::mpsc::sync_channel(1 << 10);
+        let replication = Replication {
+            voters: usize::from(set.voters.replicas),
+            reports,
+            statuses: Some(statuses),
+            hashes: Some(hashes),
+        };
+        let engine = Engine::start_replicated(config, process, None, replication)
+            .map_err(|e| format!("engine: {e}"))?;
+        let engine = Arc::new(engine);
+        let bridge = EngineAudio::new(engine.clone(), statuses_rx, hashes_rx, &timing);
+        let mut audio = Audio::new(engine, shape, wiring, state, ops);
+        audio.replicated = true;
+        Ok(SetEngine {
+            audio,
+            bridge,
+            reports: reports_rx,
+            timing,
+        })
+    }
+
+    fn new(
+        engine: Arc<Engine>,
+        shape: &Shape,
+        wiring: Vec<mix::Wiring>,
+        state: &Value,
+        ops: Ops,
+    ) -> Audio {
         let metrics = ops.metrics();
-        Ok(Audio {
+        Audio {
             engine,
+            replicated: false,
+            started_on: Vec::new(),
+            block: 0,
+            ramp: 0,
             shape: shape.clone(),
-            flows,
-            started_on,
-            block,
-            ramp,
+            wiring,
             resends_asked: Mutex::new(0),
             resend: Notify::new(),
             taps: Mutex::new(mix::meter_taps(shape, state)),
@@ -140,7 +234,7 @@ impl Audio {
             ),
             inputs: Mutex::new(InputHealth::new(metrics, shape)),
             ops,
-        })
+        }
     }
 
     pub fn engine(&self) -> &Engine {
@@ -148,9 +242,12 @@ impl Audio {
     }
 
     /// Stops the engine and releases its writers, which deletes their
-    /// flows.
+    /// flows. A set's engine is held by the replica's contact as well and
+    /// stops once that lets it go, with the process.
     pub fn stop(self) {
-        self.engine.stop();
+        if let Some(engine) = Arc::into_inner(self.engine) {
+            engine.stop();
+        }
     }
 
     /// Sends every gain and route to the engine again, as absolute
@@ -247,16 +344,17 @@ impl Audio {
         }
     }
 
-    /// Sends the engine every coefficient of `state`'s matrix that differs
-    /// from what it was sent, and a route for every channel whose selected
-    /// flow differs, all at `at` rounded up to a block. When the engine no
+    /// Sends the engine every strip parameter and coefficient of `state`'s
+    /// targets ([`mix::targets`]) that differs from what it was sent, and
+    /// a route for every channel whose selected flow differs, all at `at`
+    /// rounded up to a block. When the engine no
     /// longer takes that index, the rest of the diff goes at the earliest
     /// one it does; while it holds as many changes as it takes, the next
     /// waits. With `settle`, the gains wait for the strips' ramps.
     async fn apply(&self, state: &Value, sent: &mut Sent, at: u64, settle: bool) {
         let mut at = at.next_multiple_of(self.block);
-        for (slot, (c, sent)) in self.shape.channels.iter().zip(&mut sent.strips).enumerate() {
-            let next = strip::params(&state["channels"][&c.id], c.width);
+        let targets = mix::targets(&self.shape, &self.wiring, state);
+        for (slot, (sent, next)) in sent.strips.iter_mut().zip(targets.strips).enumerate() {
             for (p, n) in sent.iter_mut().zip(next) {
                 if *p != Some(n)
                     && self
@@ -271,8 +369,7 @@ impl Audio {
             at = (at + self.ramp).next_multiple_of(self.block);
         }
         *self.taps.lock().expect("taps lock poisoned") = mix::meter_taps(&self.shape, state);
-        let next = mix::matrix(&self.shape, state);
-        for (input, (row, new)) in sent.matrix.iter_mut().zip(next).enumerate() {
+        for (input, (row, new)) in sent.matrix.iter_mut().zip(targets.gains).enumerate() {
             for (output, (g, n)) in row.iter_mut().zip(new).enumerate() {
                 if *g != n
                     && self
@@ -283,10 +380,7 @@ impl Audio {
                 }
             }
         }
-        for (slot, flow) in selected(&self.shape, &self.flows, state)
-            .into_iter()
-            .enumerate()
-        {
+        for (slot, flow) in targets.flows.into_iter().enumerate() {
             while flow != sent.routed[slot] {
                 match self.engine.route(slot, &flow, at) {
                     Ok(_) => sent.routed[slot].clone_from(&flow),
@@ -347,7 +441,13 @@ impl Audio {
                 .expect("input health lock poisoned")
                 .update(&status.inputs);
             let late = dropped(counters);
-            match drops.tick(late, &status.diverged, tick.into_std()) {
+            // A set's engine is resynced or rebuilt by the replica.
+            let act = if self.replicated {
+                Act::None
+            } else {
+                drops.tick(late, &status.diverged, tick.into_std())
+            };
+            match act {
                 Act::None => {}
                 Act::Hold => self.hold(),
                 Act::Resend { log } => {
@@ -555,19 +655,157 @@ impl Drops {
     }
 }
 
-/// The flow each channel's selected input reads.
-fn selected(shape: &Shape, flows: &[(String, Option<String>)], state: &Value) -> Vec<String> {
-    shape
-        .channels
-        .iter()
-        .zip(flows)
-        .map(
-            |(c, (a, b))| match (state["channels"][&c.id]["input"].as_str(), b) {
-                (Some("b"), Some(b)) => b.clone(),
-                _ => a.clone(),
-            },
-        )
-        .collect()
+/// Appends an `InputDown` for each input the replicated engine pruned and
+/// an `InputUp` for each one readable again, which the leader stamps; so
+/// every replica of the set silences and raises the input at the same
+/// index. Only a leader's append is ordered: a report made while
+/// following, or one lost to an election, is appended again while this
+/// replica leads and the applied log does not hold it, first after
+/// `write_timeout`, within which an append is ordered or given up, then
+/// at twice the interval up to [`RETRY_CAP`] times it ([`Unapplied`]). Runs on a
+/// thread of its own until the engine stops or the replica is gone.
+pub fn report_inputs(
+    reports: Receiver<Report>,
+    replica: Weak<Replica<Mixer>>,
+    write_timeout: Duration,
+) {
+    let forward = move || {
+        let mut unapplied = Unapplied::new(write_timeout);
+        let mut next: Option<std::time::Instant> = None;
+        loop {
+            let received = match next {
+                Some(at) => {
+                    reports.recv_timeout(at.saturating_duration_since(std::time::Instant::now()))
+                }
+                None => reports.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            let now = std::time::Instant::now();
+            match received {
+                Ok(report) => unapplied.report(report, now),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            let Some(replica) = replica.upgrade() else {
+                return;
+            };
+            let leads = replica.raft().metrics().borrow().state == ServerState::Leader;
+            next = unapplied.retry(
+                now,
+                leads,
+                |slot| replica.store().with_state(|sm| applied_up(sm, slot)),
+                |body| {
+                    if let Err(e) = replica.append(body) {
+                        tracing::warn!("input report not appended: {e}");
+                    }
+                },
+            );
+        }
+    };
+    if let Err(e) = std::thread::Builder::new()
+        .name("faderz-inputs".into())
+        .spawn(forward)
+    {
+        tracing::error!("no thread reports the inputs' health to the set: {e}");
+    }
+}
+
+/// How many times `write_timeout` an input report is retried at most.
+pub const RETRY_CAP: u32 = 4;
+
+/// The input health this replica's engine reported that the set may not
+/// hold yet, per slot; a later report on a slot replaces an earlier one.
+struct Unapplied {
+    slots: BTreeMap<u32, Retry>,
+    first: Duration,
+}
+
+struct Retry {
+    up: bool,
+    /// Reported while leading and not appended yet: appended whatever the
+    /// applied log holds, as every report was before it was retried.
+    fresh: bool,
+    due: std::time::Instant,
+    backoff: Duration,
+}
+
+impl Unapplied {
+    fn new(first: Duration) -> Unapplied {
+        Unapplied {
+            slots: BTreeMap::new(),
+            first,
+        }
+    }
+
+    fn report(&mut self, report: Report, now: std::time::Instant) {
+        let (slot, up) = match report {
+            Report::InputPruned { slot } => (slot as u32, false),
+            Report::InputReadable { slot } => (slot as u32, true),
+        };
+        let retry = Retry {
+            up,
+            fresh: true,
+            due: now,
+            backoff: self.first,
+        };
+        self.slots.insert(slot, retry);
+    }
+
+    /// Appends each report due, while `leads`, unless it was appended
+    /// before and the applied log holds it (`applied` says whether it
+    /// holds a slot up), which drops it. Returns when the next one is due.
+    fn retry(
+        &mut self,
+        now: std::time::Instant,
+        leads: bool,
+        applied: impl Fn(u32) -> bool,
+        mut append: impl FnMut(Body),
+    ) -> Option<std::time::Instant> {
+        let (first, cap) = (self.first, self.first * RETRY_CAP);
+        self.slots.retain(|&slot, r| {
+            if r.due > now {
+                return true;
+            }
+            if !leads {
+                // A follower's append is not ordered: the applied log
+                // decides once it leads.
+                r.fresh = false;
+                r.due = now + first;
+                return true;
+            }
+            if !r.fresh && applied(slot) == r.up {
+                return false;
+            }
+            append(input_entry(slot, r.up));
+            r.fresh = false;
+            r.due = now + r.backoff;
+            r.backoff = (r.backoff * 2).min(cap);
+            true
+        });
+        self.slots.values().map(|r| r.due).min()
+    }
+}
+
+/// Whether the applied log holds `slot` up: as its latest `InputDown` or
+/// `InputUp` says, up where none is held
+/// ([`StateMachine::product_state`]).
+fn applied_up(sm: &StateMachine<Mixer>, slot: u32) -> bool {
+    (sm.pending.values().rev())
+        .find_map(|body| match body {
+            Body::InputDown { slot: s, .. } if *s == slot => Some(false),
+            Body::InputUp { slot: s, .. } if *s == slot => Some(true),
+            _ => None,
+        })
+        .unwrap_or(true)
+}
+
+/// The log entry of slot `slot` up or down, at an index the leader
+/// stamps.
+fn input_entry(slot: u32, up: bool) -> Body {
+    if up {
+        Body::InputUp { slot, at_index: 0 }
+    } else {
+        Body::InputDown { slot, at_index: 0 }
+    }
 }
 
 /// The state and revision `replica` holds now.
@@ -626,6 +864,114 @@ mod tests {
             Act::Resend { log: true }
         );
         assert_eq!(d.tick([3, 0], &diverged, at(3_200)), Act::None);
+    }
+
+    /// A set's contact timers take the engine's block, margin, hold and
+    /// contact window, and the cap `replica.maxApplyLeadMs` sets.
+    #[test]
+    fn a_set_times_contact_by_its_engine_and_its_cap() {
+        let id = |n: u8| format!("00000000-0000-4000-8000-00000000000{n}");
+        let config = json!({
+            "replica": {
+                "replicas": 3, "maxApplyLeadMs": 80,
+                "peers": ["f-0.f:7443", "f-1.f:7443", "f-2.f:7443"],
+                "peer": { "bind": "0.0.0.0", "port": 7443, "tls": {
+                    "mode": "files", "certFile": "/t/tls.crt", "keyFile": "/t/tls.key",
+                    "clientCaFile": "/t/ca.crt" } },
+                "marker": "m",
+            },
+            "shape": crate::shape::tests::small(),
+            "mxl": {
+                "domains": [{ "name": "d", "path": "/dev/shm/d" }],
+                "inputs": { "ch1": { "flow": id(1), "altFlow": id(5) }, "ch2": { "flow": id(2) },
+                            "st1": { "flow": id(3) } },
+                "outputs": { "out-pgm": { "flows": [id(4), id(6), id(7)] } },
+            },
+            "engine": { "blockSize": 96, "readerMarginSamples": 960 },
+        });
+        let (config, _, _) =
+            crate::config::Config::parse(&config.to_string(), || "faderz-1".into()).unwrap();
+        let engine = config.audio.as_ref().unwrap();
+        let t = timing(engine, config.set.as_ref().unwrap());
+        assert_eq!((t.block, t.margin), (96, 960));
+        assert_eq!(t.max_apply_lead, Duration::from_millis(80));
+        assert_eq!(t.hold, Duration::from_millis(u64::from(engine.hold_ms)));
+        assert_eq!(
+            t.contact_window,
+            Duration::from_millis(u64::from(engine.contact_window_ms))
+        );
+    }
+
+    fn down(slot: u32) -> Body {
+        Body::InputDown { slot, at_index: 0 }
+    }
+
+    fn up(slot: u32) -> Body {
+        Body::InputUp { slot, at_index: 0 }
+    }
+
+    /// A leader appends a pruned input's `InputDown` at once. An election
+    /// takes the entry with it; the replica follows for a while, appends
+    /// nothing then, leads again and appends it again, first after the
+    /// write timeout, then at twice the interval, until the applied log
+    /// holds the input down.
+    #[test]
+    fn an_input_report_lost_in_an_election_is_appended_again() {
+        let first = Duration::from_secs(2);
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut u = Unapplied::new(first);
+        let held_up = std::cell::Cell::new(true);
+        let mut appended = Vec::new();
+        u.report(Report::InputPruned { slot: 3 }, t0);
+        let next = u.retry(t0, true, |_| held_up.get(), |b| appended.push(b));
+        assert_eq!(appended, [down(3)]);
+        assert_eq!(next, Some(at(2_000)));
+        // Not due yet.
+        u.retry(at(1_000), true, |_| held_up.get(), |b| appended.push(b));
+        assert_eq!(appended.len(), 1);
+        // The election: following, it appends nothing.
+        let next = u.retry(at(2_000), false, |_| held_up.get(), |b| appended.push(b));
+        assert_eq!((appended.len(), next), (1, Some(at(4_000))));
+        // Leading again, the set still holds the input up.
+        let next = u.retry(at(4_000), true, |_| held_up.get(), |b| appended.push(b));
+        assert_eq!(appended, [down(3), down(3)]);
+        assert_eq!(next, Some(at(8_000)));
+        let next = u.retry(at(8_000), true, |_| held_up.get(), |b| appended.push(b));
+        assert_eq!((appended.len(), next), (3, Some(at(16_000))));
+        // Bounded: never more than RETRY_CAP write timeouts apart.
+        let next = u.retry(at(16_000), true, |_| held_up.get(), |b| appended.push(b));
+        assert_eq!((appended.len(), next), (4, Some(at(24_000))));
+        // Applied: dropped.
+        held_up.set(false);
+        let next = u.retry(at(24_000), true, |_| held_up.get(), |b| appended.push(b));
+        assert_eq!((appended.len(), next), (4, None));
+    }
+
+    /// Reports on a slot not yet held replace each other: the latest is
+    /// appended. A follower's report is appended once it leads only while
+    /// the applied log does not hold it already.
+    #[test]
+    fn the_latest_input_report_wins() {
+        let first = Duration::from_secs(2);
+        let t0 = std::time::Instant::now();
+        let mut u = Unapplied::new(first);
+        let mut appended = Vec::new();
+        u.report(Report::InputPruned { slot: 1 }, t0);
+        u.report(Report::InputReadable { slot: 1 }, t0);
+        u.retry(t0, true, |_| true, |b| appended.push(b));
+        assert_eq!(appended, [up(1)]);
+
+        let mut u = Unapplied::new(first);
+        let mut appended = Vec::new();
+        u.report(Report::InputPruned { slot: 0 }, t0);
+        u.report(Report::InputPruned { slot: 2 }, t0);
+        u.retry(t0, false, |_| true, |b| appended.push(b));
+        assert!(appended.is_empty());
+        // Leading: slot 0 the set already holds down, slot 2 it does not.
+        let next = u.retry(t0 + first, true, |slot| slot != 0, |b| appended.push(b));
+        assert_eq!(appended, [down(2)]);
+        assert_eq!(next, Some(t0 + first * 2));
     }
 
     /// A strip parameter the RT thread refused counts as a drop.

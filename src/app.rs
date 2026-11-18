@@ -604,7 +604,8 @@ pub(crate) mod tests {
             "outputs": [],
         }))
         .unwrap();
-        let replica = replica::start(&dir, shape, Vec::new(), Arc::new(replica::tai_samples))
+        let mixer = Mixer::factory(shape, Vec::new(), Vec::new());
+        let replica = replica::start(&dir, mixer, Arc::new(replica::tai_samples))
             .await
             .unwrap();
         let app = App::new(
@@ -677,10 +678,13 @@ pub(crate) mod tests {
         app.lapse_selections();
         assert!(selected(&app, &s), "kept while leased");
         let renewed = app.replica.store().with_state(|sm| sm.leases[&s]);
-        app.replica.append(Body::LeaseExpiry {
-            session: s.clone(),
-            renewed,
-        });
+        app.replica
+            .append(Body::LeaseExpiry {
+                session: s.clone(),
+                renewed,
+                at_index: None,
+            })
+            .unwrap();
         until_lease(&app, &s, false).await;
         app.lapse_selections();
         assert!(!selected(&app, &s), "lapsed with the lease");
@@ -700,10 +704,13 @@ pub(crate) mod tests {
         app.lapse_selections();
         assert!(selected(&app, &s), "kept while leased");
         let renewed = app.replica.store().with_state(|sm| sm.leases[&s]);
-        app.replica.append(Body::LeaseExpiry {
-            session: s.clone(),
-            renewed,
-        });
+        app.replica
+            .append(Body::LeaseExpiry {
+                session: s.clone(),
+                renewed,
+                at_index: None,
+            })
+            .unwrap();
         until_lease(&app, &s, false).await;
         app.lapse_selections();
         assert!(!selected(&app, &s), "lapsed with the lease");
