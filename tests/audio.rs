@@ -963,7 +963,12 @@ async fn a_burst_ducks_the_programme_but_not_the_me(block: u32) {
         let torn = p
             .iter()
             .any(|s| !near(comm(s), 0.0) && !near(comm(s), COMM));
-        if !silent && !torn {
+        // A late commentary block is silence within the burst: whole, the
+        // burst is one run of exactly its length.
+        let on: Vec<usize> = (0..p.len()).filter(|&i| near(comm(&p[i]), COMM)).collect();
+        let whole = on.len() as u64 == end - start
+            && on.first().map(|f| f + on.len() - 1) == on.last().copied();
+        if !silent && !torn && whole {
             read = Some((p, m));
             break;
         }

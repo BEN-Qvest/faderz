@@ -571,16 +571,30 @@ fn replicas_write_equal_audio_and_a_restarted_one_catches_up() {
 
     write(&nodes, 0, &ducking());
     let from = Outputs::now() + 1;
-    // The largest envelope the duck group reached on a replica.
-    let mut ducked = 0.0f32;
+    // The largest envelope the duck group reached on a replica while in
+    // auto, from three commands (120 ms, past the release) after it was
+    // last latched on: keyed by ch1's fader alone.
+    let latched = |i: usize| {
+        (0..=i)
+            .rev()
+            .find(|k| k % 11 == 10)
+            .is_some_and(|k| k % 22 == 10)
+    };
+    let mut keyed = 0.0f32;
     for i in 0..42 {
         write(&nodes, i, &command(i));
         std::thread::sleep(Duration::from_millis(40));
+        if (i.saturating_sub(3)..=i).any(latched) {
+            continue;
+        }
         let engine = node(&nodes, i % REPLICAS).server.audio.clone().unwrap();
         let status = engine.engine().status();
-        ducked = (status.ducks.iter()).fold(ducked, |e, d| e.max(d.envelope));
+        keyed = (status.ducks.iter()).fold(keyed, |e, d| e.max(d.envelope));
     }
-    assert!(ducked > 0.5, "the duck group never ducked: {ducked}");
+    assert!(
+        keyed > 0.5,
+        "ch1's fader never keyed the duck group: {keyed}"
+    );
     std::thread::sleep(Duration::from_millis(500));
     agree(&nodes, &outputs, from, 500);
 
