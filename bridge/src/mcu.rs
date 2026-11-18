@@ -3,7 +3,10 @@
 //! keys as notes, their LEDs, and the scribble strip text as SysEx.
 //!
 //! The values follow the published reverse-engineered MCU reference; they
-//! are not checked against a unit here.
+//! are not checked against a unit here. The function keys F1 to F8 at
+//! notes 54 to 61 (0x36 to 0x3d) are the notes Ardour's Mackie Control
+//! surface (`libs/surfaces/mackie/device_info.cc`) and REAPER's
+//! (`csurf_mcu.cpp` in the REAPER SDK) read.
 
 /// Strips of an X-Touch or an X-Touch Extender, not counting a master.
 pub const STRIPS: u8 = 8;
@@ -42,6 +45,8 @@ pub enum Key {
     BankRight,
     ChannelLeft,
     ChannelRight,
+    /// F1 to F8 as 0 to 7.
+    Function(u8),
     /// Any other note: not mapped.
     Other(u8),
 }
@@ -57,6 +62,7 @@ impl Key {
             47 => Key::BankRight,
             48 => Key::ChannelLeft,
             49 => Key::ChannelRight,
+            54..=61 => Key::Function(note - 54),
             n => Key::Other(n),
         }
     }
@@ -72,6 +78,7 @@ impl Key {
             Key::BankRight => 47,
             Key::ChannelLeft => 48,
             Key::ChannelRight => 49,
+            Key::Function(f) => 54 + f,
             Key::Other(n) => n,
         }
     }
@@ -252,7 +259,19 @@ mod tests {
         assert_eq!(key(46), Key::BankLeft);
         assert_eq!(key(49), Key::ChannelRight);
         assert_eq!(key(50), Key::Other(50));
-        for note in 0..=49 {
+        assert_eq!(key(53), Key::Other(53));
+        for (f, note) in (54..=61).enumerate() {
+            assert_eq!(key(note), Key::Function(f as u8));
+            assert_eq!(
+                parse(&[0x80, note, 0x40]),
+                Some(Input::Key {
+                    key: Key::Function(f as u8),
+                    down: false
+                })
+            );
+        }
+        assert_eq!(key(62), Key::Other(62));
+        for note in 0..=103 {
             assert_eq!(Key::from_note(note).note(), note);
         }
     }
@@ -262,6 +281,7 @@ mod tests {
         assert_eq!(led(Key::Mute(2), Led::On), vec![0x90, 18, 0x7f]);
         assert_eq!(led(Key::Select(0), Led::Blink), vec![0x90, 24, 1]);
         assert_eq!(led(Key::Solo(7), Led::Off), vec![0x90, 15, 0]);
+        assert_eq!(led(Key::Function(7), Led::Blink), vec![0x90, 61, 1]);
         let m = lcd(Device::Extender, 56 + 7, "Vox  \u{e9}");
         assert_eq!(
             m,

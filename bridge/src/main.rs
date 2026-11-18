@@ -72,6 +72,9 @@ fn list_ports() -> ExitCode {
 
 fn start(path: &std::path::Path) -> Result<(), String> {
     let config = Config::load(path)?;
+    for warning in config.warnings() {
+        tracing::warn!("{warning}");
+    }
     let session = session::load_or_create(&config.session_file())
         .map_err(|e| format!("{}: {e}", config.session_file().display()))?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -150,6 +153,7 @@ fn start(path: &std::path::Path) -> Result<(), String> {
             credentials,
             units: config.unit_specs(),
             master: config.master.clone(),
+            keys: config.keys.clone(),
             renewed,
         };
         bridge::run(options, ports, async {
