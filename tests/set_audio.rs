@@ -517,6 +517,106 @@ fn steady(nodes: &[Option<Node>], n: usize) {
     assert!(steady, "replica {n} did not commit: {}", states(nodes));
 }
 
+/// Held by each test that runs a set: two sets of three engines at once
+/// miss their deadlines on a CI host, so they run one after the other.
+static ONE_SET: Mutex<()> = Mutex::new(());
+
+/// The ch1 peak, in centi-dB, of the meter frame the replica `node`
+/// sends a client after the first `skip`.
+fn ch1_peak(node: &Node, skip: usize) -> i16 {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    node.runtime.block_on(async {
+        let session = "session-m-0123456789abcdef";
+        let url = format!("ws://{}/api/v1/ws?session={session}", node.server.api);
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let hello = json!({ "type": "hello", "session": session, "kind": "ui", "mode": "primary" });
+        ws.send(Message::text(hello.to_string())).await.unwrap();
+        let credit = json!({ "type": "credit", "n": 16 });
+        ws.send(Message::text(credit.to_string())).await.unwrap();
+        let mut frames = 0;
+        loop {
+            let m = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("a message within 5 s")
+                .unwrap()
+                .unwrap();
+            if let Message::Binary(f) = m {
+                frames += 1;
+                if frames <= skip {
+                    continue;
+                }
+                assert_eq!(f[..2], [0x4d, 4], "magic and version");
+                // After the 12-byte header and the replica's name, padded
+                // to an even length; ch1's peak is the frame's first value.
+                let name = usize::from(f[2]);
+                let at = 12 + name + name % 2;
+                return i16::from_le_bytes([f[at], f[at + 1]]);
+            }
+        }
+    })
+}
+
+/// Each replica of a set meters its channels at their taps on the
+/// replicated state, as a single replica does: ch1 meters after its fader
+/// by default, so on every replica it reads its -6 dBFS sine once its
+/// fader opens, digital silence once it closes, 10 dB less at -10, and
+/// silence again once muted.
+/// The faders start closed, so a replica metering at the gains it
+/// started with reads silence throughout.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "three debug-build engines miss their deadlines on a shared host; CI runs it in release"
+)]
+fn every_replicas_meters_follow_the_faders() {
+    let _one = ONE_SET.lock().unwrap_or_else(|e| e.into_inner());
+    /// A level of digital silence, -120 dB.
+    const FLOOR: i16 = -12_000;
+    let (set, listeners) = Set::new("taps");
+    let nodes: Vec<Option<Node>> = (listeners.into_iter().enumerate())
+        .map(|(n, l)| Some(set.start(n, Some(l))))
+        .collect();
+    for n in 0..REPLICAS {
+        steady(&nodes, n);
+    }
+    let steps = [
+        (
+            ("/channels/ch1/fader", json!(0)),
+            -602,
+            "with its fader open",
+        ),
+        (
+            ("/channels/ch1/fader", json!(-90)),
+            FLOOR,
+            "with its fader closed",
+        ),
+        (
+            ("/channels/ch1/fader", json!(-10)),
+            -1602,
+            "with its fader at -10 dB",
+        ),
+        (("/channels/ch1/mute", json!(true)), FLOOR, "muted"),
+    ];
+    for ((path, value), want, what) in steps {
+        write(&nodes, 0, &[(path, value)]);
+        for n in 0..REPLICAS {
+            let mut last = 0;
+            let read = until(10, || {
+                // The meters cover a 100 ms window: the first frames are
+                // skipped.
+                last = ch1_peak(node(&nodes, n), 3);
+                (last - want).abs() <= 10
+            });
+            assert!(
+                read,
+                "replica {n}'s ch1 meter {what}: {last}, not {want}: {}",
+                states(&nodes)
+            );
+        }
+    }
+}
+
 /// Contact runs from each replica's start. The set forms with the first
 /// replica alone and grows by two voters at once: with two of the three
 /// running the first commits alone and the second stays a learner, and
@@ -534,6 +634,7 @@ fn steady(nodes: &[Option<Node>], n: usize) {
     ignore = "three debug-build engines miss their deadlines on a shared host; CI runs it in release"
 )]
 fn replicas_write_equal_audio_and_a_restarted_one_catches_up() {
+    let _one = ONE_SET.lock().unwrap_or_else(|e| e.into_inner());
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_max_level(tracing::Level::WARN)
