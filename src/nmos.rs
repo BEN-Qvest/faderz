@@ -213,8 +213,9 @@ impl Node {
                 instances: Mutex::default(),
             }),
             seen: Mutex::new(vec![0; model.senders.len() + model.receivers.len()]),
+            // Every port's `/active` starts as the state holds it.
             foreign: (0..model.senders.len() + model.receivers.len())
-                .map(|_| AtomicBool::new(false))
+                .map(|_| AtomicBool::new(true))
                 .collect(),
             asked: Mutex::new(vec![None; model.senders.len() + model.receivers.len()]),
             instance: crate::app::uuid().map_err(|e| format!("nmos: {e}"))?,
@@ -419,24 +420,64 @@ impl Node {
             })
             .await;
         }
-        if method != axum::http::Method::GET && response.status().is_success() {
-            for (index, cancel) in named {
-                if cancel
-                    && self.scheduled(index).is_some()
-                    && let Err(Fail(e)) = self.conns.unschedule(index).await
-                {
-                    // The scheduled activation stays in the state and would
-                    // fire: the cancel is not done, whatever samplez-nmos
-                    // answered.
-                    tracing::warn!(port = index, "nmos: the cancel was not ordered: {e}");
-                    return refused(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &format!("the cancel was not taken by the set: {e}; send it again"),
-                    );
+        if method == axum::http::Method::GET
+            || !response.status().is_success()
+            || !named.iter().any(|(_, cancel)| *cancel)
+        {
+            return response;
+        }
+        if single.is_some() {
+            for (index, _) in named.into_iter().filter(|(_, cancel)| *cancel) {
+                if let Err(e) = self.cancel(index).await {
+                    return refused(StatusCode::SERVICE_UNAVAILABLE, &e);
                 }
             }
+            return response;
         }
-        response
+        // `/bulk` answers 200 with a code per item, in the order of the
+        // request's items: a cancel samplez-nmos refused cancels nothing,
+        // a later item for the same port is what the port is left with,
+        // and a cancel the set did not take fails on its own item.
+        let (mut parts, body) = response.into_parts();
+        let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY).await else {
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "an unreadable response");
+        };
+        let Ok(mut items) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) else {
+            return Response::from_parts(parts, axum::body::Body::from(bytes));
+        };
+        let senders = path.ends_with("/senders");
+        let asked: Vec<Option<(&str, usize, bool)>> = (value.as_array().into_iter().flatten())
+            .map(|item| {
+                let id = item.get("id")?.as_str()?;
+                let index = *self.ids.get(&(senders, id.to_owned()))?;
+                Some((id, index, item.get("params").is_some_and(cancels)))
+            })
+            .collect();
+        for (n, index) in bulk_cancels(&asked, &items) {
+            if let Err(e) = self.cancel(index).await {
+                items[n]["code"] = StatusCode::SERVICE_UNAVAILABLE.as_u16().into();
+                items[n]["error"] = e.into();
+            }
+        }
+        parts.headers.remove(header::CONTENT_LENGTH);
+        Response::from_parts(
+            parts,
+            axum::body::Body::from(serde_json::to_vec(&items).unwrap_or_default()),
+        )
+    }
+
+    /// Cancels the scheduled activation the state holds for the port at
+    /// `index`, if any: samplez-nmos has cancelled only its own. The error
+    /// is the answer to give, as the activation stays in the state and
+    /// would fire.
+    async fn cancel(&self, index: usize) -> Result<(), String> {
+        if self.scheduled(index).is_none() {
+            return Ok(());
+        }
+        self.conns.unschedule(index).await.map_err(|Fail(e)| {
+            tracing::warn!(port = index, "nmos: the cancel was not ordered: {e}");
+            format!("the cancel was not taken by the set: {e}; send it again")
+        })
     }
 
     /// `/active` of a port the state last changed shows the activation
@@ -949,11 +990,15 @@ impl Conns {
         .await
     }
 
-    /// Orders the firing of scheduled activation `s`, under ids every
-    /// replica derives alike, so a second leader firing it is a duplicate.
+    /// Orders the firing of scheduled activation `s`. Each try orders
+    /// under ids of its own: under an earlier try's, the command dedup
+    /// would answer with that try's refusal for as long as it keeps it,
+    /// on whichever replica leads. A second leader's Fire of one already
+    /// fired changes nothing.
     async fn fire(&self, s: &Scheduled) -> Result<(), Fail> {
+        let id = crate::app::uuid().map_err(|e| Fail(e.to_string()))?;
         self.submit(|attempt| Command::Fire {
-            id: format!("fire-{attempt}-{}", s.id),
+            id: format!("fire-{id}-{attempt}"),
             schedule: s.id.clone(),
         })
         .await
@@ -990,17 +1035,45 @@ impl Connections for Conns {
     ) -> BoxFuture<'_, Result<(), Fail>> {
         Box::pin(async move {
             let index = self.index(port);
-            // This replica writes the port's `/active` itself again.
-            self.foreign[index].store(false, Relaxed);
             if !self.saw(index, generation) {
                 return Ok(());
             }
             match at {
                 Some(at) => self.schedule(index, &active, at, generation).await,
-                None => self.order(index, &active, generation).await,
+                None => {
+                    // This replica writes the port's `/active` itself again;
+                    // a schedule does so only once it fires.
+                    self.foreign[index].store(false, Relaxed);
+                    self.order(index, &active, generation).await
+                }
             }
         })
     }
+}
+
+/// The cancels of a `/bulk` request to take into the state, as (item,
+/// port): of `asked`, each request item's id, port and whether it
+/// cancels, and `answered`, the response's items in the same order, a
+/// cancel answered 2xx whose port no later item names.
+fn bulk_cancels(
+    asked: &[Option<(&str, usize, bool)>],
+    answered: &[serde_json::Value],
+) -> Vec<(usize, usize)> {
+    let mut taken = Vec::new();
+    for (n, (item, asked_n)) in answered.iter().zip(asked).enumerate() {
+        let Some((id, index, true)) = *asked_n else {
+            continue;
+        };
+        let served = (item.get("code").and_then(serde_json::Value::as_u64))
+            .is_some_and(|code| (200..300).contains(&code));
+        let later = asked[n + 1..]
+            .iter()
+            .any(|a| a.is_some_and(|(_, i, _)| i == index));
+        if served && !later && item.get("id").and_then(|v| v.as_str()) == Some(id) {
+            taken.push((n, index));
+        }
+    }
+    taken
 }
 
 /// What an apply samplez-nmos hands over for a scheduled time means.
@@ -1364,6 +1437,33 @@ fn symbols(layout: &str, width: usize) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `/bulk` cancel is taken into the state only where samplez-nmos
+    /// answered it 2xx and no later item of the request names its port,
+    /// whose schedule the cancel would otherwise remove.
+    #[test]
+    fn a_bulk_cancel_is_taken_per_item() {
+        let asked = [
+            Some(("a", 0, true)),
+            Some(("b", 1, true)),
+            Some(("c", 2, true)),
+            Some(("c", 2, false)),
+            None,
+            Some(("d", 3, false)),
+        ];
+        let answered = [
+            serde_json::json!({ "id": "a", "code": 400 }),
+            serde_json::json!({ "id": "b", "code": 200 }),
+            serde_json::json!({ "id": "c", "code": 200 }),
+            serde_json::json!({ "id": "c", "code": 202 }),
+            serde_json::json!({ "id": "x", "code": 404 }),
+            serde_json::json!({ "id": "d", "code": 202 }),
+        ];
+        assert_eq!(bulk_cancels(&asked, &answered), vec![(1, 1)]);
+        // A response out of step with the request cancels nothing.
+        let other = [serde_json::json!({ "id": "a", "code": 200 })];
+        assert_eq!(bulk_cancels(&asked[1..2], &other), vec![]);
+    }
 
     /// A staging request's scheduled activation is kept with the mode
     /// and requested time it was asked with; an immediate one, a cancel

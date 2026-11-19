@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use faderz::config::Config;
 use faderz::server::Server;
-use faderz::state::{Activation, tai_text};
+use faderz::state::{Activation, PortRef, tai_text};
 use samplez::InputState;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -291,6 +291,12 @@ async fn is05_activations_route_the_engine_and_survive_a_restart() {
             "{port}"
         );
     }
+    // And the activation that made them, not none until a port changes.
+    for port in [&ch1, &pgm] {
+        let activation = &active(&server, port).await["activation"];
+        assert_eq!(activation["mode"], "activate_immediate", "{port}");
+        assert!(activation["activation_time"].is_string(), "{port}");
+    }
     // The engine starts as the state left it, from its first status on:
     // ch1 detached with no reader opened, the disabled output with no
     // flow created, not even for a moment.
@@ -312,6 +318,9 @@ async fn is05_activations_route_the_engine_and_survive_a_restart() {
     let (status, body) = request(server.nmos, "PATCH", &path, Some(&staged)).await;
     assert_eq!(status, 202, "{body}");
     until("the schedule is state", async || scheduled(&server) == 1).await;
+    // Until it fires, the port shows the activation it has.
+    let shown = active(&server, &ch1).await;
+    assert_eq!(shown["activation"]["mode"], "activate_immediate", "{shown}");
     let cancel = json!({ "activation": { "mode": null } });
     let (status, body) = request(server.nmos, "PATCH", &path, Some(&cancel)).await;
     assert_eq!(status, 200, "{body}");
@@ -424,6 +433,34 @@ async fn a_scheduled_activation_keeps_the_mode_and_requested_time_it_was_staged_
     assert_eq!(s.active.activation, Some(asked("0:400000000", s.at)));
     until("the bulk schedule fired", async || scheduled(&server) == 0).await;
     assert_eq!(fired("ch2"), Some(asked("0:400000000", s.at)));
+
+    // A `/bulk` cancel is judged per item: one samplez-nmos refused
+    // leaves its schedule to fire, though the request answers 200.
+    let back = json!({
+        "transport_params": [{ "mxl_flow_id": f.ch1 }],
+        "activation": { "mode": "activate_scheduled_relative", "requested_time": "60:0" },
+    });
+    let bulk = json!([{ "id": ch1, "params": back }, { "id": ch2, "params": back }]);
+    let (status, body) = request(server.nmos, "POST", path, Some(&bulk)).await;
+    assert_eq!(status, 200, "{body}");
+    until("both schedules are state", async || scheduled(&server) == 2).await;
+    let cancel = json!({ "activation": { "mode": null } });
+    let refused = json!({ "activation": { "mode": null }, "master_enable": "yes" });
+    let bulk = json!([{ "id": ch1, "params": refused }, { "id": ch2, "params": cancel }]);
+    let (status, body) = request(server.nmos, "POST", path, Some(&bulk)).await;
+    assert_eq!(status, 200, "{body}");
+    let code = |id: &str| {
+        (body.as_array().unwrap().iter())
+            .find(|item| item["id"] == id)
+            .map(|item| item["code"].clone())
+    };
+    assert_eq!(code(&ch2), Some(json!(200)), "{body}");
+    assert_ne!(code(&ch1), Some(json!(200)), "{body}");
+    until("ch2's cancel is state", async || scheduled(&server) == 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let left = (server.app.replica.store()).with_state(|sm| sm.product.scheduled().to_vec());
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0].port, PortRef::Receiver("ch1".into()));
     server.stop().await;
 }
 
