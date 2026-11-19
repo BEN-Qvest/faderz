@@ -4,10 +4,13 @@
 //!
 //! Run with `FADERZ_BIN=... cargo test --features e2e --test e2e`.
 
+use std::collections::BTreeSet;
+use std::hash::{BuildHasher, RandomState};
+use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use faderz_bridge::auth::{self, Signed};
@@ -31,12 +34,36 @@ mod rtpmidid;
 
 const WAIT: Duration = Duration::from_secs(10);
 
+/// The low end of the kernel's ephemeral range: a socket bound to port 0
+/// is given a port at or above it.
+fn ephemeral_low() -> u16 {
+    std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|r| r.split_whitespace().next()?.parse().ok())
+        .unwrap_or(32768)
+}
+
+/// A port drawn below the ephemeral range, each once per process, that
+/// `free` says is free now: a socket another test binds to port 0 is
+/// never given it, so it stays free until the process it is meant for
+/// binds it, where a port taken from port 0 and let go can be given to
+/// another test first.
+fn reserved_port(free: impl Fn(u16) -> bool) -> u16 {
+    static TAKEN: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+    let span = u64::from(ephemeral_low().saturating_sub(10_000).max(2));
+    let mut taken = TAKEN.lock().unwrap();
+    loop {
+        let draw = RandomState::new().hash_one(std::time::Instant::now()) % span;
+        let port = 10_000 + u16::try_from(draw).unwrap();
+        if !taken.contains(&port) && free(port) {
+            taken.insert(port);
+            return port;
+        }
+    }
+}
+
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    reserved_port(|p| TcpListener::bind(("127.0.0.1", p)).is_ok())
 }
 
 fn shape() -> Value {
@@ -74,21 +101,41 @@ impl Faderz {
         let dir =
             std::env::temp_dir().join(format!("bridge-e2e-{}", session::random_id().unwrap()));
         std::fs::create_dir_all(&dir).unwrap();
-        let (port, ops, nmos) = (free_port(), free_port(), free_port());
-        let mut f = Faderz {
-            child: None,
-            auth,
-            port,
-            ops,
-            nmos,
-            dir,
-        };
-        f.spawn().await;
-        f
+        // A start whose faderz finds a port taken is made again on ports
+        // of its own; free_port() draws them where port 0 never lands, so
+        // that is rare.
+        for _ in 0..5 {
+            let (port, ops, nmos) = (free_port(), free_port(), free_port());
+            let mut f = Faderz {
+                child: None,
+                auth: auth.clone(),
+                port,
+                ops,
+                nmos,
+                dir: dir.clone(),
+            };
+            if f.try_spawn().await {
+                return f;
+            }
+        }
+        panic!("faderz did not bind free ports in 5 starts");
     }
 
-    /// Starts the process on this instance's ports and data directory.
+    /// Starts the process on the instance's ports and data directory;
+    /// a port taken by another process fails the test.
     async fn spawn(&mut self) {
+        assert!(
+            self.try_spawn().await,
+            "faderz could not bind its ports again"
+        );
+    }
+
+    /// Starts the process on the instance's ports and data directory and
+    /// waits for its API to answer; false when it exits first on a port
+    /// another process holds. It is up only once it has logged its last
+    /// listener on its own port (src/main.rs): until then an answer on
+    /// the API port can come from whatever process holds that port.
+    async fn try_spawn(&mut self) -> bool {
         let bin = std::env::var("FADERZ_BIN").expect("FADERZ_BIN names the faderz binary");
         let listener = |port: u16| json!({ "bind": "127.0.0.1", "port": port });
         let config = json!({
@@ -97,26 +144,61 @@ impl Faderz {
             "auth": self.auth,
             "shape": shape(),
         });
+        std::fs::create_dir_all(&self.dir).unwrap();
         let path = self.dir.join("config.json");
         std::fs::write(&path, config.to_string()).unwrap();
-        let child = Command::new(bin)
+        let mut child = Command::new(bin)
             .arg("--config")
             .arg(&path)
             .stdout(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        // Its log goes on to the test's and is kept to tell why it exited.
+        let bound = format!("nmos listener on 127.0.0.1:{}", self.nmos);
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (listening, heard) = std::sync::mpsc::channel();
+        let stderr = child.stderr.take().unwrap();
+        let lines = log.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                eprintln!("{line}");
+                if line.contains(&bound) {
+                    let _ = listening.send(());
+                }
+                lines.lock().unwrap().push(line);
+            }
+        });
         self.child = Some(child);
+        let mut up = false;
         for _ in 0..200 {
-            if self
-                .get("/api/v1/replicas")
-                .await
-                .is_some_and(|r| r.starts_with("HTTP/1.1 "))
+            let child = self.child.as_mut().unwrap();
+            if let Some(status) = child.try_wait().unwrap() {
+                self.child = None;
+                // The log is read to its end once the process is gone.
+                std::thread::sleep(Duration::from_millis(100));
+                let log = log.lock().unwrap();
+                if log.iter().any(|l| l.contains("Address already in use")) {
+                    return false;
+                }
+                let tail = log[log.len().saturating_sub(20)..].join("\n");
+                panic!("faderz exited with {status} before it listened:\n{tail}");
+            }
+            up = up || heard.try_recv().is_ok();
+            if up
+                && self
+                    .get("/api/v1/replicas")
+                    .await
+                    .is_some_and(|r| r.starts_with("HTTP/1.1 "))
             {
-                return;
+                return true;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("faderz did not come up");
+        panic!(
+            "faderz never logged nmos listener on 127.0.0.1:{} or its API never answered",
+            self.nmos
+        );
     }
 
     async fn get(&self, path: &str) -> Option<String> {
