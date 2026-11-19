@@ -76,10 +76,14 @@ function setup(endpoints = ['ws://svc/api/v1/ws'], seqBase = SEQ_BASE, random = 
   return { clock, sockets, patches, engine, tick };
 }
 
+/** Each replica a build of its own, so a test tells whose a status names. */
+const buildOf = (r: ReplicaRef) => ({ faderz: `0.4.${r.id.slice(1)}`, samplez: '0.12.3' });
+
 function replicas(from: ReplicaRef, notCommitable: string[] = []): ReplicasMessage {
   return {
     type: 'replicas',
     replica: from,
+    build: buildOf(from),
     replicas: [R1, R2, R3].map((r) => ({ ...r, healthy: true, commitable: !notCommitable.includes(r.id) })),
   };
 }
@@ -383,6 +387,23 @@ describe('sync engine: heartbeat and failure detection', () => {
     expect(engine.primary?.socket).toBe(standby);
     standby.deliver(resume(R2, 10));
     expect(engine.link).toBe('Live');
+  });
+
+  it('names the build of the primary replica, and after a failover that of the promoted one', () => {
+    const t = setup();
+    expect(t.engine.status().build).toBeNull();
+    t.sockets[0]!.open();
+    t.sockets[0]!.deliver(replicas(R1));
+    t.sockets[0]!.deliver(snapshot(R1, 10));
+    const standby = t.sockets[1]!;
+    standby.open();
+    standby.deliver(replicas(R2));
+    standby.deliver(resume(R2, 10));
+    // The standby's replica said its build: the status still names the primary's.
+    expect(t.engine.status().build).toEqual({ faderz: '0.4.1', samplez: '0.12.3' });
+    t.sockets[0]!.drop();
+    standby.deliver(resume(R2, 10));
+    expect(t.engine.status()).toMatchObject({ primaryReplica: 'r2', build: { faderz: '0.4.2', samplez: '0.12.3' } });
   });
 
   it('fails over when the serving replica reports it cannot commit and the standby still can a moment later', () => {
