@@ -35,11 +35,13 @@ fn shape() -> Value {
             { "id": "ch2", "name": "Pres 2", "width": 1, "layout": "mono", "altInput": true },
         ],
         "buses": [{ "id": "pgm", "name": "PGM", "kind": "program", "width": 2, "layout": "stereo" }],
-        "auxes": [], "mixMinus": [], "vcas": [{ "id": "vca1", "name": "Music" }],
+        "auxes": [], "vcas": [{ "id": "vca1", "name": "Music" }],
+        "mixMinus": [{ "id": "mm1", "name": "N-1", "bus": "pgm", "width": 2, "layout": "stereo" }],
         "monitorOutputs": [{ "id": "mon", "name": "Monitor", "width": 2, "layout": "stereo" }],
         "ducks": [{ "id": "talk", "name": "Talk" }],
         "outputs": [
             { "id": "out-pgm", "name": "PGM out", "source": "pgm", "width": 2, "layout": "stereo" },
+            { "id": "out-mm", "name": "N-1 out", "source": "mm1", "width": 2, "layout": "stereo" },
         ],
     })
 }
@@ -74,6 +76,8 @@ struct Set {
     markers: Arc<Memory>,
     /// Each replica's member flow of the programme output.
     members: Vec<String>,
+    /// Each replica's member flow of the mix-minus output.
+    mm_members: Vec<String>,
 }
 
 /// A replica on its own runtime.
@@ -101,14 +105,16 @@ impl Set {
             .map(|l| l.local_addr().unwrap().port())
             .collect();
         let members: Vec<String> = (0..REPLICAS).map(|_| new_id()).collect();
+        let mm_members: Vec<String> = (0..REPLICAS).map(|_| new_id()).collect();
         let set = Set {
             tls: certificates(&at.0, REPLICAS),
             at,
             domain,
             _sources: sources,
             inputs: json!({ "ch1": { "flow": ch1 }, "ch2": { "flow": ch2, "altFlow": ch2b } }),
-            outputs: json!({ "out-pgm": { "flows": members } }),
+            outputs: json!({ "out-pgm": { "flows": members }, "out-mm": { "flows": mm_members } }),
             members,
+            mm_members,
             ports,
             markers: Arc::default(),
         };
@@ -518,17 +524,20 @@ fn steady(nodes: &[Option<Node>], n: usize) {
     assert!(steady, "replica {n} did not commit: {}", states(nodes));
 }
 
-/// The meter frame's values: ch1 3, ch2 3, pgm 14, then the monitor
-/// 2; ch1's peak is the first, the monitor's left leg the 21st.
+/// Where in the meter frame's values ch1's peak and the monitor's left
+/// leg are, as the shape lays the frame out.
 const CH1: usize = 0;
-const MON: usize = 20;
+fn mon() -> usize {
+    let shape = faderz::shape::Shape::parse(&shape()).unwrap();
+    faderz::meters::Layout::of(&shape).offset("mon").unwrap()
+}
 
 /// Held by each test that runs a set: two sets of three engines at once
 /// miss their deadlines on a CI host, so they run one after the other.
 static ONE_SET: Mutex<()> = Mutex::new(());
 
 /// Value `index` of the meter frame the replica `node` sends a client
-/// after the first `skip`: [`CH1`] or [`MON`], a peak in centi-dB.
+/// after the first `skip`: [`CH1`] or [`mon()`], a peak in centi-dB.
 fn peak(node: &Node, skip: usize, index: usize) -> i16 {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -639,7 +648,8 @@ fn every_replicas_meters_follow_the_faders() {
             "on its silent source again",
         ),
     ];
-    let steps = (steps.into_iter().map(|s| (CH1, s))).chain(monitor.into_iter().map(|s| (MON, s)));
+    let steps =
+        (steps.into_iter().map(|s| (CH1, s))).chain(monitor.into_iter().map(|s| (mon(), s)));
     for (index, ((path, value), want, what)) in steps {
         write(&nodes, 0, &[(path, value)]);
         for n in 0..REPLICAS {
@@ -650,7 +660,7 @@ fn every_replicas_meters_follow_the_faders() {
                 last = peak(node(&nodes, n), 3, index);
                 (last - want).abs() <= 10
             });
-            let meter = if index == MON { "monitor" } else { "ch1" };
+            let meter = if index == mon() { "monitor" } else { "ch1" };
             assert!(
                 read,
                 "replica {n}'s {meter} meter {what}: {last}, not {want}: {}",
@@ -939,4 +949,77 @@ fn states(nodes: &[Option<Node>]) -> String {
         );
     }
     out
+}
+
+/// An interrupt of the mix-minus output is one replicated command: every
+/// replica's member flow of it carries the talkback channel alone, at
+/// its level (ch1 is 6 dB above ch2) before its closed fader, in place of the mix, alike on all
+/// of them, and the mix again once released.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "three debug-build engines miss their deadlines on a shared host; CI runs it in release"
+)]
+fn an_interrupt_changes_every_replicas_mix_minus_alike() {
+    let _one = ONE_SET.lock().unwrap_or_else(|e| e.into_inner());
+    let (set, listeners) = Set::new("talk");
+    let nodes: Vec<Option<Node>> = (listeners.into_iter().enumerate())
+        .map(|(n, l)| Some(set.start(n, Some(l))))
+        .collect();
+    for n in 0..REPLICAS {
+        steady(&nodes, n);
+    }
+    let engines = (0..REPLICAS).map(|n| node(&nodes, n).engine()).collect();
+    let (outputs, reader) = Outputs::read(set.domain.0.clone(), set.mm_members.clone(), engines);
+    // The mix is ch2 alone: ch1's fader stays closed.
+    write(
+        &nodes,
+        0,
+        &[
+            ("/channels/ch2/fader", json!(0)),
+            ("/mixMinus/mm1/interrupt/source", json!("ch1")),
+        ],
+    );
+    // The level every replica's output holds, alike, once the engine's
+    // ramp after the last write is over.
+    let settled = |what: &str| -> i64 {
+        std::thread::sleep(Duration::from_millis(1500));
+        let from = Outputs::now();
+        let mut level = None;
+        let alike = until(30, || {
+            std::thread::sleep(Duration::from_millis(500));
+            let each: Vec<BTreeSet<i64>> = (0..REPLICAS)
+                .map(|n| levels(&outputs.blocks.lock().unwrap()[n], from))
+                .collect();
+            let one = each[0].len() == 1 && each.iter().all(|l| *l == each[0]);
+            level = each[0].first().copied();
+            one
+        });
+        assert!(
+            alike,
+            "{what}: no one level on every replica: {}",
+            states(&nodes)
+        );
+        level.unwrap()
+    };
+    let mix = settled("the mix");
+    assert!(mix > i64::MIN, "the mix is silent");
+    write(
+        &nodes,
+        1,
+        &[("/mixMinus/mm1/interrupt/active", json!(true))],
+    );
+    let talk = settled("the interrupt");
+    assert!(
+        talk > mix + 500,
+        "the talkback ({talk}) is not 6 dB above the mix ({mix})"
+    );
+    write(
+        &nodes,
+        2,
+        &[("/mixMinus/mm1/interrupt/active", json!(false))],
+    );
+    assert_eq!(settled("the release"), mix);
+    outputs.stop.store(true, Ordering::Relaxed);
+    reader.join().unwrap();
 }

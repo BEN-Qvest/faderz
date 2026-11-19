@@ -3883,7 +3883,7 @@ mod tests {
             let some = |next: &mut dyn FnMut(u64) -> u64| -> Value {
                 json!(channels.iter().filter(|_| next(3) == 0).collect::<Vec<_>>())
             };
-            match next(36) {
+            match next(38) {
                 0 => (format!("/channels/{ch}/fader"), db),
                 1 => (format!("/channels/{ch}/mute"), flag),
                 2 => (
@@ -3929,9 +3929,18 @@ mod tests {
                 15 => (format!("/afv/{ch}/offLevel"), json!(-(next(60) as f64))),
                 16 => ("/monitor/source".into(), json!(sources[next(5) as usize])),
                 17 => {
-                    let key = ["level", "dim", "cut", "mono", "downmix"][next(5) as usize];
+                    let key = [
+                        "level",
+                        "dim",
+                        "cut",
+                        "mono",
+                        "downmix",
+                        "talkbackDim",
+                        "dimDepth",
+                    ][next(7) as usize];
                     let value = match key {
                         "level" => db,
+                        "dimDepth" => json!(next(40) as f64),
                         "downmix" => json!(["lr", "loRo"][next(2) as usize]),
                         _ => flag,
                     };
@@ -3988,6 +3997,11 @@ mod tests {
                     let mode = ["off", "off", "pfl", "afl"][next(4) as usize];
                     (format!("/{}/solo", at[next(2) as usize]), json!(mode))
                 }
+                35 => {
+                    let source = channels.get(next(channels.len() as u64 + 1) as usize);
+                    ("/mixMinus/mm1/interrupt/source".into(), json!(source))
+                }
+                36 => ("/mixMinus/mm1/interrupt/active".into(), flag),
                 _ => ("/metering/loudness/preset".into(), json!("atsc")),
             }
         };
