@@ -34,8 +34,7 @@ fn shape() -> Value {
     })
 }
 
-/// A fresh data directory under the target directory, removed when
-/// dropped.
+/// A fresh data directory, removed when dropped.
 struct Dir(PathBuf);
 
 impl std::ops::Deref for Dir {
@@ -51,8 +50,17 @@ impl Drop for Dir {
     }
 }
 
+/// A replica's data directory on tmpfs: on a disk busy with builds one
+/// fsync of its log can outlast the 2 s a write waits to commit, and the
+/// write is answered 503, not applied.
 fn data_dir() -> Dir {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+    let shm = PathBuf::from("/dev/shm");
+    let base = if shm.is_dir() {
+        shm
+    } else {
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+    };
+    let dir = base.join(format!(
         "faderz-server-{}-{}",
         std::process::id(),
         DIRS.fetch_add(1, Ordering::Relaxed)
