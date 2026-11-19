@@ -45,7 +45,7 @@
 
 <div class="users">
   <button class="key" aria-label={`Users ${count}`} aria-expanded={open} aria-controls="users-panel" onclick={() => (open = !open)} title="Who works on this mixer"
-    ><span class="fixed">{short.current ? 'USR' : 'USERS'} {String(count).padStart(2)}</span></button
+    ><span class="count"><span class="fixed">{short.current ? 'USR' : 'USERS'} {String(count).padStart(2)}</span></span></button
   >
   <div class="panel" class:open id="users-panel" role="region" aria-label="Users">
     {#each rows as r (r.handle)}
@@ -79,6 +79,27 @@
   @media (max-width: 700px) {
     .users {
       display: none;
+    }
+  }
+  /* The count changes whenever a session elsewhere takes or lets go of a
+     control. A button lays out its content as flex items, which are never
+     relayout boundaries, so the text sits in a block of its own, sized for
+     a count of up to three digits, with size and layout containment: a
+     new count lays out that box, not the page. */
+  .count {
+    display: block;
+  }
+  .count .fixed {
+    display: block;
+    width: calc(9ch + 9 * 0.06em);
+    height: 14px;
+    line-height: 14px;
+    text-align: center;
+    contain: size layout style;
+  }
+  @media (max-height: 500px) {
+    .count .fixed {
+      width: calc(7ch + 7 * 0.06em);
     }
   }
   /* Opens under the header over the view; it moves nothing. */

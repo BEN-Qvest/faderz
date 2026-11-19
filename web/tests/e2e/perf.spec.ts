@@ -1,7 +1,7 @@
 import { writeFile } from 'node:fs/promises';
 import { expect, test, type Page } from '@playwright/test';
 import { PERF_URL } from '../../playwright.config';
-import { faderCenter, live, resetMock, serverState } from './support';
+import { RawClient, faderCenter, live, resetMock, serverState } from './support';
 
 // Runs against the 64-channel mock server (playwright.config.ts). Tracing
 // is off: its DOM snapshot after every action runs on the page's main thread.
@@ -94,7 +94,18 @@ test('three clients moving faders with meters on and duck groups firing stay und
     // On a retry, a performance trace of the window, kept only when a
     // page has a long task in it, shows what ran in that task.
     if (info.retry > 0) {
-      await browser.startTracing(undefined, { categories: ['devtools.timeline', 'disabled-by-default-devtools.timeline', 'v8.execute', 'blink.user_timing'] });
+      // Invalidation tracking with stacks names the element and the code
+      // that made a layout or style recalculation as large as it was.
+      await browser.startTracing(undefined, {
+        categories: [
+          'devtools.timeline',
+          'disabled-by-default-devtools.timeline',
+          'disabled-by-default-devtools.timeline.invalidationTracking',
+          'disabled-by-default-devtools.timeline.stack',
+          'v8.execute',
+          'blink.user_timing',
+        ],
+      });
       tracing = true;
     }
     const starts = await Promise.all(pages.map((p) => p.evaluate(() => ({ t: performance.now(), patches: window.__faderz!.patches }))));
@@ -141,6 +152,50 @@ test('three clients moving faders with meters on and duck groups firing stay und
     // A test that fails inside the window leaves no trace running.
     await stopTracing().catch(() => undefined);
     await Promise.all(contexts.map((c) => c.close()));
+  }
+});
+
+interface TraceEvent {
+  name: string;
+  ph: string;
+  args?: { beginData?: { partialLayout?: boolean; totalObjects?: number } };
+}
+
+// A layout from the document down walks every strip of the console, tens
+// of milliseconds on a loaded runner: the test above saw it as a long task
+// whenever another client's touch showed or hid a fader's owner label or
+// changed the header's user count. Each is laid out in a box of its own,
+// so a touch and a release lay out those boxes, not the page.
+test('another client touching and releasing a fader lays out no more than its boxes', { tag: '@mock' }, async ({ page, browser }) => {
+  await live(page);
+  const other = await RawClient.open(PERF_URL);
+  const owner = page.locator('[data-path="/channels/ch2/fader"] [data-testid="owner"]');
+  const frames = () => page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+  let tracing = false;
+  try {
+    await frames();
+    await browser.startTracing(page, { categories: ['devtools.timeline', 'disabled-by-default-devtools.timeline'] });
+    tracing = true;
+    for (let i = 0; i < 3; i++) {
+      await other.command({ type: 'touch', path: '/channels/ch2/fader' });
+      await expect(owner).toBeVisible();
+      await frames();
+      await other.command({ type: 'release', path: '/channels/ch2/fader' });
+      await expect(owner).toHaveCount(0);
+      await frames();
+    }
+    tracing = false;
+    const events = (JSON.parse((await browser.stopTracing()).toString()) as { traceEvents: TraceEvent[] }).traceEvents;
+    const layouts = events.filter((e) => e.name === 'Layout' && e.ph === 'X');
+    expect(layouts.length).toBeGreaterThan(0);
+    // Every layout says whether it started below the document: without
+    // that the check below would hold of any trace.
+    expect(layouts.filter((e) => typeof e.args?.beginData?.partialLayout !== 'boolean')).toEqual([]);
+    // Objects of each layout from the document down.
+    expect(layouts.filter((e) => e.args?.beginData?.partialLayout === false).map((e) => e.args?.beginData?.totalObjects)).toEqual([]);
+  } finally {
+    if (tracing) await browser.stopTracing().catch(() => undefined);
+    other.close();
   }
 });
 
