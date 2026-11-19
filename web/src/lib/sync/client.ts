@@ -20,6 +20,10 @@ export interface FaderzDebug {
   readonly session: string;
   readonly revision: number;
   readonly outbox: number;
+  /** The page message that carried the latest command; `outbox` covers it once `processed` reaches it. */
+  readonly commanded: number;
+  /** Messages the worker had processed by the last patch. */
+  readonly processed: number;
   readonly failovers: number;
   readonly lastFailover: { from: string | null; to: string | null; reason: string } | null;
   readonly replicas: ReadonlyArray<{ id: string; role: string; healthy: boolean; commitable: boolean }>;
@@ -76,6 +80,8 @@ function exposeDebug(store: MixerStore, ticking: () => boolean): void {
     get standbyReplica() { return s().standbyReplica; },
     get revision() { return s().revision; },
     get outbox() { return s().outbox; },
+    get commanded() { return store.messages.commanded; },
+    get processed() { return store.messages.processed; },
     get failovers() { return s().failover?.n ?? 0; },
     get lastFailover() {
       const f = s().failover;

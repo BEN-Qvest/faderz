@@ -86,6 +86,10 @@ export class MixerStore {
 
   private port: Port | null = null;
   private posted = 0;
+  /** The page message that carried the latest command (set, touch or release). */
+  private commanded = 0;
+  /** The page messages the worker had processed by the last patch. */
+  private processed = 0;
   /** Writes by page message number; a patch built before that message does not overwrite them. */
   private readonly localWrites = new Map<string, { input: number; value: unknown }>();
   private noticeId = 0;
@@ -267,14 +271,27 @@ export class MixerStore {
     this.post({ type: 'tick' });
   }
 
+  /** The number of the page message that carried the latest command,
+   *  and the number of messages the worker had processed by the last
+   *  patch: the worker's status covers that command once the second
+   *  reaches the first. The worker answers every command with a patch. */
+  get messages(): { commanded: number; processed: number } {
+    return { commanded: this.commanded, processed: this.processed };
+  }
+
   private post(msg: ToWorker): void {
+    // Numbered as the worker counts them: a message sent before the
+    // worker is attached never reaches it.
+    if (!this.port) return;
     this.posted++;
-    this.port?.post(msg);
+    if (msg.type === 'set' || msg.type === 'touch' || msg.type === 'release') this.commanded = this.posted;
+    this.port.post(msg);
   }
 
   // ---- worker patches ------------------------------------------------------
 
   apply(p: Patch, now: number = performance.now()): void {
+    this.processed = p.input;
     performance.mark('faderz:patch-start');
     const fresh = (path: string) => (this.localWrites.get(path)?.input ?? 0) <= p.input;
     if (p.snapshot) {
