@@ -18,6 +18,7 @@ import {
   resetMock,
   serverState,
   settled,
+  switchTheme,
   uiFontLoaded,
 } from './support';
 
@@ -380,8 +381,7 @@ test('moves nothing on its own when the system asks for reduced motion', async (
 test('switches to the light theme and works at tablet width', async ({ page }) => {
   await page.setViewportSize({ width: 1024, height: 768 });
   await live(page);
-  await page.getByRole('button', { name: 'Switch to light theme' }).click();
-  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+  await switchTheme(page, 'light');
   const width = await page.evaluate(() => document.documentElement.scrollWidth);
   expect(width).toBeLessThanOrEqual(1024);
   await expect(page.getByRole('button', { name: 'Pres 1 mute' })).toBeVisible();
@@ -1329,7 +1329,7 @@ test('writes the tally on the strip in words: PGM, PVW, and CLOSED when the AFV 
   await expect(page.getByTestId('tally-ch15')).not.toHaveCSS('text-decoration-line', 'line-through');
   // The words take the chip's colour in both themes: white on the PGM fill, the PVW colour on its tint.
   for (const theme of ['dark', 'light']) {
-    if (theme === 'light') await page.getByRole('button', { name: 'Switch to light theme' }).click();
+    if (theme === 'light') await switchTheme(page, 'light');
     for (const ch of ['ch13', 'ch14']) {
       const chip = page.getByTestId(`tally-${ch}`);
       await expect(chip.locator('span')).toHaveCSS('color', await chip.evaluate((el) => getComputedStyle(el).color));
@@ -1515,7 +1515,7 @@ test('lists the consoles and every other session with what it holds, each once',
   try {
     await other.command({ type: 'touch', path: '/channels/ch4/fader' });
     await surface.command({ type: 'touch', path: '/channels/ch5/fader' });
-    const key = page.getByRole('button', { name: /^Users \d+$/ });
+    const key = page.getByRole('button', { name: /^Users \d+(,|$)/ });
     // Two connected surfaces, this screen and one web client.
     await expect(key).toHaveText('USERS  4');
     await key.click();
@@ -1541,11 +1541,13 @@ test('lists every session connected to the replica in USERS, until it closes', a
   const ws = baseURL!.replace(/^http/, 'ws');
   const path = BACKEND ? '/' : `/?endpoints=${ws}/__mock/replicas/r1/api/v1/ws,${ws}/__mock/replicas/r2/api/v1/ws`;
   await live(page, path);
-  const key = page.getByRole('button', { name: /^Users \d+$/ });
+  const key = page.getByRole('button', { name: /^Users \d+(,|$)/ });
   await key.click();
   const panel = page.getByRole('region', { name: 'Users' });
   await expect(panel.getByTestId('you')).toContainText(handleTag(ownerHandle(await debug(page, 'session'))));
-  const count = Number((await key.getAttribute('aria-label'))!.split(' ')[1]);
+  // "Users 4" and, where a surface is down, ", 1 surface disconnected", which a session coming and going leaves as it is.
+  const [, n, down] = /^Users (\d+)(.*)$/.exec((await key.getAttribute('aria-label'))!)!;
+  const count = Number(n);
   const context = await browser.newContext();
   const second = await context.newPage();
   await live(second, path);
@@ -1555,10 +1557,10 @@ test('lists every session connected to the replica in USERS, until it closes', a
   await expect(row).toHaveCount(1);
   await expect(row).toContainText('anonymous');
   await expect(row).toContainText(`operator, web client ${tag}`);
-  await expect(key).toHaveAttribute('aria-label', `Users ${count + 1}`);
+  await expect(key).toHaveAttribute('aria-label', `Users ${count + 1}${down}`);
   await context.close();
   await expect(row).toHaveCount(0);
-  await expect(key).toHaveAttribute('aria-label', `Users ${count}`);
+  await expect(key).toHaveAttribute('aria-label', `Users ${count}${down}`);
 });
 
 // The count sits in a box of fixed size (Users.svelte), so a count of
@@ -1569,8 +1571,9 @@ test('shows a USERS count of three digits whole, on a tall and a short screen', 
   await live(page, `/?endpoints=${ws}/__mock/replicas/r1/api/v1/ws,${ws}/__mock/replicas/r2/api/v1/ws`);
   const clients = await Promise.all(Array.from({ length: 100 }, () => RawClient.open(`${baseURL}/__mock/replicas/r1`)));
   try {
-    const key = page.getByRole('button', { name: /^Users \d+$/ });
-    await expect(key).toHaveAttribute('aria-label', /^Users 1\d\d$/);
+    const key = page.getByRole('button', { name: /^Users \d+(,|$)/ });
+    // The mock's OSC tablet is configured and disconnected.
+    await expect(key).toHaveAttribute('aria-label', /^Users 1\d\d, 1 surface disconnected$/);
     const count = key.locator('.fixed');
     // The text, which may run over its box, lies within the key's border.
     const whole = () =>
@@ -2075,7 +2078,7 @@ test('every state word of a bank-bar pill fits its box at 1024, 1180 and 1280 px
         await page.mouse.up();
         await expect(word).toHaveText('AUTO');
       }
-      if (theme === 'dark') await page.getByRole('button', { name: 'Switch to light theme' }).click();
+      if (theme === 'dark') await switchTheme(page, 'light');
     }
   } finally {
     await patch(request, '/ducks/comm/mode', 'auto');

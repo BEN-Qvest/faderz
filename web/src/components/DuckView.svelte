@@ -1,6 +1,6 @@
 <script lang="ts">
   // Setting up duck groups: per group a column with its mode, detector,
-  // presets and destinations, and per channel the group's TRIG and TARGET
+  // presets and destinations, and per channel the group's KEY and TARGET
   // switches and the depth. The channel grid is one tab stop; the arrows
   // move within it. A phone shows one group at a time, picked above. Up
   // to 1280 px the detector starts folded to its mode keys, so the channel
@@ -9,7 +9,10 @@
   import { MediaQuery } from 'svelte/reactivity';
   import { pendingWrite } from '../lib/pending';
   import { fit } from '../lib/format';
-  import { LAMP_WIDTH, forced, groupRefusals, lampText, targetRefusal, triggerRefusal } from '../lib/duck';
+  import { onMount } from 'svelte';
+  import { LAMP_WIDTH, duckReach, forced, groupRefusals, keyingText, lampText, liveDuck, targetRefusal, triggerRefusal } from '../lib/duck';
+  import { onAnimationFrame } from '../lib/meters/store';
+  import { tip } from '../lib/tip';
   import type { Change, DuckKeyTap, DuckShape } from '../lib/contract/types';
   import { getMixer } from '../lib/state/mixer.svelte';
   import { patchState } from '../lib/state/actions';
@@ -36,7 +39,17 @@
     { id: 'preFader', label: 'Pre-fader' },
     { id: 'postFader', label: 'Post-fader' },
   ];
-  /** Cells per group in the channel grid: TRIG, TARGET, depth. */
+  // Each group's key level, polled on the frame clock; only what changed renders.
+  let keys = $state<Record<string, number | null>>({});
+  onMount(() =>
+    onAnimationFrame((now) => {
+      for (const g of groups) {
+        const key = liveDuck(mixer.meters, g.id, now)?.key ?? null;
+        if (keys[g.id] !== key) keys[g.id] = key;
+      }
+    }),
+  );
+  /** Cells per group in the channel grid: KEY, TARGET, depth. */
   const CELLS = 3;
 
   /** Times of a timing preset. */
@@ -164,16 +177,33 @@
             <th></th>
             {#each shown as g (g.id)}
               {@const d = mixer.state!.ducks[g.id]!}
+              {@const reach = duckReach(shape, d)}
+              {@const key = keys[g.id] ?? null}
+              {@const keysText = `key: ${reach.triggers} (${reach.tap})`}
+              {@const ducksText = `ducks: ${reach.targets} on ${reach.into}`}
               <th colspan={CELLS} scope="colgroup" class="group">
-                <span class="gname">{g.name}</span>
-                <span class="lamp fixed" class:lit={forced(d)} class:bypass={d.mode === 'off' && !d.hold} data-testid={`duck-view-lamp-${g.id}`}>{fit(lampText(d), LAMP_WIDTH)}</span>
+                <div class="gtop">
+                  <span class="gname">{g.name}</span>
+                  <span class="lamp fixed" class:lit={forced(d)} class:bypass={d.mode === 'off' && !d.hold} data-testid={`duck-view-lamp-${g.id}`}>{fit(lampText(d), LAMP_WIDTH)}</span>
+                </div>
+                <!-- What keys the group, what it lowers where, and why it keys
+                     now; one line each, cut off with the whole in the tip. -->
+                <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+                <div class="fact" role="note" tabindex="0" data-testid={`duck-view-keys-${g.id}`} use:tip={keysText}><span class="k">key:</span> {reach.triggers} <span class="dim">({reach.tap})</span></div>
+                <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+                <div class="fact ducks" role="note" tabindex="0" data-testid={`duck-view-ducks-${g.id}`} use:tip={ducksText}
+                  ><span class="k">ducks:</span> {reach.targets} <span class="dim">on</span> <span class="into">{reach.into}</span></div
+                >
+                <div class="fact level" data-testid={`duck-view-keying-${g.id}`}
+                  ><span class="k">now:</span> <span class="reading fixed">{keyingText(key, d.threshold)}</span></div
+                >
               </th>
             {/each}
           </tr>
           <tr class="labels">
             <th scope="col">Channel</th>
             {#each shown as g (g.id)}
-              <th scope="col" class="first" title={`Keys ${g.name}`}>Trig</th>
+              <th scope="col" class="first" title={`Keys ${g.name}`}>Key</th>
               <th scope="col" title={`Lowered by ${g.name}`}>Target</th>
               <th scope="col" title="How far a target is lowered at full duck">Depth (dB)</th>
             {/each}
@@ -403,11 +433,12 @@
   }
   .names th {
     top: 0;
-    height: 30px;
+    height: 96px;
     box-sizing: border-box;
+    vertical-align: top;
   }
   .labels th {
-    top: 30px;
+    top: 96px;
     height: 24px;
     box-sizing: border-box;
     border-bottom-color: var(--line-strong);
@@ -421,6 +452,57 @@
   }
   .group {
     white-space: nowrap;
+  }
+  .gtop {
+    height: 22px;
+  }
+  /* Fixed heights: a trigger or target switched below changes the
+     text, never the header's height. The ducks line wraps to two
+     lines; beyond that it is cut and its tip, on focus, a long touch
+     or hover, has the rest. Two keep the channel rows in view while
+     the detector is folded. */
+  /* Sized by the column alone: without inline-size containment a long
+     line would widen the fixed group columns. */
+  .fact {
+    contain: inline-size;
+    height: 18px;
+    line-height: 18px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 11px;
+    font-weight: 400;
+  }
+  .fact.ducks {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    height: 32px;
+    line-height: 16px;
+    white-space: normal;
+  }
+  .fact:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: -2px;
+  }
+  .fact .k {
+    color: var(--text-dim);
+    font-weight: 600;
+  }
+  .fact .dim {
+    color: var(--text-dim);
+  }
+  /* The level changes per meter frame: a box of fixed size in its own
+     monospace digits (KEYING_WIDTH) with strict containment. */
+  .reading {
+    display: inline-block;
+    margin-left: 0.3em;
+    vertical-align: top;
+    width: 22ch;
+    height: 18px;
+    font-family: var(--font-num);
+    white-space: pre;
+    contain: strict;
   }
   .gname {
     font-size: 13px;

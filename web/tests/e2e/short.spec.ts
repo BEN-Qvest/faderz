@@ -65,7 +65,7 @@ test('a notice longer than the header slot widens nothing and moves no header it
   // Left edges of the header items right of the notice slot.
   const edges = () =>
     page.evaluate(() =>
-      [...document.querySelectorAll<HTMLElement>('header .right > :not(.mid)')]
+      [...document.querySelectorAll<HTMLElement>('header .right > :not(.mid, .group), header .right > .group > *')]
         .map((el) => el.getBoundingClientRect())
         .filter((r) => r.width > 0)
         .map((r) => Math.round(r.left)),
@@ -130,5 +130,5 @@ test('the commit banner shows its whole text to the keyboard on a short screen',
   }
   await expect(banner).toHaveCount(0);
   // The USR key keeps its full name.
-  await expect(page.getByRole('button', { name: /^Users \d+$/ })).toHaveText(/^USR\s+\d+$/);
+  await expect(page.getByRole('button', { name: /^Users \d+(,|$)/ })).toHaveText(/^USR\s+\d+$/);
 });

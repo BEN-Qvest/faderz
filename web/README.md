@@ -169,7 +169,9 @@ user, where that is no email address), switches the theme, and in
 `token` and `oidc` mode offers Sign out (`POST /api/v1/logout`), which
 in `oidc` mode continues to the provider's end-session endpoint when it
 has one; under its entries it names the faderz version and samplez
-release the primary replica was built from. Below 1200 px the menu takes the theme key's place. The status
+release the primary replica was built from. The pill shows at every
+width and in every mode, with a person mark where nobody is signed in;
+its menu and the Setup view are where the theme is switched. The status
 bar starts with the ENGINE lamp and the session tag and endpoint, then
 the notice line.
 A viewer's write controls are locked with the reason "signed in as a
@@ -349,14 +351,16 @@ triggers it; it sets the threshold, and its key meter row shows the key
 level against it. More groups than fit one row of tiles scroll within
 it. Beside the masters with a fine pointer, for up to four groups and
 where the tiles leave the band at least 180 px, the band's summary takes
-the rest of it: two rows per group, the first with its name, the buses,
-auxes and mix-minus outputs it lowers and its gain reduction in dB, the
-second with the targets it lowers in them, the reduction as a bar on one
-scale for every group (0 to the deepest depth of any), KEY lit while
-the key triggers it and the key as a bar against its threshold.
-Narrower than 300 px the outputs take the whole first row, the
-reduction moves to the second and its bar goes. A line's tooltip, on
-focus or hover, adds its readings of that moment. The band keeps its
+the rest of it: two rows per group under its name, the first saying
+what keys it, "key: <triggers> (<tap>)", its key level against its
+threshold ("key -18.3 >= thr -30.0"), KEY lit while the key triggers it and the
+key as a bar against the threshold; the second what it lowers, "ducks:
+<targets> on <outputs>", its gain reduction in dB and as a bar on one
+scale for every group (0 to the deepest depth of any). Narrower than
+420 px the bars and the key level go. The Duck view heads each group
+with the same key and ducks lines, the ducks line wrapping to two
+lines, and the key level. A line's tooltip, on focus, hover or a click,
+holds every list whole and adds its readings of that moment. The band keeps its
 height. In the example shape's masters, 776 px wide, the summary shows
 beside up to four groups, and from five not at all. Under 1400 px,
 where the masters lie over the strips, and with a coarse pointer the
@@ -367,7 +371,7 @@ reads the gain reduction in place of DK, or, on a trigger, while a
 group it keys is engaged; it opens the Duck section of its processing
 panel. The
 DUCK view sets up every group: mode, key tap, detector and key filters,
-destinations, and per channel TRIG, TARGET and the depth; up to 1280 px
+destinations, and per channel KEY, TARGET and the depth; up to 1280 px
 the detector starts folded to its mode keys. Its channel grid is one
 tab stop, walked with the arrow keys. The presets LIGHT, HEAVY and
 VOICE write in one atomic PATCH and take a second press within 3 s or a
@@ -393,6 +397,15 @@ the sessions on other replicas that hold a control. Its panel lists
 each with who is signed in (the display name, or token or anonymous),
 the role, the handle tag, what it holds and what it has selected;
 every role sees it. Each replica knows only its own connections.
+
+The header's right end holds what the screen shows, then, past a
+divider, what it does. Left of the divider are the status readouts:
+the pending count, a failover, the line-up tone lamp and, against the
+divider, the control surfaces in one field, each with its protocol and
+the strips its bank is on (from 1301 px; below that the USERS panel
+lists them). Right of it are the controls, USERS, LOCK DESK and the
+account pill, all one height (26 px, 32 px to a finger). A dot on
+USERS says a configured surface is disconnected.
 
 A label cut off for lack of room, such as a long channel name, shows
 its full text in a tooltip: after a short hover, on keyboard focus (Tab

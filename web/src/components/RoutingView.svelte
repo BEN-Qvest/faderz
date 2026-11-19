@@ -2,13 +2,15 @@
   import { getMixer } from '../lib/state/mixer.svelte';
   import { channelPath, vcaPath } from '../lib/state/paths';
   import { TAP_LABEL } from '../lib/audio/taps';
+  import type { Layout } from '../lib/contract/types';
   import Matrix from './Matrix.svelte';
+  import LayoutBadge from './LayoutBadge.svelte';
 
   const mixer = getMixer();
   const shape = $derived(mixer.shape!);
-  type Col = { id: string; name: string; kind: 'bus' | 'vca' };
+  type Col = { id: string; name: string; kind: 'bus' | 'vca'; layout?: Layout };
   const cols = $derived<Col[]>([
-    ...shape.buses.map((b) => ({ id: b.id, name: b.name, kind: 'bus' as const })),
+    ...shape.buses.map((b) => ({ id: b.id, name: b.name, kind: 'bus' as const, layout: b.layout })),
     ...shape.vcas.map((v) => ({ id: v.id, name: v.name, kind: 'vca' as const })),
   ]);
 
@@ -51,7 +53,7 @@
           <tr>
             <td>{o.name}</td>
             <td>{#if direct}{direct.name} direct out, {TAP_LABEL[mixer.state!.channels[direct.id]!.directOut.tap]}{:else}{src?.name ?? o.source}{/if}</td>
-            <td class="num">{o.layout}</td>
+            <td class="num">{#if o.layout === 'mono'}mono{:else}<LayoutBadge layout={o.layout} />{/if}</td>
           </tr>
         {/each}
       </tbody>

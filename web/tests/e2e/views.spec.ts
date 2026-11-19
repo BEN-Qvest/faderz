@@ -211,3 +211,105 @@ test('keeps one tab stop in the Duck view grid when the groups shown change', as
   for (let i = 0; i < 40 && !(await page.evaluate(() => !!document.activeElement?.closest('tbody.members'))); i++) await page.keyboard.press('Tab');
   expect(await page.evaluate(() => !!document.activeElement?.closest('tbody.members'))).toBe(true);
 });
+
+/** "key -18.3 >= thr -30.0": both numbers named, and the comparison the reading states holds for them. */
+function keyingHolds(text: string): boolean {
+  const m = /^\s*key\s+(-inf|--|-?\d+\.\d)\s+(>=|<)?\s*thr\s+(-?\d+\.\d)\s*$/.exec(text);
+  if (!m) return false;
+  if (m[1] === '--') return m[2] === undefined;
+  const key = m[1] === '-inf' ? -Infinity : Number(m[1]);
+  return (key >= Number(m[3])) === (m[2] === '>=');
+}
+
+test('each duck group says what keys it at which tap, what it ducks on which outputs, and its key level against the threshold', { tag: '@mock' }, async ({ page, request }) => {
+  await live(page);
+  const band = page.getByTestId('duck-summary');
+  await expect(band).toBeVisible();
+  // The triggers are named as the key, never as what the group lowers.
+  await expect(page.getByTestId('duck-summary-keys-comm')).toHaveText('key: Pres 1, Pres 2 (pre-fader, while open)');
+  await expect(page.getByTestId('duck-summary-ducks-comm')).toHaveText(/^ducks: Amb 1, .* on PGM 5\.1, PGM 2\.0$/);
+  await expect(page.getByTestId('duck-summary-ducks-comm')).not.toContainText('Pres 1');
+  await expect(page.getByTestId('duck-summary-keys-remote')).toHaveText(/^key: Phone 1, Phone 2 \(/);
+  const keying = page.getByTestId('duck-summary-keying-comm');
+  await expect(keying).toHaveText(/-30\.0\s*$/);
+  // A reading arrives with the meter frames, its comparison true to its numbers.
+  await expect.poll(async () => keyingHolds((await keying.textContent()) ?? ''), { timeout: 5000 }).toBe(true);
+  await expect(keying).not.toHaveText(/^\s*key\s+--/, { timeout: 5000 });
+  // A click shows the line's tip with every list whole, where the line cuts them.
+  await page.getByTestId('duck-summary-comm').click();
+  await expect(page.getByRole('tooltip')).toContainText('ducks: Amb 1, Amb 2, Amb 3, Amb 4, Music on PGM 5.1, PGM 2.0');
+  await expect(page.getByRole('tooltip')).toContainText('key: Pres 1, Pres 2 (pre-fader, while open)');
+  await page.mouse.move(0, 0);
+  await expect(page.getByRole('tooltip')).toBeHidden();
+  // A changed tap, trigger and threshold read at once, in the band and in the Duck view.
+  try {
+    await patch(request, '/ducks/comm/keyTap', 'postFader');
+    await patch(request, '/ducks/comm/channels/ch2/trigger', false);
+    await patch(request, '/ducks/comm/threshold', -24);
+    await expect(page.getByTestId('duck-summary-keys-comm')).toHaveText('key: Pres 1 (post-fader)');
+    await expect(keying).toHaveText(/-24\.0\s*$/);
+    await page.getByRole('button', { name: 'Duck', exact: true }).click();
+    await expect(page.getByTestId('duck-view-keys-comm')).toHaveText('key: Pres 1 (post-fader)');
+    const ducks = page.getByTestId('duck-view-ducks-comm');
+    await expect(ducks).toHaveText(/^ducks: Amb 1, .* on PGM 5\.1, PGM 2\.0$/);
+    // The outputs show whole in the 212 px column; the targets give way.
+    // The list wraps: the whole of it shows in the 212 px column, nothing cut.
+    await expect(ducks).toHaveText('ducks: Amb 1, Amb 2, Amb 3, Amb 4, Music on PGM 5.1, PGM 2.0');
+    expect(await ducks.evaluate((e) => e.scrollHeight <= e.clientHeight + 0.5)).toBe(true);
+    const level = page.getByTestId('duck-view-keying-comm');
+    await expect(level).toHaveText(/^now: key .* thr -24\.0$/);
+    await expect.poll(async () => keyingHolds(((await level.locator('.reading').textContent()) ?? '')), { timeout: 5000 }).toBe(true);
+  } finally {
+    await patch(request, '/ducks/comm/keyTap', 'preFaderOpen');
+    await patch(request, '/ducks/comm/channels/ch2/trigger', true);
+    await patch(request, '/ducks/comm/threshold', -30);
+  }
+});
+
+test('names each bus with its width on its master and in the routing columns, as a channel strip does', async ({ page, request }) => {
+  const { shape } = await serverState(request);
+  const wide = shape.buses.find((b) => b.layout === '5.1' || b.layout === '7.1');
+  const stereo = shape.buses.find((b) => b.layout === 'stereo');
+  expect(wide, 'the example shape has a bus wider than stereo').toBeDefined();
+  await live(page);
+  // The master's head: the same badge a 5.1 channel strip shows.
+  await expect(page.getByTestId(`layout-${wide!.id}`)).toHaveText(wide!.layout);
+  await expect(page.getByTestId(`layout-${stereo!.id}`)).toHaveText('ST');
+  // The channel strip's grey width badge, on the master as on a strip.
+  for (const badge of [page.getByTestId(`layout-${wide!.id}`).locator('.badge'), page.locator('[data-channel] .head .badge[data-layout]').first()]) {
+    await expect(badge).toHaveCSS('background-color', 'rgb(139, 150, 164)');
+    await expect(badge).toHaveCSS('color', 'rgb(11, 13, 16)');
+    await expect(badge).toHaveCSS('font-size', '10px');
+  }
+  // Line-up tone takes the width's place while it replaces the programme, moving nothing.
+  const box = await page.getByTestId(`layout-${stereo!.id}`).boundingBox();
+  try {
+    await patch(request, '/tone/targets', [stereo!.id]);
+    await patch(request, '/tone/on', true);
+    await expect(page.getByTestId(`tone-${stereo!.id}`)).toBeVisible();
+    await expect(page.getByTestId(`layout-${stereo!.id}`)).toBeHidden();
+    expect(await page.getByTestId(`layout-${stereo!.id}`).boundingBox()).toEqual(box);
+  } finally {
+    await patch(request, '/tone/on', false);
+    await patch(request, '/tone/targets', []);
+  }
+  await expect(page.getByTestId(`layout-${stereo!.id}`)).toBeVisible();
+  // A kind tag the name already says is left out: PGM on "PGM 5.1"; CF on "Clean" stays.
+  await expect(page.locator(`[data-master="${wide!.id}"] .tags > .tag`)).toBeHidden();
+  const clean = shape.buses.find((b) => b.kind === 'cleanFeed')!;
+  await expect(page.locator(`[data-master="${clean.id}"] .tags > .tag`)).toHaveText('CF');
+  // A mono output shows none.
+  await page.getByRole('button', { name: 'Aux / N-1', exact: true }).click();
+  const mono = shape.auxes.find((a) => a.layout === 'mono')!;
+  await expect(page.getByTestId(`layout-${mono.id}`).locator('.badge')).toHaveCount(0);
+  // Routing: each bus column names its width beside its name; VCA columns have none.
+  await page.getByRole('button', { name: 'Routing', exact: true }).click();
+  const head = page.getByRole('table', { name: 'Routing' }).locator('thead tr').last();
+  await expect(head.getByRole('columnheader', { name: `${wide!.name}, ${wide!.layout}`, exact: true })).toBeVisible();
+  await expect(head.getByRole('columnheader', { name: `${stereo!.name}, stereo`, exact: true })).toBeVisible();
+  await expect(head.locator('.badge[data-layout]')).toHaveCount(shape.buses.filter((b) => b.layout !== 'mono').length);
+  // The output flows name widths as the badges do, not as "stereo".
+  const flows = page.locator('section.outputs tbody');
+  await expect(flows).not.toContainText('stereo');
+  await expect(flows.locator('.badge[data-layout="stereo"]').first()).toHaveText('ST');
+});
