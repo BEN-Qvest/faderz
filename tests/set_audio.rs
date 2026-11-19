@@ -1237,6 +1237,174 @@ fn every_replica_applies_a_stereo_channels_image_and_balance() {
     }
 }
 
+/// A mono channel's surround pan is replicated state: every replica
+/// writes the legs of the same place in the 5.1 field.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "three debug-build engines miss their deadlines on a shared host; CI runs it in release"
+)]
+fn every_replica_places_a_mono_channel_in_the_surround_field() {
+    let _one = ONE_SET.lock().unwrap_or_else(|e| e.into_inner());
+    let shape = json!({
+        "sampleRate": 48000,
+        "frameRate": { "numerator": 25, "denominator": 1 },
+        "channels": [
+            { "id": "m", "name": "Mic", "width": 1, "layout": "mono", "altInput": false },
+        ],
+        "buses": [{ "id": "pgm", "name": "PGM", "kind": "program", "width": 6, "layout": "5.1" }],
+        "auxes": [], "mixMinus": [], "vcas": [], "monitorOutputs": [],
+        "outputs": [
+            { "id": "out-51", "name": "PGM 5.1", "source": "pgm", "width": 6, "layout": "5.1" },
+        ],
+    });
+    let (set, listeners) = Set::with("surpan", shape, &["out-51"], |domain| {
+        let src = new_id();
+        (
+            vec![Source::start(domain, &src, vec![0.5])],
+            json!({ "m": { "flow": src } }),
+        )
+    });
+    let nodes: Vec<Option<Node>> = (listeners.into_iter().enumerate())
+        .map(|(n, l)| Some(set.start(n, Some(l))))
+        .collect();
+    for n in 0..REPLICAS {
+        steady(&nodes, n);
+    }
+    let h = std::f32::consts::FRAC_1_SQRT_2;
+    let near = |leg: &[f32], want: f32| leg.iter().all(|v| (v - want).abs() <= 1e-6);
+    write(
+        &nodes,
+        0,
+        &[
+            ("/channels/m/fader", json!(0)),
+            ("/channels/m/routes/pgm", json!(true)),
+        ],
+    );
+    // fr, lr and the legs L R C LFE Ls Rs every replica writes.
+    // A new mono channel is the L/R pair; no spread puts it in C.
+    write(&nodes, 0, &[("/channels/m/pan/spread", json!(0))]);
+    let steps: [(f64, f64, [f32; 6]); 4] = [
+        (-1.0, 0.0, [0.0, 0.0, 0.5, 0.0, 0.0, 0.0]),
+        (-1.0, -1.0, [0.5, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        (1.0, 0.0, [0.0, 0.0, 0.0, 0.0, 0.5 * h, 0.5 * h]),
+        (0.0, 0.0, [0.0, 0.0, 0.5 * h, 0.0, 0.25, 0.25]),
+    ];
+    for (fr, lr, want) in steps {
+        write(
+            &nodes,
+            1,
+            &[
+                ("/channels/m/pan/frontRear", json!(fr)),
+                ("/channels/m/pan/lr", json!(lr)),
+            ],
+        );
+        for n in 0..REPLICAS {
+            let mut last = None;
+            let read = until(20, || {
+                let Some(out) = legs_of(&set.domain.0, &set.members[n], 6) else {
+                    return false;
+                };
+                last = Some(out.iter().map(|l| l[0]).collect::<Vec<_>>());
+                out.iter().zip(want).all(|(leg, w)| near(leg, w))
+            });
+            assert!(
+                read,
+                "replica {n} at fr {fr}, lr {lr}: wanted {want:?}, read {last:?}: {}",
+                states(&nodes)
+            );
+        }
+    }
+}
+
+/// A replica that joins late replays the whole log from its first entry
+/// onto the initial state of the shape, as its peers' states began: the
+/// entries wrote a mono channel's left-right pan on a 5.1 bus and nothing
+/// of the rest of its pan, and every replica writes the same legs, the
+/// L/R pair the pan was before the field.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "three debug-build engines miss their deadlines on a shared host; CI runs it in release"
+)]
+fn a_replica_replaying_the_whole_log_writes_what_its_peers_write() {
+    let _one = ONE_SET.lock().unwrap_or_else(|e| e.into_inner());
+    let shape = json!({
+        "sampleRate": 48000,
+        "frameRate": { "numerator": 25, "denominator": 1 },
+        "channels": [
+            { "id": "m", "name": "Mic", "width": 1, "layout": "mono", "altInput": false },
+        ],
+        "buses": [{ "id": "pgm", "name": "PGM", "kind": "program", "width": 6, "layout": "5.1" }],
+        "auxes": [], "mixMinus": [], "vcas": [], "monitorOutputs": [],
+        "outputs": [
+            { "id": "out-51", "name": "PGM 5.1", "source": "pgm", "width": 6, "layout": "5.1" },
+        ],
+    });
+    let (set, listeners) = Set::with("replay", shape, &["out-51"], |domain| {
+        let src = new_id();
+        (
+            vec![Source::start(domain, &src, vec![0.5])],
+            json!({ "m": { "flow": src } }),
+        )
+    });
+    let mut listeners: Vec<Option<std::net::TcpListener>> =
+        listeners.into_iter().map(Some).collect();
+    let mut nodes: Vec<Option<Node>> = (0..REPLICAS).map(|_| None).collect();
+    // The set forms on the first replica, the second a learner it grows
+    // by once a third has joined.
+    for n in 0..2 {
+        nodes[n] = Some(set.start(n, listeners[n].take()));
+    }
+    steady(&nodes, 0);
+    // Entries that wrote the left-right position alone.
+    write(
+        &nodes,
+        0,
+        &[
+            ("/channels/m/fader", json!(0)),
+            ("/channels/m/routes/pgm", json!(true)),
+            ("/channels/m/pan/lr", json!(0.3)),
+        ],
+    );
+    nodes[2] = Some(set.start(2, listeners[2].take()));
+    let voters = |nodes: &[Option<Node>]| {
+        let raft = node(nodes, 0)
+            .server
+            .app
+            .replica
+            .raft()
+            .metrics()
+            .borrow()
+            .clone();
+        raft.membership_config.membership().voter_ids().count()
+    };
+    let grown = until(60, || voters(&nodes) == REPLICAS);
+    assert!(grown, "the set did not grow to three: {}", states(&nodes));
+    for n in 0..REPLICAS {
+        steady(&nodes, n);
+    }
+    let theta = 1.3 * std::f32::consts::FRAC_PI_4;
+    let want = [theta.cos(), theta.sin(), 0.0, 0.0, 0.0, 0.0].map(|g| g * 0.5);
+    for n in 0..REPLICAS {
+        let mut last = None;
+        let read = until(30, || {
+            let Some(out) = legs_of(&set.domain.0, &set.members[n], 6) else {
+                return false;
+            };
+            last = Some(out.iter().map(|l| l[0]).collect::<Vec<_>>());
+            out.iter()
+                .zip(want)
+                .all(|(leg, w)| leg.iter().all(|v| (v - w).abs() <= 1e-6))
+        });
+        assert!(
+            read,
+            "replica {n}: wanted {want:?}, read {last:?}: {}",
+            states(&nodes)
+        );
+    }
+}
+
 /// An interrupt of the mix-minus output is one replicated command: every
 /// replica's member flow of it carries the talkback channel alone, at
 /// its level (ch1 is 6 dB above ch2) before its closed fader, in place of the mix, alike on all

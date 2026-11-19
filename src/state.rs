@@ -1979,6 +1979,7 @@ impl Product for Mixer {
         } else {
             self.shape = Some(Arc::new(saved.shape));
             self.state = saved.state;
+            fill_pan(&mut self.state);
             // Taken before duck groups were kept: its shape has none.
             if self.state.get("ducks").is_none() {
                 self.state["ducks"] = json!({});
@@ -1991,6 +1992,18 @@ impl Product for Mixer {
         self.rewire();
         self.derive();
         Ok(())
+    }
+}
+
+/// A snapshot an older binary saved has no surround position in the pan
+/// of its channels: the initial one fills it in, as a configured state
+/// does ([`Mixer::reconcile`]), so a write can reach it.
+fn fill_pan(state: &mut Value) {
+    let channels = state["channels"].as_object_mut().into_iter().flatten();
+    for pan in channels.filter_map(|(_, c)| c.get_mut("pan")?.as_object_mut()) {
+        for (leaf, initial) in [("frontRear", -1), ("spread", 1), ("lfeSend", -90)] {
+            pan.entry(leaf).or_insert(json!(initial));
+        }
     }
 }
 
@@ -4592,6 +4605,89 @@ mod tests {
         let mut back = wired();
         back.load(&serde_json::to_vec(&v).unwrap()).unwrap();
         assert_eq!(back.targets(), wired().targets());
+    }
+
+    /// The state is a function of the log: a snapshot, one an older
+    /// binary saved without the surround position included, and a log
+    /// replayed from its first entry hold the same state, whatever the
+    /// log wrote, the deprecated `fr` among it, which the panner never
+    /// reads. A mono channel on a surround bus sounds as it did before
+    /// the field, the L/R pair of its `lr`.
+    #[test]
+    fn a_snapshot_and_a_replayed_log_hold_the_same_state() {
+        let shape = Shape::parse(&crate::shape::tests::surround()).unwrap();
+        let writes = [
+            ("/channels/ch1/fader", json!(0)),
+            ("/channels/ch1/routes/pgm", json!(true)),
+            ("/channels/ch1/pan/lr", json!(0.3)),
+            // The deprecated leaves an old console could write.
+            ("/channels/ch1/pan/fr", json!(0)),
+            ("/channels/ch1/pan/divergence", json!(0)),
+            ("/channels/ch1/pan/lfe", json!(-6)),
+        ];
+        let mut replayed = Mixer::new(shape.clone());
+        for (n, (path, value)) in writes.into_iter().enumerate() {
+            set(&mut replayed, "a", n as u64 + 1, path, value);
+        }
+        let scene = store(&mut replayed, "c1", None, "Opening");
+        let saved = replayed.save();
+        let theta = 1.3 * std::f64::consts::FRAC_PI_4;
+        let before = [libm::cos(theta), libm::sin(theta), 0.0, 0.0, 0.0, 0.0];
+        let legs = |m: &Mixer| -> Vec<f64> {
+            let g = crate::mix::matrix(&shape, m.state());
+            g[0][..6].iter().map(|g| f64::from(*g)).collect()
+        };
+        let close = |got: Vec<f64>| {
+            assert!(
+                got.iter().zip(before).all(|(g, w)| (g - w).abs() < 1e-6),
+                "{got:?} vs {before:?}"
+            );
+        };
+        close(legs(&replayed));
+        // A snapshot of this binary.
+        let mut loaded = Mixer::new(shape.clone());
+        loaded.load(&saved).unwrap();
+        assert_eq!(loaded.text(), replayed.text());
+        close(legs(&loaded));
+        // One an older binary saved: no surround position in it or in its scenes.
+        let mut old: Value = serde_json::from_slice(&saved).unwrap();
+        let strip = |channels: &mut Value| {
+            let pan = channels["ch1"]["pan"].as_object_mut().unwrap();
+            for leaf in ["frontRear", "spread", "lfeSend"] {
+                pan.remove(leaf);
+            }
+        };
+        strip(&mut old["mixer"]["state"]["channels"]);
+        for stored in old["mixer"]["scenes"].as_array_mut().unwrap() {
+            strip(&mut stored[1]["channels"]);
+        }
+        let mut back = Mixer::new(shape.clone());
+        back.load(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(back.text(), replayed.text());
+        close(legs(&back));
+        // A snapshot install builds a default state that takes the saved
+        // one, the missing surround position filled in.
+        let mut installed = Mixer::default();
+        installed.load(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(installed.text(), replayed.text());
+        close(legs(&installed));
+        // The stored scene recalls the same.
+        set(&mut back, "b", 1, "/channels/ch1/pan/lr", json!(-1));
+        let recalled = Command::Recall {
+            id: "r1".into(),
+            scene,
+            at: "2026-11-19T00:00:00Z".into(),
+        };
+        rest(&mut back, recalled);
+        close(legs(&back));
+        // The initial state has the surround position at the front, full
+        // spread and no LFE send, a stereo channel's included.
+        for ch in ["ch1", "st1"] {
+            let pan = format!("/channels/{ch}/pan");
+            assert_eq!(*at(&replayed, &format!("{pan}/frontRear")), json!(-1));
+            assert_eq!(*at(&replayed, &format!("{pan}/spread")), json!(1));
+            assert_eq!(*at(&replayed, &format!("{pan}/lfeSend")), json!(-90));
+        }
     }
 
     const OWN: &str = "0d7f6b8e-4a2c-4e8f-9b1a-2c3d4e5f6a0f";

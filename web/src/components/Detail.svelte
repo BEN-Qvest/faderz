@@ -37,6 +37,20 @@
   const group = $derived(channel ? 'channels' : shape.buses.some((b) => b.id === id) ? 'buses' : 'auxes');
   const element = $derived(channel ?? shape.buses.find((b) => b.id === id) ?? shape.auxes.find((a) => a.id === id)!);
   const st = $derived(mixer.state![group][id] as ChannelState | BusState);
+  // Front/rear, spread and the LFE send place a mono channel in the field of
+  // a bus or mix-minus of more than two legs, or of a monitor of more than two
+  // legs through its AFL, so they act only when it reaches one; a send to an aux
+  // and a PFL keep the L/R pair.
+  const feedsSurround = $derived.by(() => {
+    if (group !== 'channels') return false;
+    const c = st as ChannelState;
+    const wide = (w: number) => w > 2;
+    return (
+      shape.buses.some((b) => wide(b.width) && c.routes[b.id]) ||
+      shape.mixMinus.some((m) => wide(m.width) && c.routes[m.bus]) ||
+      shape.monitorOutputs.some((m) => wide(m.width))
+    );
+  });
   const ch = $derived(channel ? (st as ChannelState) : null);
   const p = (...rest: Array<string | number>) => pointer(group, id, ...rest);
   const flag = (...rest: Array<string | number>) => mixer.value<boolean>(p(...rest));
@@ -174,9 +188,15 @@
       {/if}
       {#if ch && element.width <= 2}
         <div class="pan-row"><span class="lbl">Pan</span><Pan path={p('pan', 'lr')} label={`${element.name} pan`} /></div>
-        <div class="pan-row"><span class="lbl">F/R</span><Pan path={p('pan', 'fr')} label={`${element.name} front rear`} left="F" right="R" /></div>
-        <Param path={p('pan', 'divergence')} label="Diverg" min={0} max={1} step={0.01} format={(v) => `${Math.round(v * 100)}%`} />
-        <Param path={p('pan', 'lfe')} label="LFE" min={-90} max={10} fader format={(v) => formatDb(v)} />
+        {#if element.width === 1 && feedsSurround}
+          <div class="pan-row"><span class="lbl">F/R</span><Pan path={p('pan', 'frontRear')} label={`${element.name} front rear`} left="F" right="R" /></div>
+          <Param path={p('pan', 'spread')} label="Spread" min={0} max={1} step={0.01} format={(v) => `${Math.round(v * 100)}%`} />
+          <Param path={p('pan', 'lfeSend')} label="LFE" min={-90} max={10} fader format={(v) => formatDb(v)} />
+        {:else if element.width === 1}
+          <p class="note">Front/rear, spread and LFE act on a surround bus: route this channel to one.</p>
+        {:else}
+          <p class="note">Front/rear, spread and LFE are mono-channel controls.</p>
+        {/if}
       {:else if ch}
         <p class="note">{element.layout} maps leg to leg on {element.layout} buses and folds down (Lo/Ro) on narrower ones.</p>
       {/if}
