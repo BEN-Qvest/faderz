@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use crate::app::App;
 use crate::audio::{self, Audio};
 use crate::config::Config;
+use crate::nmos::Node;
 use crate::shape::Shape;
 use crate::state::Mixer;
 use crate::{api, replica, ui, ws};
@@ -45,6 +46,8 @@ pub struct Server {
     pub app: Arc<App>,
     /// The engine, when the configuration has an `mxl` section.
     pub audio: Option<Arc<Audio>>,
+    /// The NMOS node, with `nmos.enabled`.
+    pub node: Option<Arc<Node>>,
     replica: Arc<Replica<Mixer>>,
     /// Awaits the serving task, which ends only on a failure or a panic,
     /// or stops it on `stop`.
@@ -82,6 +85,7 @@ impl Server {
             shape.clone(),
             config.consoles.clone(),
             config.wiring.clone(),
+            config.own_flows(),
         );
         let product = mixer().config_hash();
         let (state, peer, kube, write_timeout) = match &config.set {
@@ -150,12 +154,15 @@ impl Server {
             Some(engine) => {
                 let process = process.unwrap_or_else(|| samplez::rt::setup_process(&engine.rt));
                 let (live, revision) = audio::state_of(&state);
+                // The leg flows IS-05 activations named, the detached
+                // channels and the outputs' enable, which the state keeps.
+                let view = state.store().with_state(|sm| sm.product.engine_view());
                 let audio = match &config.set {
                     None => Audio::start(
                         engine.clone(),
                         process,
                         &shape,
-                        config.wiring.clone(),
+                        view.clone(),
                         &live,
                         ops_state.clone(),
                     )?,
@@ -164,7 +171,7 @@ impl Server {
                             engine.clone(),
                             process,
                             &shape,
-                            config.wiring.clone(),
+                            view.clone(),
                             &live,
                             ops_state.clone(),
                             set,
@@ -198,6 +205,17 @@ impl Server {
             auth: config.auth.clone(),
             api: config.api.clone(),
         };
+        let node = match config.nmos.enabled {
+            true => Some(Arc::new(Node::new(
+                config,
+                &shape,
+                &state,
+                app.clone(),
+                config.listeners.nmos.port,
+                ops_state.metrics(),
+            )?)),
+            false => None,
+        };
         let ws_app = app.clone();
         let service = Service::new(
             service_config,
@@ -209,6 +227,10 @@ impl Server {
         .refusal(api::refusal)
         .ui(ui::router())
         .ws(move |socket, connect| ws::serve(ws_app.clone(), socket, connect));
+        let service = match &node {
+            Some(node) => service.nmos(node.router()),
+            None => service,
+        };
         let bound = service
             .bind()
             .await
@@ -239,6 +261,7 @@ impl Server {
         let failure = Arc::new(Mutex::new(None));
         let failed = failure.clone();
         let peer_state = state.clone();
+        let serving_node = node.clone();
         let serving = tokio::spawn(async move {
             let peers = async {
                 match peer {
@@ -296,6 +319,12 @@ impl Server {
                         None => std::future::pending().await,
                     }
                 } => e,
+                () = async {
+                    match serving_node {
+                        Some(node) => node.run().await,
+                        None => std::future::pending().await,
+                    }
+                } => "the replica stopped under the nmos node".to_owned(),
                 () = tasks_app.publish() => unreachable!("publishing never returns"),
                 () = follow => unreachable!("following the state never returns"),
             }
@@ -323,6 +352,7 @@ impl Server {
             peer: peer_addr,
             app,
             audio: engine,
+            node,
             replica: state,
             watching,
             stop,
@@ -348,6 +378,10 @@ impl Server {
         }
         let _ = self.stop.send(());
         let _ = self.watching.await;
+        // Once nothing posts to the registry any more.
+        if let Some(node) = &self.node {
+            node.unregister().await;
+        }
         if let Some(audio) = self.audio.and_then(Arc::into_inner) {
             audio.stop();
         }
@@ -424,7 +458,12 @@ mod tests {
             },
         });
         let (config, shape, _) = Config::parse(&config.to_string(), || unreachable!()).unwrap();
-        let mixer = Mixer::factory(shape, config.consoles.clone(), config.wiring.clone());
+        let mixer = Mixer::factory(
+            shape,
+            config.consoles.clone(),
+            config.wiring.clone(),
+            config.own_flows(),
+        );
         let replica = replica::start(&dir, mixer, Arc::new(replica::tai_samples))
             .await
             .unwrap();

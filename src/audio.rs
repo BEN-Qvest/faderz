@@ -75,16 +75,25 @@ pub fn timing(engine: &samplez::Config, set: &Set) -> Timing {
     }
 }
 
+/// The flow each channel reads at start, as the state sets it: none for a
+/// channel IS-05 detached, so the engine opens no reader for it.
+fn start_flows(shape: &Shape, view: &mix::EngineView, state: &Value) -> Vec<Option<String>> {
+    (mix::selected(shape, &view.wiring, state).into_iter())
+        .zip(&view.detached)
+        .map(|(flow, detached)| (!detached).then_some(flow))
+        .collect()
+}
+
 pub struct Audio {
     engine: Arc<Engine>,
     /// The engine follows a set's replicated log: nothing is sent to it
     /// from here.
     replicated: bool,
     shape: Shape,
-    /// Each channel's flows of input a and b.
-    wiring: Vec<mix::Wiring>,
     /// The flow each channel's input read when the engine started.
-    started_on: Vec<String>,
+    started_on: Vec<Option<String>>,
+    /// Each output's enable when the engine started.
+    started_enabled: Vec<bool>,
     block: u64,
     /// The engine's ramp length, samples.
     ramp: u64,
@@ -103,10 +112,12 @@ pub struct Audio {
     inputs: Mutex<InputHealth>,
 }
 
-/// What the engine was sent: every coefficient, and each input's flow.
+/// What the engine was sent: every coefficient, each input's flow, none
+/// for a detached one, and each output's enable.
 struct Sent {
     matrix: Vec<Vec<f32>>,
-    routed: Vec<String>,
+    routed: Vec<Option<String>>,
+    outputs: Vec<bool>,
     /// Each input's strip parameters ([`strip::params`]); `None` for one
     /// not sent, as all are at start: the engine's strip passes its input
     /// unchanged until set.
@@ -125,8 +136,12 @@ impl Sent {
         self.matrix.iter_mut().flatten().for_each(|g| *g = f32::NAN);
         self.strips.iter_mut().flatten().for_each(|p| *p = None);
         self.ducks = None;
-        for (routed, input) in self.routed.iter_mut().zip(engine.status().inputs) {
-            *routed = input.flow_id;
+        let status = engine.status();
+        for (routed, input) in self.routed.iter_mut().zip(status.inputs) {
+            *routed = (input.state != InputState::Detached).then_some(input.flow_id);
+        }
+        for (enabled, output) in self.outputs.iter_mut().zip(status.outputs) {
+            *enabled = output.enabled;
         }
     }
 }
@@ -143,19 +158,23 @@ impl Audio {
         mut config: samplez::Config,
         process: ProcessStatus,
         shape: &Shape,
-        wiring: Vec<mix::Wiring>,
+        view: mix::EngineView,
         state: &Value,
         ops: Ops,
     ) -> Result<Audio, String> {
-        let started_on = mix::selected(shape, &wiring, state);
+        let started_on = start_flows(shape, &view, state);
         for (input, flow) in config.inputs.iter_mut().zip(&started_on) {
             input.flow_id.clone_from(flow);
+        }
+        for (output, enabled) in config.outputs.iter_mut().zip(&view.outputs) {
+            output.enabled = *enabled;
         }
         let block = u64::from(config.block_size);
         let ramp = u64::from(config.ramp_samples);
         let engine = Engine::start(config, process, None).map_err(|e| format!("engine: {e}"))?;
-        let mut audio = Audio::new(Arc::new(engine), shape, wiring, state, ops);
+        let mut audio = Audio::new(Arc::new(engine), shape, state, ops);
         (audio.started_on, audio.block, audio.ramp) = (started_on, block, ramp);
+        audio.started_enabled = view.outputs;
         Ok(audio)
     }
 
@@ -170,7 +189,7 @@ impl Audio {
         mut config: samplez::Config,
         process: ProcessStatus,
         shape: &Shape,
-        wiring: Vec<mix::Wiring>,
+        view: mix::EngineView,
         state: &Value,
         ops: Ops,
         set: &Set,
@@ -179,9 +198,12 @@ impl Audio {
         for (input, flow) in config
             .inputs
             .iter_mut()
-            .zip(mix::selected(shape, &wiring, state))
+            .zip(start_flows(shape, &view, state))
         {
             input.flow_id = flow;
+        }
+        for (output, enabled) in config.outputs.iter_mut().zip(&view.outputs) {
+            output.enabled = *enabled;
         }
         let (reports, reports_rx) = std::sync::mpsc::sync_channel(64);
         let (statuses, statuses_rx) = std::sync::mpsc::sync_channel(1 << 12);
@@ -196,7 +218,7 @@ impl Audio {
             .map_err(|e| format!("engine: {e}"))?;
         let engine = Arc::new(engine);
         let bridge = EngineAudio::new(engine.clone(), statuses_rx, hashes_rx, &timing);
-        let mut audio = Audio::new(engine, shape, wiring, state, ops);
+        let mut audio = Audio::new(engine, shape, state, ops);
         audio.replicated = true;
         Ok(SetEngine {
             audio,
@@ -206,22 +228,16 @@ impl Audio {
         })
     }
 
-    fn new(
-        engine: Arc<Engine>,
-        shape: &Shape,
-        wiring: Vec<mix::Wiring>,
-        state: &Value,
-        ops: Ops,
-    ) -> Audio {
+    fn new(engine: Arc<Engine>, shape: &Shape, state: &Value, ops: Ops) -> Audio {
         let metrics = ops.metrics();
         Audio {
             engine,
             replicated: false,
             started_on: Vec::new(),
+            started_enabled: Vec::new(),
             block: 0,
             ramp: 0,
             shape: shape.clone(),
-            wiring,
             resends_asked: Mutex::new(0),
             resend: Notify::new(),
             taps: Mutex::new(mix::meter_taps(shape, state)),
@@ -293,6 +309,7 @@ impl Audio {
                 .map(|row| vec![0.0; row.len()])
                 .collect(),
             routed: self.started_on.clone(),
+            outputs: self.started_enabled.clone(),
             strips: self
                 .shape
                 .channels
@@ -306,7 +323,8 @@ impl Audio {
                 ..Targets::default()
             }),
         };
-        self.apply(&state, &mut sent, 0, true).await;
+        let view = replica.store().with_state(|sm| sm.product.engine_view());
+        self.apply(&state, &view, &mut sent, 0, true).await;
         // A resend asked for meanwhile marks it ready once done. The lock
         // is held over the check and the store, so a hold() cannot fall
         // between them and be overwritten.
@@ -349,7 +367,8 @@ impl Audio {
                 // engine takes it.
                 None => (state, revision) = state_of(replica),
             }
-            self.apply(&state, &mut sent, at, false).await;
+            let view = replica.store().with_state(|sm| sm.product.engine_view());
+            self.apply(&state, &view, &mut sent, at, false).await;
             if let Some(n) = resent {
                 let asked = self.resends_asked.lock().expect("resend lock poisoned");
                 if *asked == n {
@@ -384,15 +403,24 @@ impl Audio {
     }
 
     /// Sends the engine every strip parameter, duck setting, duck mask and
-    /// coefficient of `state`'s targets ([`mix::targets`]) that differs
-    /// from what it was sent, and a route for every channel whose selected
-    /// flow differs, all at `at` rounded up to a block. When the engine no
+    /// coefficient of `state`'s targets read through `view`
+    /// ([`mix::EngineView::targets`]) that differs from what it was sent, a
+    /// route or detach for every channel whose flow differs and an enable
+    /// for every output whose enable differs, all at `at` rounded up to a
+    /// block; the gains no earlier than the detaches. When the engine no
     /// longer takes that index, the rest of the diff goes at the earliest
     /// one it does; while it holds as many changes as it takes, the next
     /// waits. With `settle`, the gains wait for the strips' ramps.
-    async fn apply(&self, state: &Value, sent: &mut Sent, at: u64, settle: bool) {
+    async fn apply(
+        &self,
+        state: &Value,
+        view: &mix::EngineView,
+        sent: &mut Sent,
+        at: u64,
+        settle: bool,
+    ) {
         let mut at = at.next_multiple_of(self.block);
-        let targets = mix::targets(&self.shape, &self.wiring, state);
+        let targets = view.targets(&self.shape, state);
         for (slot, (sent, next)) in sent.strips.iter_mut().zip(targets.strips).enumerate() {
             for (p, n) in sent.iter_mut().zip(next) {
                 if *p != Some(n)
@@ -440,6 +468,42 @@ impl Audio {
         // After a refusal every setting and mask goes again on the next
         // write.
         sent.ducks = (!refused).then_some(held);
+        for (slot, flow) in targets.flows.into_iter().enumerate() {
+            while flow != sent.routed[slot] {
+                let sent_now = match &flow {
+                    Some(f) => self.engine.route(slot, f, at),
+                    None => self.engine.detach(slot, at),
+                };
+                match sent_now {
+                    Ok(k) => {
+                        // A detached channel is silent before any gain
+                        // sent with it applies, so one detached at start
+                        // is never heard.
+                        if flow.is_none() {
+                            at = at.max(k.next_multiple_of(self.block));
+                        }
+                        sent.routed[slot].clone_from(&flow);
+                    }
+                    Err(EntryError::Full) => tokio::time::sleep(FULL_RETRY).await,
+                    Err(e) => {
+                        tracing::warn!(slot, ?flow, "input route refused: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+        for (slot, enabled) in targets.outputs.into_iter().enumerate() {
+            while enabled != sent.outputs[slot] {
+                match self.engine.set_output_enabled(slot, enabled, at) {
+                    Ok(_) => sent.outputs[slot] = enabled,
+                    Err(EntryError::Full) => tokio::time::sleep(FULL_RETRY).await,
+                    Err(e) => {
+                        tracing::warn!(slot, enabled, "output enable refused: {e}");
+                        break;
+                    }
+                }
+            }
+        }
         if settle {
             at = (at + self.ramp).next_multiple_of(self.block);
         }
@@ -452,20 +516,6 @@ impl Audio {
                         .await
                 {
                     *g = n;
-                }
-            }
-        }
-        for (slot, flow) in targets.flows.into_iter().enumerate() {
-            // Every channel reads a flow: no target detaches one.
-            let Some(flow) = flow else { continue };
-            while flow != sent.routed[slot] {
-                match self.engine.route(slot, &flow, at) {
-                    Ok(_) => sent.routed[slot].clone_from(&flow),
-                    Err(EntryError::Full) => tokio::time::sleep(FULL_RETRY).await,
-                    Err(e) => {
-                        tracing::warn!(slot, flow, "input route refused: {e}");
-                        break;
-                    }
                 }
             }
         }

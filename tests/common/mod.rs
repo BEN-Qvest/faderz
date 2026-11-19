@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod registry;
+
 use std::hash::{BuildHasher, RandomState};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,6 +81,14 @@ pub fn new_id() -> String {
         &h[16..20],
         &h[20..32]
     )
+}
+
+/// A random id of the form BCP-007-03 takes for MXL ids: version 4,
+/// RFC 4122 variant.
+pub fn mxl_id() -> String {
+    let mut id = new_id().into_bytes();
+    (id[14], id[19]) = (b'4', b'8');
+    String::from_utf8(id).unwrap()
 }
 
 /// A producer writing `values`, one per channel, into every sample of a
