@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use samplez_replica::Replica;
-use samplez_replica::entry::SessionKey;
+use samplez_replica::entry::{NodeId, SessionKey};
+use samplez_replica::membership;
 use samplez_service::config::AuthMode;
 use samplez_service::metrics::Metrics;
 use samplez_service::replica::{Ack, Commands, Resolution};
@@ -18,6 +19,7 @@ use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::audio::Audio;
+use crate::config::Set;
 use crate::state::{Answer, Mixer};
 
 /// Deltas waiting per client before it is caught up by snapshot instead.
@@ -30,6 +32,9 @@ pub struct App {
     pub replica: Arc<Replica<Mixer>>,
     /// The replica's id in the contract (`ReplicaRef.id`).
     pub name: String,
+    /// The id of each replica of the set by ordinal ([`member_names`]);
+    /// empty for a set of one.
+    members: Vec<String>,
     pub hub: Hub,
     pub commands: Commands,
     /// The revision of the last delta handed to the hub.
@@ -49,6 +54,9 @@ pub struct App {
     /// The engine's inputs and outputs last read ([`App::count`]); none
     /// without an engine.
     engine: Mutex<Option<Value>>,
+    /// When each follower last matched all of this leader's log, as
+    /// [`replicas`](App::replicas) saw it; read without an engine only.
+    caught_up: Mutex<BTreeMap<NodeId, Instant>>,
 }
 
 /// A connection counted by [`App::connected`]; dropping it counts it
@@ -112,10 +120,87 @@ const SELECTION_GRACE: Duration = samplez_replica::session::LEASE;
 /// A session's requests for one control forwarded at most this often.
 pub const REQUEST_INTERVAL: Duration = Duration::from_secs(3);
 
+/// The id of each replica of `set` by ordinal: `name` for this one, and
+/// for the others the StatefulSet's name and their ordinal, as its pods
+/// are named, or, without a StatefulSet, their peer address as listed
+/// (`host:port`, unique by validation). Entry n is the replica of
+/// ordinal n, as `peers[n]` is its address.
+pub fn member_names(set: &Set, name: &str) -> Vec<String> {
+    (set.peers.iter().enumerate())
+        .map(|(n, addr)| match &set.statefulset {
+            _ if n == usize::from(set.ordinal) => name.to_owned(),
+            Some(statefulset) => format!("{statefulset}-{n}"),
+            None => addr.clone(),
+        })
+        .collect()
+}
+
+/// How many log entries a follower may trail the leader's log by and
+/// still count as heard: replication runs in batches, so an exact match
+/// would flap during a burst of writes.
+const REPLICATION_LAG: u64 = 16;
+
+/// How long ago a follower may last have matched the leader's whole log
+/// and still count as heard: a live one does between batches of writes,
+/// a stopped one never does again once the log moves on.
+const CAUGHT_UP_WINDOW: Duration = Duration::from_secs(3);
+
+/// Whether a follower that has matched `matched` of a leader whose log
+/// ends at `last` is within [`REPLICATION_LAG`] of it.
+fn within_lag(matched: Option<u64>, last: Option<u64>) -> bool {
+    match (matched, last) {
+        (Some(matched), Some(last)) => matched.saturating_add(REPLICATION_LAG) >= last,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// The ordinal of an audio replica's node id; a witness sorts last.
+fn ordinal_of(id: NodeId) -> u16 {
+    match membership::slot_of(id) {
+        membership::Slot::Audio(ordinal) => ordinal,
+        membership::Slot::Witness => u16::MAX,
+    }
+}
+
+/// Whether replica `me` hears replica `id` of its set. With contact
+/// running: contact holds a majority and has had a report from `id`
+/// within its window. Without (a set without an engine), what raft
+/// shows: a follower hears the leader it follows, for as long as raft
+/// names one (it drops the name when the election timeout passes without
+/// a heartbeat); the leader hears a follower whose matched log is within
+/// [`REPLICATION_LAG`] entries of its own and that has matched all of it
+/// within [`CAUGHT_UP_WINDOW`] (`caught_up` holds when it last did).
+fn hears(
+    id: NodeId,
+    me: NodeId,
+    contact: Option<&samplez_replica::contact::Metrics>,
+    metrics: &openraft::RaftMetrics<NodeId, openraft::BasicNode>,
+    caught_up: &mut BTreeMap<NodeId, Instant>,
+    now: Instant,
+) -> bool {
+    if let Some(contact) = contact {
+        return contact.in_contact
+            && (contact.peers.iter()).any(|p| p.node == id && p.reports > 0 && !p.silent);
+    }
+    if metrics.current_leader == Some(me) {
+        let matched = (metrics.replication.as_ref())
+            .and_then(|r| r.get(&id).copied().flatten())
+            .map(|log| log.index);
+        if matched.is_some() && matched == metrics.last_log_index {
+            caught_up.insert(id, now);
+        }
+        return within_lag(matched, metrics.last_log_index)
+            && (caught_up.get(&id)).is_some_and(|&t| now.duration_since(t) < CAUGHT_UP_WINDOW);
+    }
+    metrics.current_leader == Some(id)
+}
+
 impl App {
     pub fn new(
         replica: Arc<Replica<Mixer>>,
         name: String,
+        set: Option<&Set>,
         auth: AuthMode,
         metrics: &Metrics,
     ) -> Arc<App> {
@@ -123,6 +208,7 @@ impl App {
         Arc::new(App {
             commands: Commands::new(replica.clone(), COMMANDS_IN_FLIGHT),
             replica,
+            members: set.map_or_else(Vec::new, |set| member_names(set, &name)),
             name,
             hub: Hub::new(CLIENT_DELTAS, metrics),
             published,
@@ -136,6 +222,7 @@ impl App {
             requests: Mutex::default(),
             counters: Mutex::default(),
             engine: Mutex::default(),
+            caught_up: Mutex::default(),
         })
     }
 
@@ -154,13 +241,67 @@ impl App {
         json!({ "id": self.name, "role": role })
     }
 
-    /// Model `ReplicaStatus` of every replica this one knows: itself.
+    /// Model `ReplicaStatus` of every replica of the set as this one sees
+    /// it, by ordinal: itself as [`ReplicatedState::replica`] reports it,
+    /// and each other voter that serves clients (not a witness) by what
+    /// this replica hears of it ([`hears`]). The leader is the one
+    /// raft follows. Another replica can commit, as far as this one can
+    /// tell, while it is heard and a majority of the voters is: this
+    /// replica counting itself when it is ready. Every entry, this
+    /// replica's own included, is commitable by that one rule.
     pub fn replicas(&self) -> Value {
         let info = self.replica.replica();
-        let mut status = self.replica_ref();
-        status["healthy"] = json!(info.ready);
-        status["commitable"] = json!(info.commitable);
-        json!([status])
+        let mut own = self.replica_ref();
+        own["healthy"] = json!(info.ready);
+        own["commitable"] = json!(info.commitable);
+        if self.members.is_empty() {
+            return json!([own]);
+        }
+        let metrics = self.replica.raft().metrics().borrow().clone();
+        let contact = self.replica.contact_metrics();
+        let me = self.replica.id();
+        let voters: Vec<NodeId> = metrics.membership_config.membership().voter_ids().collect();
+        let now = Instant::now();
+        let mut caught_up = self.caught_up.lock().expect("caught_up lock poisoned");
+        let up: BTreeMap<NodeId, bool> = (voters.iter())
+            .map(|&id| {
+                let up = if id == me {
+                    info.ready
+                } else {
+                    hears(id, me, contact.as_ref(), &metrics, &mut caught_up, now)
+                };
+                (id, up)
+            })
+            .collect();
+        let quorum = 2 * up.values().filter(|&&up| up).count() > voters.len();
+        let mut listed: Vec<(u16, Value)> = Vec::new();
+        for &id in &voters {
+            let membership::Slot::Audio(ordinal) = membership::slot_of(id) else {
+                continue;
+            };
+            let healthy = up[&id];
+            let status = if id == me {
+                own["commitable"] = json!(healthy && quorum);
+                own.clone()
+            } else {
+                let Some(name) = self.members.get(usize::from(ordinal)) else {
+                    continue;
+                };
+                let role = if metrics.current_leader == Some(id) {
+                    "leader"
+                } else {
+                    "follower"
+                };
+                json!({ "id": name, "role": role, "healthy": healthy, "commitable": healthy && quorum })
+            };
+            listed.push((ordinal, status));
+        }
+        // Not yet a voter itself, as while it joins: listed all the same.
+        if !voters.contains(&me) {
+            listed.push((ordinal_of(me), own));
+        }
+        listed.sort_by_key(|(ordinal, _)| *ordinal);
+        Value::Array(listed.into_iter().map(|(_, s)| s).collect())
     }
 
     /// The `replicas` message.
@@ -605,6 +746,59 @@ pub fn uuid() -> std::io::Result<String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A follower that trails the leader's log by a batch is still
+    /// heard; one that has fallen further behind, or has matched nothing,
+    /// is not. An exact match would list it down on every write burst.
+    #[test]
+    fn a_follower_within_the_lag_window_is_heard() {
+        assert!(within_lag(Some(100), Some(100)));
+        assert!(within_lag(Some(100 - REPLICATION_LAG), Some(100)));
+        assert!(!within_lag(Some(100 - REPLICATION_LAG - 1), Some(100)));
+        assert!(!within_lag(None, Some(100)));
+        assert!(within_lag(Some(0), None));
+    }
+
+    /// A follower hears the leader raft names, and nothing once raft has
+    /// dropped the name (the leader went silent).
+    #[test]
+    fn the_leader_is_heard_while_raft_names_it() {
+        let mut m = openraft::RaftMetrics::new_initial(1);
+        let mut seen = BTreeMap::new();
+        let now = Instant::now();
+        m.current_leader = Some(2);
+        assert!(hears(2, 1, None, &m, &mut seen, now));
+        assert!(!hears(3, 1, None, &m, &mut seen, now));
+        m.current_leader = None;
+        assert!(!hears(2, 1, None, &m, &mut seen, now));
+    }
+
+    /// The leader hears a follower that trails by a batch while it keeps
+    /// catching up, and stops hearing one that has not matched the whole
+    /// log for the window, though it still trails by little.
+    #[test]
+    fn a_follower_that_stops_catching_up_is_not_heard() {
+        let mut m = openraft::RaftMetrics::new_initial(1);
+        let mut seen = BTreeMap::new();
+        let at = |index| openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), index);
+        let t0 = Instant::now();
+        m.current_leader = Some(1);
+        m.last_log_index = Some(100);
+        m.replication = Some(BTreeMap::from([(2, Some(at(100))), (3, Some(at(10)))]));
+        assert!(hears(2, 1, None, &m, &mut seen, t0));
+        assert!(!hears(3, 1, None, &m, &mut seen, t0), "far behind");
+        m.last_log_index = Some(105);
+        m.replication = Some(BTreeMap::from([(2, Some(at(100)))]));
+        assert!(hears(
+            2,
+            1,
+            None,
+            &m,
+            &mut seen,
+            t0 + Duration::from_secs(1)
+        ));
+        assert!(!hears(2, 1, None, &m, &mut seen, t0 + CAUGHT_UP_WINDOW));
+    }
     use crate::contract::{check, contract};
     use crate::replica;
     use crate::shape::Shape;
@@ -650,6 +844,7 @@ pub(crate) mod tests {
         let app = App::new(
             Arc::new(replica),
             "r1".into(),
+            None,
             AuthMode::None,
             &Metrics::default(),
         );
