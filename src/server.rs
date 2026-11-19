@@ -291,6 +291,8 @@ impl Server {
                         let count = tasks_app.count(&audio);
                         // A set's engine follows the replicated log; only
                         // its meter taps follow the state here.
+                        let started = live.clone();
+                        let resets = audio.follow_resets(&tasks_state, &started, revision);
                         let follow = async {
                             if replicated {
                                 audio.follow_taps(&tasks_state, revision).await;
@@ -299,7 +301,7 @@ impl Server {
                             }
                             std::future::pending::<()>().await
                         };
-                        tokio::join!(follow, meter, count);
+                        tokio::join!(follow, meter, count, resets);
                     }
                     None => std::future::pending::<()>().await,
                 }
