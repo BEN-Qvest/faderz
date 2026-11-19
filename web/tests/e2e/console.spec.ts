@@ -130,7 +130,8 @@ test('the quorum sits in the link key, says what it counts, and follows a replic
   await expect(quorum).toHaveText('QUORUM 3/3');
 });
 
-test('names the signed-in user by initials in a pill at the header end, with Sign out in its menu and no email anywhere', async ({ page }) => {
+test('names the signed-in user by initials in a pill at the header end, with Sign out in its menu and no email anywhere', async ({ page, request }) => {
+  const { build } = (await (await request.get('/api/v1/replicas')).json()) as { build: { faderz: string; samplez: string } };
   const logouts = await signedIn(page);
   await live(page);
   const pill = page.getByTestId('account');
@@ -150,10 +151,13 @@ test('names the signed-in user by initials in a pill at the header end, with Sig
   await page.keyboard.press('ArrowUp');
   const menu = page.getByRole('menu', { name: 'Account' });
   await expect(menu).toBeVisible();
-  // Settings first, Sign out last.
-  await expect(menu.getByRole('menuitem')).toHaveText(['Switch to light theme', 'Sign out']);
-  const out = menu.getByRole('menuitem', { name: 'Sign out' });
-  await expect(out).toBeFocused();
+  // Settings first, then Sign out, then the version lines that open
+  // About / What's new; ArrowUp from the pill lands on the last.
+  await expect(menu.getByRole('menuitem')).toHaveText(['Switch to light theme', 'Sign out', `faderz ${build.faderz} samplez ${build.samplez}`]);
+  await expect(page.getByTestId('account-build')).toBeFocused();
+  await page.keyboard.press('ArrowUp');
+  await expect(menu.getByRole('menuitem', { name: 'Sign out' })).toBeFocused();
+  await page.keyboard.press('ArrowDown');
   await page.keyboard.press('ArrowDown');
   await expect(menu.getByRole('menuitem', { name: 'Switch to light theme' })).toBeFocused();
   await expect(page.getByTestId('account-role')).toHaveText('operator');
@@ -197,10 +201,89 @@ test('names what the serving replica was built from in the connection details an
   await page.getByTestId('account').click();
   const menu = page.getByRole('menu', { name: 'Account' });
   await expect(menu.getByTestId('account-build')).toHaveText(`faderz ${build.faderz} samplez ${build.samplez}`);
-  // Below the entries, and none of them.
-  await expect(menu.getByRole('menuitem').last()).toHaveText('Sign out');
-  const last = (await menu.getByRole('menuitem').last().boundingBox())!;
-  expect((await menu.getByTestId('account-build').boundingBox())!.y).toBeGreaterThanOrEqual(last.y + last.height);
+  // Below the settings and Sign out, as the entry that opens About / What's new.
+  await expect(menu.getByRole('menuitem').last()).toHaveAccessibleName(`About / What's new: faderz ${build.faderz}, samplez ${build.samplez}`);
+  const signOut = (await menu.getByRole('menuitem', { name: 'Sign out' }).boundingBox())!;
+  expect((await menu.getByTestId('account-build').boundingBox())!.y).toBeGreaterThanOrEqual(signOut.y + signOut.height);
+});
+
+test('the version lines open About / What\'s new with the changelog the replica serves, by keyboard and by pointer', async ({ page, request }) => {
+  const about = (await (await request.get('/api/v1/about')).json()) as { build: { faderz: string; samplez: string }; changelog: string };
+  // The newest release, as its heading reads.
+  const newest = /^## \[([^\]]+)\]\([^)]*\)\s*(.*)$/m.exec(about.changelog)!;
+  await signedIn(page);
+  await live(page);
+  // From the account menu by keyboard: the version entry is its last.
+  await page.getByTestId('account').focus();
+  await page.keyboard.press('ArrowUp');
+  await expect(page.getByTestId('account-build')).toBeFocused();
+  await page.keyboard.press('Enter');
+  const dialog = page.getByRole('dialog', { name: "About / What's new" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByTestId('about-build')).toHaveText(`faderz ${about.build.faderz}, built against samplez ${about.build.samplez}`);
+  await expect(dialog.getByRole('heading', { level: 3 }).first()).toHaveText(`${newest[1]} ${newest[2]}`);
+  await expect(dialog.getByRole('heading', { name: 'Changelog' })).toHaveCount(0);
+  // Section labels read in the text colour at the list's size or as
+  // capitals; breaking changes stand out from them.
+  const label = dialog.getByRole('heading', { level: 4, name: 'Features' }).first();
+  const item = dialog.locator('li').first();
+  const style = (l: typeof label) => l.evaluate((e) => { const c = getComputedStyle(e); return { color: c.color, size: parseFloat(c.fontSize), transform: c.textTransform, weight: c.fontWeight }; });
+  const [l, li] = [await style(label), await style(item)];
+  expect(l.color).toBe(li.color);
+  expect(l.size >= li.size || l.transform === 'uppercase').toBe(true);
+  const breaking = dialog.getByRole('heading', { level: 4, name: /BREAKING CHANGES/ }).first();
+  const b = await style(breaking);
+  expect(b.color === l.color && b.weight === l.weight).toBe(false);
+  // Every link opens a page of its own, none of them script.
+  const hrefs = await dialog.getByTestId('about-changelog').locator('a').evaluateAll((as) => as.map((a) => [a.getAttribute('href'), a.getAttribute('target')]));
+  expect(hrefs.length).toBeGreaterThan(10);
+  expect(hrefs.filter(([href, target]) => !/^https:\/\//.test(href ?? '') || target !== '_blank')).toEqual([]);
+  // Inside the viewport, its body scrolls.
+  const r = (await dialog.boundingBox())!;
+  const v = page.viewportSize()!;
+  expect(r.x >= 0 && r.y >= 0 && r.x + r.width <= v.width && r.y + r.height <= v.height).toBe(true);
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(page.getByTestId('account')).toBeFocused();
+
+  // From the connection details by pointer: closing goes back to them.
+  await page.getByRole('button', { name: /^Connection LIVE, details$/ }).click();
+  await page.getByTestId('build-about').click();
+  await expect(dialog.getByTestId('about-changelog')).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(page.getByRole('region', { name: 'Connection details' })).toBeVisible();
+  await expect(page.getByTestId('build-about')).toBeFocused();
+  // A press outside the dialog closes it too.
+  await page.getByTestId('build-about').click();
+  await expect(dialog).toBeVisible();
+  await page.mouse.click(5, 5);
+  await expect(dialog).toBeHidden();
+});
+
+test('About / What\'s new shows that it loads, and a failure with a way to try again', async ({ page }) => {
+  let release: () => void = () => {};
+  let fail = true;
+  await page.route('**/api/v1/about', async (route) => {
+    await new Promise<void>((r) => (release = r));
+    if (fail) await route.fulfill({ status: 500, json: { code: 500, message: 'the replica broke' } });
+    else await route.continue();
+  });
+  await live(page);
+  await page.getByRole('button', { name: /^Connection LIVE, details$/ }).click();
+  await page.getByTestId('build-about').click();
+  const dialog = page.getByRole('dialog', { name: "About / What's new" });
+  await expect(dialog.getByTestId('about-busy')).toHaveText('Loading the changelog...');
+  await expect(dialog.locator('[aria-busy="true"]')).toHaveCount(1);
+  release();
+  await expect(dialog.getByRole('alert')).toContainText('The changelog could not be loaded: the replica broke');
+  await expect(dialog.locator('[aria-busy="true"]')).toHaveCount(0);
+  fail = false;
+  await dialog.getByRole('button', { name: 'Try again' }).click();
+  await expect(dialog.getByTestId('about-busy')).toBeVisible();
+  release();
+  await expect(dialog.getByTestId('about-changelog')).toBeVisible();
+  await expect(dialog.getByRole('alert')).toHaveCount(0);
 });
 
 test('the pill fits the header from 320 px beside every other header control, a locked desk key included', async ({ page }) => {
