@@ -24,7 +24,7 @@ use crate::shape::Shape;
 /// ([`Product::DERIVATION_VERSION`], in samplez's compatibility key): a
 /// change to any of them takes another version, so replicas deriving
 /// differently never run side by side.
-pub const DERIVATION_VERSION: u32 = 5;
+pub const DERIVATION_VERSION: u32 = 6;
 
 /// The layout [`Product::save`] writes. A snapshot carries it beside
 /// the state, which binaries before it read from the top level: they
@@ -364,6 +364,9 @@ pub enum Answer {
     Refused { message: String },
     /// The console a `PutConsole` created.
     Created,
+    /// The channels a `Recall` set to a delay of 0: their stored delay is
+    /// past their delay line.
+    Recalled { delays: Vec<String> },
 }
 
 /// What one command or expiry changed, for [`Product::delta`].
@@ -910,7 +913,9 @@ impl Mixer {
             Command::Patch { changes, .. } => (changes.iter())
                 .map(|c| (c.path.clone(), c.value.clone()))
                 .collect(),
-            Command::Recall { scene, .. } => self.recall_writes(scene).unwrap_or_default(),
+            Command::Recall { scene, .. } => (self.recall_writes(scene))
+                .map(|(written, _)| written)
+                .unwrap_or_default(),
             _ => Vec::new(),
         }
     }
@@ -1060,6 +1065,25 @@ impl Mixer {
                 .any(|c| &c.id == channel && c.alt_input)
         {
             return Err(format!("channel {channel} has no B input"));
+        } else if let [group, channel, leaf] = tokens(path).as_slice()
+            && (group.as_str(), leaf.as_str()) == ("channels", "delay")
+        {
+            // The engine refuses a delay past the input's line.
+            let line = (shape.channels.iter())
+                .find(|c| &c.id == channel)
+                .and_then(|c| c.max_delay);
+            let samples = value.as_u64().unwrap_or(0);
+            match line {
+                None if samples > 0 => {
+                    return Err(format!("channel {channel} has no delay line"));
+                }
+                Some(max) if samples > u64::from(max) => {
+                    return Err(format!(
+                        "channel {channel} delays at most {max} samples, its delay line"
+                    ));
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -1414,29 +1438,45 @@ impl Mixer {
         at: &str,
         ctx: &Apply,
     ) -> Effect<Edits> {
-        let Some(mut written) = self.recall_writes(scene) else {
+        let Some((mut written, delays)) = self.recall_writes(scene) else {
             let message = format!("unknown scene {scene}");
             return self.refuse(session, id, Answer::NotFound { message });
         };
         if let Some(answer) = self.reroute_refusal(ctx, &written) {
             return self.refuse(session, id, answer);
         }
+        if !delays.is_empty() {
+            self.record(session, id, Answer::Recalled { delays });
+        }
         written.push(("/sceneRecalled".into(), json!({ "id": scene, "at": at })));
         changed(self.write(written))
     }
 
-    /// The leaves a recall of `scene` writes, none for an unknown scene.
-    fn recall_writes(&self, scene: &str) -> Option<Vec<(String, Value)>> {
+    /// The leaves a recall of `scene` writes, none for an unknown scene,
+    /// and the channels whose stored delay their delay line no longer
+    /// takes: those recall a delay of 0.
+    fn recall_writes(&self, scene: &str) -> Option<(Leaves, Vec<String>)> {
         let data = self.scenes.get(scene)?;
-        let mut written: Vec<(String, Value)> = self
-            .recalled(data)
-            .into_iter()
-            // A scene keeps the ids of the shape it was stored in.
-            .filter(|(path, v)| {
-                self.state.pointer(path).is_some_and(|current| current != v)
-                    && self.check_references(path, v).is_ok()
-            })
-            .collect();
+        let mut written = Vec::new();
+        let mut short = Vec::new();
+        for (path, mut v) in self.recalled(data) {
+            let Some(current) = self.state.pointer(&path) else {
+                continue;
+            };
+            // A scene keeps the ids and delays of the shape it was stored
+            // in.
+            if let Err(e) = self.check_references(&path, &v) {
+                let Some(channel) = delayed_channel(&path) else {
+                    continue;
+                };
+                tracing::warn!(scene, channel, "recall sets the delay to 0: {e}");
+                short.push(channel);
+                v = json!(0);
+            }
+            if *current != v {
+                written.push((path, v));
+            }
+        }
         // With a channel added since the scene was stored, a group's
         // triggers can pass the limit: that group keeps its routing, as
         // if it were recall-safe, so its members and destinations stay a
@@ -1449,7 +1489,7 @@ impl Mixer {
             );
             written.retain(|(p, _)| duck::routing_of(p) != Some(group.as_str()));
         }
-        Some(written)
+        Some((written, short))
     }
 
     /// The leaves of the scene `data` a recall writes: those of the groups
@@ -1752,6 +1792,9 @@ impl Mixer {
             if fits {
                 set_at(&mut state, &path, value);
             } else {
+                if let Some(channel) = delayed_channel(&path) {
+                    tracing::warn!(channel, %value, "the delay line no longer takes the saved delay: 0");
+                }
                 dropped.push(path);
             }
         }
@@ -2134,6 +2177,17 @@ fn changed(values: Vec<(String, Value)>) -> Effect<Edits> {
             values,
             ..Edits::default()
         })
+    }
+}
+
+/// Leaves to write, as paths and values.
+type Leaves = Vec<(String, Value)>;
+
+/// The channel whose delay `path` is.
+fn delayed_channel(path: &str) -> Option<String> {
+    match tokens(path).as_slice() {
+        [group, channel, leaf] if group == "channels" && leaf == "delay" => Some(channel.clone()),
+        _ => None,
     }
 }
 
@@ -4037,6 +4091,8 @@ mod tests {
             channel("ch4", 1, "mono"),
         ];
         shape["channels"].as_array_mut().unwrap().extend(more);
+        shape["channels"][3]["maxDelay"] = json!(960);
+        shape["channels"][5]["maxDelay"] = json!(48_000);
         shape["vcas"]
             .as_array_mut()
             .unwrap()
@@ -4091,7 +4147,7 @@ mod tests {
             let some = |next: &mut dyn FnMut(u64) -> u64| -> Value {
                 json!(channels.iter().filter(|_| next(3) == 0).collect::<Vec<_>>())
             };
-            match next(39) {
+            match next(40) {
                 0 => (format!("/channels/{ch}/fader"), db),
                 1 => (format!("/channels/{ch}/mute"), flag),
                 2 => (
@@ -4218,6 +4274,9 @@ mod tests {
                     },
                     json!(["normal", "leftToBoth", "rightToBoth", "swap"][next(4) as usize]),
                 ),
+                // Within ch3's and c51's lines; any but 0 is refused on
+                // the others.
+                38 => (format!("/channels/{ch}/delay"), json!(next(3) * 480)),
                 _ => ("/metering/loudness/preset".into(), json!("atsc")),
             }
         };
@@ -4310,6 +4369,7 @@ mod tests {
                     "{at}"
                 );
                 assert_eq!(kept.flows, whole.flows, "{at}");
+                assert_eq!(kept.delays, whole.delays, "{at}");
                 assert_eq!(
                     format!("{:?}", kept.ducks),
                     format!("{:?}", whole.ducks),
@@ -4519,6 +4579,105 @@ mod tests {
     #[test]
     fn the_config_hash_of_a_fixed_configuration_never_moves() {
         assert_eq!(wired().config_hash(), 1_102_375_237_759_052_186);
+    }
+
+    /// `wired` with a delay line of `line` samples on ch1 and none on
+    /// the others.
+    fn delayed(line: u32) -> Mixer {
+        let m = wired();
+        let mut shape = m.shape().clone();
+        shape.channels[0].max_delay = Some(line);
+        Mixer::configured(shape, Vec::new(), m.wiring.clone())
+    }
+
+    /// A channel's delay is its input slot's delay target, 0 by default,
+    /// and reaches the engine as one `Delay` entry. A write is refused
+    /// past the channel's line and, on a channel without one, for
+    /// anything but 0: the engine would refuse the entry. A loaded state
+    /// whose delay the configured line no longer takes drops it to 0.
+    #[test]
+    fn a_channels_delay_is_its_input_slots_within_its_line() {
+        let mut m = delayed(960);
+        let before = m.targets().unwrap();
+        assert_eq!(before.delays, [0, 0, 0]);
+        patch(&mut m, "p1", &[("/channels/ch1/delay", json!(960))]);
+        let after = m.targets().unwrap();
+        assert_eq!(after.delays, [960, 0, 0]);
+        let entries: Vec<String> = (before.diff(&after).iter())
+            .filter(|e| matches!(e, samplez::engine::Entry::Delay { .. }))
+            .map(|e| format!("{e:?}"))
+            .collect();
+        assert_eq!(entries, ["Delay { slot: 0, samples: 960 }"]);
+        assert_ne!(
+            m.config_hash(),
+            wired().config_hash(),
+            "the line is configuration"
+        );
+
+        let refused = |m: &Mixer, path: &str, value: Value| match m.check_write(path, &value) {
+            Err(Answer::Invalid { message }) => message,
+            other => panic!("{path} {value}: {other:?}"),
+        };
+        let e = refused(&m, "/channels/ch1/delay", json!(961));
+        assert!(e.contains("ch1 delays at most 960 samples"), "{e}");
+        let e = refused(&m, "/channels/ch2/delay", json!(1));
+        assert!(e.contains("ch2 has no delay line"), "{e}");
+        m.check_write("/channels/ch2/delay", &json!(0)).unwrap();
+        patch(&mut m, "p2", &[("/channels/ch1/delay", json!(961))]);
+        assert_eq!(
+            m.state()["channels"]["ch1"]["delay"],
+            960,
+            "nothing applied"
+        );
+
+        let mut shorter = delayed(480);
+        shorter.load(&m.save()).unwrap();
+        assert_eq!(shorter.state()["channels"]["ch1"]["delay"], 0);
+        assert_eq!(shorter.dropped, ["/channels/ch1/delay"]);
+        assert_eq!(shorter.targets().unwrap().delays, [0, 0, 0]);
+        let mut same = delayed(960);
+        same.load(&m.save()).unwrap();
+        assert_eq!(same.targets().unwrap().delays, [960, 0, 0]);
+    }
+
+    /// A scene's delay that the channel's line, shortened since the scene
+    /// was stored, no longer takes recalls 0 rather than leaving the
+    /// delay as it was, and the recall's answer names the channel, so
+    /// the console can say so. One within the line recalls as stored,
+    /// with no answer.
+    #[test]
+    fn a_recalled_delay_past_the_line_is_0_and_answered() {
+        let mut m = delayed(960);
+        patch(&mut m, "p1", &[("/channels/ch1/delay", json!(960))]);
+        let scene = store(&mut m, "s1", None, "Lip sync");
+        let recall = |m: &mut Mixer, id: &str| {
+            rest(
+                m,
+                Command::Recall {
+                    id: id.into(),
+                    scene: scene.clone(),
+                    at: "2026-11-15T12:01:00.000Z".into(),
+                },
+            )
+        };
+
+        let mut shorter = delayed(480);
+        shorter.load(&m.save()).unwrap();
+        patch(&mut shorter, "p2", &[("/channels/ch1/delay", json!(240))]);
+        recall(&mut shorter, "r1");
+        assert_eq!(shorter.state()["channels"]["ch1"]["delay"], 0);
+        assert_eq!(shorter.targets().unwrap().delays, [0, 0, 0]);
+        assert_eq!(
+            shorter.answer(&rest_key(), "r1"),
+            Some(&Answer::Recalled {
+                delays: vec!["ch1".into()]
+            })
+        );
+
+        patch(&mut m, "p3", &[("/channels/ch1/delay", json!(0))]);
+        recall(&mut m, "r2");
+        assert_eq!(m.state()["channels"]["ch1"]["delay"], 960);
+        assert_eq!(m.answer(&rest_key(), "r2"), None);
     }
 
     /// A snapshot carries its format: a binary that reads the earlier

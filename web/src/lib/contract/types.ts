@@ -53,6 +53,8 @@ export interface ChannelShape extends ElementShape {
   altInput: boolean;
   /** Label of the input source, shown under the channel name. */
   source?: string;
+  /** Longest delay, in samples, the input's delay line takes; absent without one, and then only 0. */
+  maxDelay?: number;
 }
 /** Operator-assigned scribble strip colour. */
 export type ScribbleColor = 'none' | 'red' | 'orange' | 'yellow' | 'green' | 'cyan' | 'blue' | 'purple';
@@ -664,6 +666,10 @@ export interface CommandResult {
   result: 'applied' | 'duplicate' | 'noop';
   revision: Revision;
   atIndex?: number;
+}
+export interface RecallResult extends CommandResult {
+  /** Channels whose stored delay is past their delay line: the recall set their delay to 0. */
+  delaysNotApplied?: Id[];
 }
 export interface ApiError {
   code: 400 | 403 | 404 | 409;

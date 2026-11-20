@@ -507,7 +507,8 @@ test('sets the LFE send and the stereo image of a channel from the processing pa
   await patch(request, '/channels/ch1/routes/pgm51', true);
 });
 
-test('enters a channel delay in frames and shows it in ms', async ({ page, request }) => {
+// The backend runs without an engine, so no channel there has a delay line.
+test('enters a channel delay in frames and shows it in ms', { tag: '@mock' }, async ({ page, request }) => {
   await live(page);
   await page.locator('[data-channel="ch2"] .head').click();
   await page.getByRole('radio', { name: 'frames' }).click();
@@ -523,6 +524,58 @@ test('enters a channel delay in frames and shows it in ms', async ({ page, reque
   await settled(page);
   expect((await serverState(request)).state.channels['ch2']!.delay).toBe(120000);
   await patch(request, '/channels/ch2/delay', 0);
+});
+
+// An entry past the line is refused, never capped: a capped delay is one
+// nobody typed, and lip sync off by the difference goes unnoticed.
+test('shows a channel delay range in the selected unit and refuses an entry past the delay line', { tag: '@mock' }, async ({ page, request }) => {
+  await live(page);
+  await page.locator('[data-channel="st1"] .head').click();
+  const panel = page.getByRole('region', { name: 'Music processing' });
+  await expect(panel.getByText('0 to 100.0 ms')).toBeVisible();
+  await panel.getByRole('radio', { name: 'frames' }).click();
+  const range = panel.getByText('0 to 2.50 fr');
+  await expect(range).toBeVisible();
+  await expect(panel.getByRole('alert')).toHaveCount(0);
+  const entry = panel.locator('input[data-path="/channels/st1/delay"]');
+  await entry.fill('2');
+  await entry.press('Enter');
+  await settled(page);
+  expect((await serverState(request)).state.channels['st1']!.delay).toBe(3840);
+  await entry.fill('1 s');
+  await entry.press('Enter');
+  await expect(panel.getByRole('alert')).toHaveText('0 to 2.50 fr');
+  await expect(entry).toHaveAttribute('aria-invalid', 'true');
+  await expect(entry).toHaveValue('2.00');
+  await entry.press('ArrowUp');
+  await expect(entry).toHaveValue('2.00');
+  await entry.fill('2.5');
+  await entry.press('Enter');
+  await expect(panel.getByRole('alert')).toHaveCount(0);
+  await settled(page);
+  expect((await serverState(request)).state.channels['st1']!.delay).toBe(4800);
+  await patch(request, '/channels/st1/delay', 0);
+});
+
+test('greys out the delay of a channel without a delay line and leaves a bus delay as it was', async ({ page, request }) => {
+  await live(page);
+  await page.locator('[data-channel="st4"] .head').click();
+  const panel = page.getByRole('region', { name: 'FX processing' });
+  await expect(panel.locator('input[data-path="/channels/st4/delay"]')).toBeDisabled();
+  await expect(panel.getByText('No delay line')).toBeVisible();
+  await expect(panel.getByRole('radio', { name: 'frames' })).toBeDisabled();
+  await panel.getByRole('button', { name: 'Close processing' }).click();
+  await page.locator('[data-master="pgm20"] .head').click();
+  const bus = page.getByRole('region', { name: 'PGM 2.0 processing' });
+  const entry = bus.locator('input[data-path="/buses/pgm20/delay"]');
+  await expect(entry).toBeEnabled();
+  await expect(bus.getByText('No delay line')).toHaveCount(0);
+  await entry.fill('40');
+  await entry.press('Enter');
+  await settled(page);
+  expect((await serverState(request)).state.buses['pgm20']!.delay).toBe(1920);
+  expect((await serverState(request)).state.channels['st4']!.delay).toBe(0);
+  await patch(request, '/buses/pgm20/delay', 0);
 });
 
 test('switches a programme bus limiter and the dynamics order from the processing panel', async ({ page, request }) => {
@@ -550,6 +603,12 @@ test('sets AFV rise, hold, fall and closed level from the AFV view', async ({ pa
   await off.press('Tab');
   await settled(page);
   expect((await serverState(request)).state.afv['ch13']).toMatchObject({ holdMs: 300, offLevel: -20 });
+  // Past the range: refused and restored, never clamped.
+  await hold.fill('999999');
+  await hold.press('Enter');
+  await expect(hold).toHaveValue('300');
+  await expect(page.getByText(/Amb 1 AFV hold time takes 0 to 10000 ms/)).toBeVisible();
+  expect((await serverState(request)).state.afv['ch13']!.holdMs).toBe(300);
   await patch(request, '/afv/ch13/holdMs', 0);
   await patch(request, '/afv/ch13/offLevel', -90);
 });
@@ -1089,6 +1148,12 @@ test('types an EQ frequency and a gate threshold into the processing panel', asy
   await thr.fill('-42');
   await thr.press('Enter');
   await settled(page);
+  // Past the range: refused and restored, never clamped.
+  const typed = await freq.inputValue();
+  await freq.fill('99k');
+  await freq.press('Enter');
+  await expect(freq).toHaveValue(typed);
+  await expect(page.getByText(/Freq takes 20 to 20000/)).toBeVisible();
   const ch = (await serverState(request)).state.channels['ch5']!;
   expect(ch.eq.bands[1]!.freq).toBe(1200);
   expect(ch.gate.threshold).toBe(-42);
@@ -1100,7 +1165,9 @@ test('Escape in a typed field restores its value and leaves the processing panel
   await live(page);
   await page.locator('[data-channel="ch5"] .head').click();
   const panel = page.getByRole('region', { name: 'Guest 3 processing' });
-  for (const field of [page.getByRole('textbox', { name: 'Thr value, type to set' }).first(), panel.getByRole('textbox', { name: /delay in/i })]) {
+  // ch5 has a delay line only on the mock: the backend's channels have none, so their delay field is disabled.
+  const delay = panel.getByRole('textbox', { name: /delay in/i });
+  for (const field of [page.getByRole('textbox', { name: 'Thr value, type to set' }).first(), ...(BACKEND ? [] : [delay])]) {
     const before = await field.inputValue();
     await field.fill('-12');
     await field.press('Escape');
