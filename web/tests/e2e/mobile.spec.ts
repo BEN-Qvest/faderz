@@ -176,3 +176,34 @@ test('explains an engine counter on a tap, with its key, and names the input at 
   await info.tap();
   await expect(help).toHaveCount(0);
 });
+
+// It reads the mock's faulty input; a backend run has no engine, so no
+// loudness measurement to note, and leaves it out.
+test('notes a loudness measurement\'s gaps and start on the MASTERS sheet, and explains them on a tap', { tag: '@mock' }, async ({ page, request }) => {
+  await live(page);
+  const reset = await request.post('/api/v1/loudness/reset', { data: { ids: ['cf'] }, headers: { 'X-Samplez-Request': '1' } });
+  expect(reset.status()).toBe(204);
+  for (const id of REPLICAS) {
+    expect((await request.post(`/__mock/replicas/${id}/kill`)).ok()).toBe(true);
+    expect((await request.post(`/__mock/replicas/${id}/restart`)).ok()).toBe(true);
+  }
+  await page.getByRole('button', { name: 'MASTERS' }).click();
+  const note = page.getByTestId('loudness-note-cf');
+  await expect(note.locator('.gaps')).toHaveText(/ gaps?$/, { timeout: 5000 });
+  await expect(note.locator('.since')).toHaveText(/^since \d\d:\d\d$/, { timeout: 15_000 });
+  // The sheet scrolls its masters sideways.
+  await note.scrollIntoViewIfNeeded();
+  const box = (await note.boundingBox())!;
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+  // The count is never what gives way: it shows whole.
+  expect(await note.locator('.gaps').evaluate((e) => e.scrollWidth <= e.clientWidth + 0.5)).toBe(true);
+  // A tap shows what both mean.
+  await note.tap();
+  const tip = page.locator('#faderz-tip');
+  await expect(tip).toContainText('an input was down, or this mixer instance could not measure the audio');
+  await expect(tip).toContainText("earlier programme loudness isn't included");
+  const t = (await tip.boundingBox())!;
+  expect(t.x).toBeGreaterThanOrEqual(0);
+  expect(t.x + t.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+});
