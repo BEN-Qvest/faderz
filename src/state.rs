@@ -19,10 +19,11 @@ use crate::duck;
 use crate::mix::{self, Wiring};
 use crate::shape::Shape;
 
-/// The version of how [`Mixer::targets`] derives engine targets from the
-/// state, in [`Mixer::config_hash`]: a change to the derivation that
-/// gives other targets for one state takes another version, so replicas
-/// deriving differently never form one set.
+/// The version of how a command applies, how [`Mixer::targets`] derives
+/// engine targets from the state, and what save and load produce
+/// ([`Product::DERIVATION_VERSION`], in samplez's compatibility key): a
+/// change to any of them takes another version, so replicas deriving
+/// differently never run side by side.
 pub const DERIVATION_VERSION: u32 = 4;
 
 /// The layout [`Product::save`] writes. A snapshot carries it beside
@@ -1803,6 +1804,7 @@ fn snapshot_text(shape: &Shape, state: &Value, owners: &Value) -> String {
 impl Product for Mixer {
     type Change = Edits;
 
+    const DERIVATION_VERSION: u32 = crate::state::DERIVATION_VERSION;
     const DRIVES_ENGINE: bool = true;
 
     /// A command that switches an input is refused as [`Answer::Refused`]
@@ -1852,11 +1854,13 @@ impl Product for Mixer {
         }
     }
 
-    /// [`mix::targets`] of the state, as every write keeps them; none
-    /// without an engine's wiring.
+    /// [`mix::targets`] of the state, as every write keeps them, with
+    /// the loudness measurements' run flags and reset epochs
+    /// ([`mix::loudness`]); none without an engine's wiring.
     fn targets(&self) -> Option<Targets> {
         let mut t = self.derived.as_ref()?.targets().clone();
         self.overlay(&mut t);
+        mix::loudness(self.shape(), self.state(), &mut t);
         Some(t)
     }
 
@@ -1879,12 +1883,15 @@ impl Product for Mixer {
         }
     }
 
-    /// XXH3 over [`DERIVATION_VERSION`], the shape, the declared consoles
-    /// and the wiring: what [`Product::apply`], [`Product::load`] and
-    /// [`Product::targets`] read besides the state.
+    /// XXH3 over the shape, the declared consoles and the wiring: what
+    /// [`Product::apply`], [`Product::load`] and [`Product::targets`] read
+    /// besides the state.
     fn config_hash(&self) -> u64 {
         let config = json!({
-            "derivation": DERIVATION_VERSION,
+            // Frozen: this input never moves, so a release keeps the
+            // hash. A derivation change raises
+            // Product::DERIVATION_VERSION instead.
+            "derivation": 4,
             "shape": self.shape,
             "consoles": self.declared,
             "wiring": self.wiring,
@@ -4485,9 +4492,8 @@ mod tests {
         assert_eq!(m.targets().unwrap().flows, flows(&["a1", "a2", "a3"]));
     }
 
-    /// The configuration hash follows the shape, the declared consoles,
-    /// each input's flows and domain, and the derivation version, and
-    /// not the state.
+    /// The configuration hash follows the shape, the declared consoles
+    /// and each input's flows and domain, and not the state.
     #[test]
     fn the_config_hash_covers_the_configuration_alone() {
         let mut m = wired();
@@ -4504,16 +4510,15 @@ mod tests {
         let other = Mixer::configured(m.shape().clone(), vec![desk("x", "X")], m.wiring.clone());
         assert_ne!(other.config_hash(), hash, "a declared console");
         assert_ne!(mixer().config_hash(), hash, "the shape and wiring");
-        let config = json!({
-            "derivation": DERIVATION_VERSION + 1,
-            "shape": m.shape,
-            "consoles": m.declared,
-            "wiring": m.wiring,
-        });
-        assert_ne!(
-            xxhash_rust::xxh3::xxh3_64(config.to_string().as_bytes()),
-            hash
-        );
+    }
+
+    /// Replicas share a set only at one configuration hash, so a release
+    /// that moved it for an unchanged configuration could not roll into
+    /// a running set: the hash of a fixed configuration is pinned. A
+    /// derivation change raises Product::DERIVATION_VERSION, never this.
+    #[test]
+    fn the_config_hash_of_a_fixed_configuration_never_moves() {
+        assert_eq!(wired().config_hash(), 1_102_375_237_759_052_186);
     }
 
     /// A snapshot carries its format: a binary that reads the earlier
