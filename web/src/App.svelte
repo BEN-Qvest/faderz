@@ -14,6 +14,7 @@
   import Consoles from './components/Consoles.svelte';
   import StatusBar from './components/StatusBar.svelte';
   import AheadBanner from './components/AheadBanner.svelte';
+  import NewVersionNotice from './components/NewVersionNotice.svelte';
   import { tip } from './lib/tip';
   import NoticeLine from './components/NoticeLine.svelte';
   import LockKey from './components/LockKey.svelte';
@@ -122,6 +123,7 @@
       </div>
       <span class="sep" aria-hidden="true"></span>
       <div class="group controls" role="group" aria-label="Controls">
+        <NewVersionNotice />
         <Users />
         <LockKey />
         <Account />
