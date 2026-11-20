@@ -55,14 +55,14 @@ mutes, bus and aux polarity, mix-minus exclusions and talkback
 interrupts, the monitor's source, channel and VCA PFL and AFL listening
 (PFL over AFL; PFL centred before the pan, AFL at the pan before the AFV
 stage), fold-down, image, level, dim, talkback dim, cut, mono and speaker mutes
-and solos, duck groups, the channel delay, and the bus and aux true-peak
-limiter on every output carrying that bus or aux. An output carrying a bus or aux is
+and solos, duck groups, the channel delay, the bus and aux true-peak
+limiter on every output carrying that bus or aux, and the scene crossfade. An output carrying a bus or aux is
 late by the limiter's look-ahead, 53 samples (about 1.1 ms at 48 kHz), whether
 the limiter is on or off, so that turning it on needs no restart; an
 output carrying a mix-minus, a direct out or the monitor is not. The rest of the state is kept, shown and replicated but not
 applied to the audio in this version: bus and aux EQ,
-dynamics and delay, the line-up tone, the AFV rise, hold and fall
-times, and the scene crossfade time.
+dynamics and delay, the line-up tone, and the AFV rise, hold and fall
+times.
 
 A channel delays its input by its `delay`, in samples, exactly, for lip
 sync: opt-in per channel through `mxl.inputs.<channel>.maxDelayMs`, the
@@ -194,9 +194,38 @@ whether it is engaged.
 ![The duck tiles over the masters, Commentary held by an operator and Remote comm latched on, and beside them a line per group with what it lowers, its gain reduction and its key level](docs/screenshots/duck-tiles.png)
 
 Scenes are stored and recalled from the SCENES view; recall-safe groups
-keep chosen parameters of a channel out of every recall. The view's note
-on crossfading describes the contract's recall; the engine takes a recall
-at once, without the crossfade.
+keep chosen parameters of a channel out of every recall. The state takes
+a recalled scene at once. With a crossfade time, every gain the recall
+changes (faders, mutes as a fade to or from silence, pans, routes,
+sends, VCAs) ramps linearly from the value it has to the scene's over
+that time; with 0 the recall is a cut, each gain ramping over the
+engine's ramp length (`engine.rampSamples`) as on any other write.
+Strip settings, inputs and duck settings change as on any other write.
+The replica that takes the recall writes the sample index the fade
+starts at into the replicated log: past its receipt by the longest lead
+the log stamps a command with, the top of `replica.maxApplyLeadMs` plus
+samplez's `EXTRA_LEAD`, so the whole fade plays and every replica of a
+set fades alike.
+
+A recall whose entry applies after its fade start, such as one that
+switches inputs and waits for an engine generation, does not play the
+part of the fade already past: each gain steps by that elapsed share of
+its swing, and one applied after the fade's end steps to the scene's
+value. A recall that re-routes can therefore click by most of its swing.
+A recall during a running fade has the same limit at the other end: each
+gain it changes still fading starts its new fade from where the running
+fade will be at the new fade's start, and holds that value from the
+index the recall applies at until then, so it steps there by the
+running fade's progress over that gap (up to the lead). The recall's
+apply index does not reach the product's derivation, which would let
+the new fade start there. Both hold until the engine ramps a gain
+joining a fade from its held value.
+
+During a fade, a write that moves a fading gain, such as a fader move,
+ends that gain's fade: the gain ramps from where the fade has got to,
+over the ramp length, to its new value. A new recall fades each gain it
+changes from where that gain is, over its own crossfade time, or cuts
+it with 0. A gain neither moves keeps fading.
 
 ![The SCENES view with six scenes, the current one marked, and the recall-safe grid](docs/screenshots/scenes.png)
 

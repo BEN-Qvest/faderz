@@ -276,7 +276,18 @@ paths:
       description: |
         Applies the scene to every control, owned ones included, except the
         recall-safe parameter groups. The state takes the scene values at
-        once; the audio crossfades over crossfadeMs from atIndex.
+        once. Every gain the recall changes ramps linearly to its new value
+        over crossfadeMs, from a sample index the receiving replica writes
+        into the log, past its receipt by the top of maxApplyLeadMs plus
+        samplez's EXTRA_LEAD; 0 is a cut, each gain ramping over the
+        engine's ramp length. A later write that moves a fading gain ends
+        its fade. A recall applied after its fade start, such as one that
+        switches inputs, steps each gain by the share of the fade already
+        past, and to the scene's value once the fade has ended. A recall
+        during a running fade starts each still-fading gain's new fade from
+        where the running fade will be at the new start, so that gain steps
+        by the running fade's progress between the apply index and the new
+        start.
       parameters:
         - $ref: "#/components/parameters/RequestHeader"
       requestBody:

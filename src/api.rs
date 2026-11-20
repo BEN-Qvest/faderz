@@ -23,9 +23,10 @@ use serde_json::{Value, json};
 
 use crate::app::{App, now_rfc3339, uuid};
 use crate::contract::{Contract, check, contract};
+use crate::replica::tai_samples;
 use crate::shape::Shape;
 use crate::state::{
-    Answer, Command, Console, ConsolePut, Write, default_protocol, default_strips,
+    Answer, Command, Console, ConsolePut, Crossfade, Write, default_protocol, default_strips,
     default_transport,
 };
 
@@ -391,10 +392,18 @@ async fn recall_scene(
             ));
         }
         let owner = owner(identity.map(|Extension(i)| i));
+        // tai_samples counts at replica::RATE, the one rate the model's
+        // Shape.sampleRate allows, so it and the shape's rate agree.
+        let rate = u64::from(app.with_state(|sm| sm.product.shape().sample_rate));
+        let fade = (b.crossfade_ms > 0).then(|| Crossfade {
+            start: tai_samples() + crate::state::crossfade_lead(rate),
+            len: (u64::from(b.crossfade_ms) * rate / 1000) as u32,
+        });
         let command = Command::Recall {
             id: b.command_id.clone(),
             scene,
             at: now_rfc3339(),
+            fade,
         };
         let ack = run(&app, &owner, &b.command_id, command).await?;
         let mut body = result(&app, &ack, true).await;
