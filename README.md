@@ -49,7 +49,7 @@ built into the binary and the control-surface bridge both speak.
 
 The engine applies the channel strip (trim, leg trim, polarity,
 high-pass, EQ, gate, compressor), faders, mutes, VCA offsets and mutes,
-AFV open and closed with the off level, mono pan, surround pan (a mono channel in the field of a 5.1 or 7.1 bus), stereo balance
+AFV open and closed with the off level and its rise, hold and fall, mono pan, surround pan (a mono channel in the field of a 5.1 or 7.1 bus), stereo balance
 and image, and the fold-down of wider channels, bus routing, sends, the bus, aux and mix-minus faders and
 mutes, bus and aux polarity, mix-minus exclusions and talkback
 interrupts, the monitor's source, channel and VCA PFL and AFL listening
@@ -61,8 +61,7 @@ late by the limiter's look-ahead, 53 samples (about 1.1 ms at 48 kHz), whether
 the limiter is on or off, so that turning it on needs no restart; an
 output carrying a mix-minus, a direct out or the monitor is not. The rest of the state is kept, shown and replicated but not
 applied to the audio in this version: bus and aux EQ,
-dynamics and delay, and the AFV rise, hold and fall
-times.
+dynamics and delay.
 
 A channel delays its input by its `delay`, in samples, exactly, for lip
 sync: opt-in per channel through `mxl.inputs.<channel>.maxDelayMs`, the
@@ -203,6 +202,23 @@ exclusions.
 The AFV view shows the tally the vision switcher reports and which
 channels follow which camera.
 
+A tally that opens a channel's AFV stage, its source on programme,
+ramps the stage's gains linearly to 0 dB over `riseMs`; one that closes
+it, its source on preview or off, holds them for `holdMs` and then
+ramps them to `offLevel` over `fallMs`. A tally carrying `transitionMs`
+takes it in place of `riseMs` and `fallMs` for every stage it moves,
+the hold kept. The replica that takes the tally writes the sample index
+the transition starts at into the replicated log: the tally's
+`atIndex`, else its `at` read as TAI, else its receipt plus the lead a
+scene crossfade takes, so every replica of a set fades alike.
+`PUT /api/v1/afv/tally` takes that lead. A tally whose index is already
+past at its receipt counts in `afv_late_total` and does not play the
+part of its transition already past: each gain steps to where its fade
+has got to, as a late recall does. A fader move during the transition
+ends the fade of the gains it moves, and a recall fades from where the
+transition has got to, as during a crossfade. A tally more than 60 s
+ahead is refused.
+
 ![The AFV view with CAM1 on programme and CAM2 on preview, and the channels following them](docs/screenshots/afv-tally.png)
 
 Duck groups lower ambience and music under commentary. The DUCK view
@@ -270,7 +286,8 @@ selected. The ENGINE lamp in the status bar opens the engine's counters
 of the replica serving the screen, each under a name for people with an
 (i) that explains it, and shows WARN while a counter whose rise is a
 fault (a late output block, a lost input block, a late change) rose in
-the last 10 s. An input that delivers nothing usable is named on the
+the last 10 s. A late tally (`afv_late_total`) is the switcher's fault,
+not the replica's, and lights no lamp. An input that delivers nothing usable is named on the
 lamp and in the counters with the reason: its flow stopped, the set
 took it down, or its blocks came late. The names and explanations are
 those of `api/ws/counters.schema.json`.
