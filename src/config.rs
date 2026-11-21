@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 
 use crate::contract::{check, contract};
 use crate::mix::Wiring;
-use crate::shape::{Shape, loudness_channels};
+use crate::shape::{ChannelTone, Shape, loudness_channels};
 use crate::state::Console;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,7 +93,8 @@ pub struct Mxl {
     #[serde(default = "default_library_path")]
     pub library_path: PathBuf,
     pub domains: Vec<Domain>,
-    /// The flows each channel reads, by channel id; every channel has one.
+    /// Each channel's input, by channel id: the flows it reads, or a tone
+    /// generator; every channel has one.
     pub inputs: BTreeMap<String, Input>,
     /// The flows each output of the shape writes, by output id; every
     /// output has them.
@@ -204,8 +205,14 @@ const MAX_HEARTBEAT_S: u64 = 10;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Input {
-    /// The flow of input a.
-    pub flow: String,
+    /// The flow of input a; required but for a tone input.
+    #[serde(default)]
+    pub flow: Option<String>,
+    /// Makes the channel's input a line-up tone generator in place of a
+    /// flow: it reads none, so it takes no `flow`, `altFlow`, `domain`
+    /// or `channels`, and has no NMOS receiver.
+    #[serde(default)]
+    pub tone: Option<ToneInput>,
     /// The flow of input b; required exactly for a channel with
     /// `altInput`.
     #[serde(default)]
@@ -230,6 +237,18 @@ pub struct Input {
     /// and counts against `engine.delayBudgetSamples`.
     #[serde(default)]
     pub max_delay_ms: Option<f64>,
+}
+
+/// `mxl.inputs.<channel>.tone`: the frequency and level the generator
+/// starts at, within samplez's ranges (`samplez_dsp::TONE_FREQUENCY_HZ`,
+/// `samplez_dsp::TONE_LEVEL_DB`); absent, samplez's 1 kHz at -18 dBFS.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToneInput {
+    #[serde(default)]
+    pub frequency: Option<u32>,
+    #[serde(default)]
+    pub level: Option<f64>,
 }
 
 /// The highest flow channel `mxl.inputs.<channel>.channels` may name:
@@ -854,16 +873,28 @@ impl Config {
         let revision = env(REVISION_ENV).filter(|r| !r.is_empty());
         config.set = config.replica.set(&name, env_marker, revision)?;
         config.delay_lines(&mut shape)?;
+        config.tone_inputs(&mut shape)?;
         config.audio = config.audio(&shape)?;
         if let (Some(engine), Some(mxl)) = (&config.audio, &config.mxl) {
             config.wiring = (shape.channels.iter().zip(&engine.inputs))
-                .map(|(c, input)| Wiring {
-                    a: input
-                        .flow_id
-                        .clone()
-                        .expect("every configured input names a flow"),
-                    b: mxl.inputs[&c.id].alt_flow.clone(),
-                    domain: input.domain.clone(),
+                .map(|(c, input)| match input.tone {
+                    // Reads no flow: names none ([`crate::mix::selected`]).
+                    Some(_) => Wiring {
+                        a: String::new(),
+                        b: None,
+                        domain: String::new(),
+                    },
+                    None => Wiring {
+                        a: input
+                            .flow_id
+                            .clone()
+                            .expect("every configured flow input names a flow"),
+                        b: mxl.inputs[&c.id].alt_flow.clone(),
+                        domain: input
+                            .domain
+                            .clone()
+                            .expect("every configured flow input names a domain"),
+                    },
                 })
                 .collect();
         }
@@ -1074,6 +1105,49 @@ impl Config {
         Ok(())
     }
 
+    /// Sets each tone channel's `tone` in `shape` from
+    /// `mxl.inputs.<id>.tone`: the frequency and level its generator
+    /// starts at, samplez's where none is given, and refuses one outside
+    /// samplez's ranges.
+    fn tone_inputs(&self, shape: &mut Shape) -> Result<(), String> {
+        if let Some(c) = shape.channels.iter().find(|c| c.tone.is_some()) {
+            return Err(format!(
+                "shape: channel {} tone: set by mxl.inputs.{}.tone",
+                c.id, c.id
+            ));
+        }
+        let Some(mxl) = &self.mxl else {
+            return Ok(());
+        };
+        let start = samplez_dsp::ToneParams::DEFAULT;
+        let hz = samplez_dsp::TONE_FREQUENCY_HZ;
+        let db = samplez_dsp::TONE_LEVEL_DB;
+        let (low, high) = (f64::from(*db.start()), f64::from(*db.end()));
+        for c in &mut shape.channels {
+            let Some(tone) = mxl.inputs.get(&c.id).and_then(|i| i.tone.as_ref()) else {
+                continue;
+            };
+            let frequency = tone.frequency.unwrap_or(start.frequency_hz);
+            if !hz.contains(&frequency) {
+                return Err(format!(
+                    "mxl.inputs.{}.tone.frequency {frequency}: not in {}..={} Hz",
+                    c.id,
+                    hz.start(),
+                    hz.end()
+                ));
+            }
+            let level = tone.level.unwrap_or(f64::from(start.level_db));
+            if !(low..=high).contains(&level) {
+                return Err(format!(
+                    "mxl.inputs.{}.tone.level {level}: not in {low}..={high} dBFS",
+                    c.id
+                ));
+            }
+            c.tone = Some(ChannelTone { frequency, level });
+        }
+        Ok(())
+    }
+
     /// Appends each channel's flow channel selection to its `source`
     /// label, or makes it the label.
     fn label_sources(&self, shape: &mut Shape) -> Result<(), String> {
@@ -1129,7 +1203,9 @@ impl Config {
     }
 
     /// The engine configuration of the `mxl` section, with a matrix of
-    /// zeros: one input per channel reading its flow of input a, one
+    /// zeros: one input per channel reading its flow of input a, or a tone
+    /// generator, then the line-up tone's generators
+    /// ([`crate::mix::tone_widths`]), one
     /// output per output of the shape writing this replica's flow
     /// ([`Config::member_flows`]), one meter per bus, aux,
     /// mix-minus and monitor output no full-width output carries, and the columns a
@@ -1156,6 +1232,31 @@ impl Config {
         for c in &shape.channels {
             let at = format!("mxl.inputs.{}", c.id);
             let input = mxl.inputs.get(&c.id).ok_or(format!("{at}: missing"))?;
+            if input.tone.is_some() {
+                let given = [
+                    ("flow", input.flow.is_some()),
+                    ("altFlow", input.alt_flow.is_some()),
+                    ("domain", input.domain.is_some()),
+                    ("channels", input.channels.is_some()),
+                ];
+                if let Some((key, _)) = given.iter().find(|(_, given)| *given) {
+                    return Err(format!("{at}.{key}: a tone input reads no flow"));
+                }
+                if c.alt_input {
+                    return Err(format!(
+                        "{at}.tone: the channel has altInput, a tone input has no input b"
+                    ));
+                }
+                inputs.push(json!({
+                    "name": c.id,
+                    "tone": {},
+                    "channels": c.width,
+                    "loudnessChannels": loudness_channels(&c.layout),
+                    "maxDelaySamples": c.max_delay.unwrap_or(0),
+                }));
+                continue;
+            }
+            let flow = (input.flow.as_ref()).ok_or(format!("{at}.flow: required without tone"))?;
             match (&input.alt_flow, c.alt_input) {
                 (Some(_), false) => {
                     return Err(format!("{at}.altFlow: the channel has no altInput"));
@@ -1169,7 +1270,7 @@ impl Config {
             let mut engine_input = json!({
                 "name": c.id,
                 "domain": domain(at.clone(), &input.domain)?,
-                "flowId": input.flow,
+                "flowId": flow,
                 "channels": c.width,
                 "loudnessChannels": loudness_channels(&c.layout),
                 "maxDelaySamples": c.max_delay.unwrap_or(0),
@@ -1190,6 +1291,13 @@ impl Config {
                 engine_input["flowChannels"] = legs.iter().map(|n| n - 1).collect();
             }
             inputs.push(engine_input);
+        }
+        for width in crate::mix::tone_widths(shape) {
+            inputs.push(json!({
+                "name": crate::mix::tone_input(width),
+                "tone": {},
+                "channels": width,
+            }));
         }
         let mut outputs = Vec::new();
         // Per output, the flow of each ordinal.
@@ -1212,7 +1320,7 @@ impl Config {
         // Inputs may share a flow; an output's flow is written by this
         // engine alone.
         let read: std::collections::BTreeSet<&str> = (mxl.inputs.values())
-            .flat_map(|i| std::iter::once(&i.flow).chain(&i.alt_flow))
+            .flat_map(|i| i.flow.iter().chain(&i.alt_flow))
             .map(String::as_str)
             .collect();
         let mut written = std::collections::BTreeSet::new();
@@ -1250,7 +1358,9 @@ impl Config {
         {
             return Err(format!("mxl.outputs.{id}: not an output of the shape"));
         }
-        let rows: usize = shape.channels.iter().map(|c| c.width).sum();
+        let rows: usize = (shape.channels.iter().map(|c| c.width))
+            .chain(crate::mix::tone_widths(shape))
+            .sum();
         let columns: usize = (shape.outputs.iter().map(|o| o.width))
             .chain(shape.meter_columns().iter().map(|m| m.1))
             .sum();
@@ -1793,6 +1903,148 @@ mod tests {
         assert!(e.contains("replica.name"), "{e}");
     }
 
+    /// A channel's input configured `tone` is a samplez tone generator:
+    /// no flow, no domain, even beside two domains, and wired to no flow;
+    /// the shape carries the frequency and level it starts at, samplez's
+    /// 1 kHz at -18 dBFS unless given, and the initial state its tone. A
+    /// flow, input b, a domain or a flow channel selection beside it is
+    /// refused, as are start values outside samplez's ranges, a channel
+    /// with altInput, a channel with neither flow nor tone, and a shape
+    /// that sets `tone` itself.
+    #[test]
+    fn a_tone_input_reads_no_flow() {
+        let id = |n: u8| format!("00000000-0000-4000-8000-00000000000{n}");
+        let config = |st1: Value, domains: Value| {
+            json!({
+                "replica": { "name": "r1" },
+                "shape": small(),
+                "mxl": {
+                    "domains": domains,
+                    "inputs": {
+                        "ch1": { "flow": id(1), "altFlow": id(5), "domain": "d" },
+                        "ch2": { "flow": id(2), "domain": "d" },
+                        "st1": st1,
+                    },
+                    "outputs": { "out-pgm": { "flow": id(4), "domain": "d" } },
+                },
+            })
+            .to_string()
+        };
+        let two = json!([
+            { "name": "d", "path": "/dev/shm/d" },
+            { "name": "e", "path": "/dev/shm/e" },
+        ]);
+        let parse = |st1: Value| Config::parse(&config(st1, two.clone()), || unreachable!());
+
+        let (c, shape, _) = parse(json!({ "tone": {} })).unwrap();
+        let engine = c.audio.as_ref().unwrap();
+        assert!(engine.inputs[2].tone.is_some());
+        assert_eq!(
+            (&engine.inputs[2].flow_id, &engine.inputs[2].domain),
+            (&None, &None)
+        );
+        assert!(engine.inputs[..2].iter().all(|i| i.tone.is_none()));
+        assert_eq!(
+            c.wiring[2],
+            Wiring {
+                a: String::new(),
+                b: None,
+                domain: String::new(),
+            }
+        );
+        let start = samplez_dsp::ToneParams::DEFAULT;
+        assert_eq!(
+            shape.channels[2].tone,
+            Some(ChannelTone {
+                frequency: start.frequency_hz,
+                level: f64::from(start.level_db),
+            })
+        );
+        assert_eq!(shape.channels[0].tone, None);
+        let state = shape.initial_state();
+        assert_eq!(
+            state["channels"]["st1"]["tone"],
+            json!({ "frequency": 1000, "level": -18.0, "ident": false })
+        );
+        assert!(state["channels"]["ch1"].get("tone").is_none());
+
+        let (_, shape, _) = parse(json!({ "tone": { "frequency": 440, "level": -20.5 } })).unwrap();
+        assert_eq!(
+            shape.channels[2].tone,
+            Some(ChannelTone {
+                frequency: 440,
+                level: -20.5,
+            })
+        );
+        // The ends of samplez's ranges are taken.
+        for (frequency, level) in [(20, -60.0), (20_000, 0.0)] {
+            let tone = json!({ "tone": { "frequency": frequency, "level": level } });
+            parse(tone).unwrap();
+        }
+
+        for key in ["flow", "altFlow", "domain", "channels"] {
+            let value = if key == "channels" {
+                json!([1, 2])
+            } else if key == "domain" {
+                json!("d")
+            } else {
+                json!(id(6))
+            };
+            let mut st1 = json!({ "tone": {} });
+            st1[key] = value;
+            let e = parse(st1).unwrap_err();
+            assert_eq!(
+                e,
+                format!("mxl.inputs.st1.{key}: a tone input reads no flow")
+            );
+        }
+        for (tone, refused) in [
+            (json!({ "frequency": 19 }), "frequency 19"),
+            (json!({ "frequency": 20_001 }), "frequency 20001"),
+            (json!({ "level": 0.001 }), "level 0.001"),
+            (json!({ "level": -60.001 }), "level -60.001"),
+        ] {
+            let e = parse(json!({ "tone": tone })).unwrap_err();
+            assert!(
+                e.starts_with(&format!("mxl.inputs.st1.tone.{refused}: not in")),
+                "{e}"
+            );
+        }
+        assert!(parse(json!({ "tone": { "ident": true } })).is_err());
+        let e = parse(json!({})).unwrap_err();
+        assert!(
+            e.contains("mxl.inputs.st1.flow: required without tone"),
+            "{e}"
+        );
+
+        let mut alt = json!({
+            "replica": { "name": "r1" },
+            "shape": small(),
+            "mxl": {
+                "domains": [{ "name": "d", "path": "/dev/shm/d" }],
+                "inputs": {
+                    "ch1": { "tone": {} },
+                    "ch2": { "flow": id(2) },
+                    "st1": { "flow": id(3) },
+                },
+                "outputs": { "out-pgm": { "flow": id(4) } },
+            },
+        });
+        let e = Config::parse(&alt.to_string(), || unreachable!()).unwrap_err();
+        assert!(
+            e.contains("mxl.inputs.ch1.tone: the channel has altInput"),
+            "{e}"
+        );
+        alt["shape"]["channels"][0]["altInput"] = json!(false);
+        Config::parse(&alt.to_string(), || unreachable!()).unwrap();
+        alt["shape"]["channels"][1]["tone"] = json!({ "frequency": 1000, "level": -18 });
+        let e = Config::parse(&alt.to_string(), || unreachable!()).unwrap_err();
+        assert!(
+            e.contains("channel ch2 tone: set by mxl.inputs.ch2.tone"),
+            "{e}"
+        );
+    }
+
     /// Every channel the state lets select input b has a flow for it.
     #[test]
     fn an_alt_input_needs_an_alt_flow() {
@@ -1885,7 +2137,9 @@ mod tests {
         let engine: Vec<u32> = (c.audio.unwrap().inputs.iter())
             .map(|i| i.max_delay_samples)
             .collect();
-        assert_eq!(engine, [960, 0, 240_000]);
+        // The line-up tone's mono and stereo inputs last, which have no
+        // line.
+        assert_eq!(engine, [960, 0, 240_000, 0, 0]);
         // 0 is no line.
         let (_, shape, _) =
             Config::parse(&config(json!(0), json!(0), json!({})), || unreachable!()).unwrap();
@@ -2226,6 +2480,39 @@ mod tests {
                 .wiring
                 .is_empty()
         );
+    }
+
+    /// The line-up tone's generators are the engine's last inputs, after
+    /// the channels', one per distinct width of a bus, aux or mix-minus,
+    /// narrowest first and as wide, with no flow; the matrix has their
+    /// rows. They are no channel, so they are wired to nothing.
+    #[test]
+    fn the_line_up_tones_are_the_engines_last_inputs() {
+        let id = |n: u8| format!("00000000-0000-4000-8000-00000000000{n}");
+        let config = json!({
+            "replica": { "name": "r1" },
+            "shape": small(),
+            "mxl": {
+                "domains": [{ "name": "d", "path": "/dev/shm/d" }],
+                "inputs": { "ch1": { "flow": id(1), "altFlow": id(5) },
+                            "ch2": { "flow": id(2) }, "st1": { "flow": id(3) } },
+                "outputs": { "out-pgm": { "flow": id(4) } },
+            },
+        });
+        let (c, shape, _) = Config::parse(&config.to_string(), || unreachable!()).unwrap();
+        let engine = c.audio.as_ref().unwrap();
+        let names: Vec<&str> = engine.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["ch1", "ch2", "st1", "/tone/1", "/tone/2"]);
+        for (tone, width) in engine.inputs[3..].iter().zip([1, 2]) {
+            assert!(tone.tone.is_some() && tone.flow_id.is_none() && tone.domain.is_none());
+            assert_eq!(tone.channels, width, "aux1 is mono, pgm, cf and mm1 stereo");
+        }
+        assert_eq!(
+            engine.matrix.len(),
+            4 + 1 + 2,
+            "the channels' legs, then the tones'"
+        );
+        assert_eq!(c.wiring.len(), shape.channels.len());
     }
 
     /// `replica.maxApplyLeadMs` is 50 unless set, and is taken from 30 to

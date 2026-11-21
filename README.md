@@ -42,7 +42,7 @@ built into the binary and the control-surface bridge both speak.
   failover between them
 - Hardware control surfaces through `faderz-bridge` (Mackie Control over
   USB-MIDI or RTP-MIDI)
-- NMOS: each channel's input an IS-04 receiver and each output a sender,
+- NMOS: each channel's flow input an IS-04 receiver and each output a sender,
   connected over MXL through IS-05 per AMWA BCP-007-03
 - `/healthz`, `/readyz` and Prometheus `/metrics`; a container image and
   a release binary
@@ -61,7 +61,7 @@ late by the limiter's look-ahead, 53 samples (about 1.1 ms at 48 kHz), whether
 the limiter is on or off, so that turning it on needs no restart; an
 output carrying a mix-minus, a direct out or the monitor is not. The rest of the state is kept, shown and replicated but not
 applied to the audio in this version: bus and aux EQ,
-dynamics and delay, the line-up tone, and the AFV rise, hold and fall
+dynamics and delay, and the AFV rise, hold and fall
 times.
 
 A channel delays its input by its `delay`, in samples, exactly, for lip
@@ -80,6 +80,41 @@ Once a channel has a line, a snapshot carries it as the shape's
 `maxDelay`, and a recall that set a delay to 0 carries its answer;
 faderz 0.4.9 and earlier read neither. Rolling back to such a release
 needs the data volume cleared.
+
+A channel whose input is configured `tone` in place of a `flow` plays
+samplez's line-up tone generator: a sine of whole hertz at a sample-peak
+level on every leg, which the channel's strip, delay, fader and routing
+take as any input's. It reads no flow, so it takes no `flow`, `altFlow`,
+`domain` or `channels`, its channel has no `altInput`, and it has no
+NMOS receiver. `tone: {}` starts it at 1 kHz and -18 dBFS; `frequency`,
+20 to 20000 Hz, and `level`, -60 to 0 dBFS, start it elsewhere. The
+shape gives such a channel `tone`, the values it starts at, and its
+state `tone`, written at `/channels/<channel>/tone/frequency`, `level`
+and `ident`: a level or ident change ramps over `engine.rampSamples`, a
+frequency change crossfades over as long, and a value outside its range
+is refused, never clamped. With `ident` the tone stops on one leg at a
+time in leg order, for 250 ms each, then sounds on every leg for
+250 ms. A scene recall leaves the tone as it is. A snapshot of a state
+with a tone channel carries the shape's `tone`, which faderz 0.4.9 and
+earlier do not read either.
+
+The line-up tone (`/tone`) is a 1 kHz sine at `level`, -30 to 0 dBFS
+sample peak, on every leg. While `on`, each output whose bus, aux or
+mix-minus is in `targets` carries the tone in place of its mix, after
+the element's fader and before the output's limiter, so the fader does
+not scale it and the limiter still applies; an output narrower than its
+element carries the tone's first legs. The element's meters show the
+tone, and a monitor playing the element plays the tone as it plays a
+source, through its own level, dim, downmix, mono and speaker controls;
+while a channel or VCA solos, the monitor plays the listen sum. Off, or
+for an element not in `targets`, the mix is as without it. Turning it
+on or off, a target and a level change ramp over `engine.rampSamples`
+as a gain does. With `ident` the tone stops on one of the target's legs
+at a time in layout order, for 250 ms each, then sounds on every leg
+for 250 ms: a stereo target cuts L, then R, a 5.1 target each of its
+six legs. Each distinct width of a bus, aux or mix-minus has a generator
+of that many legs, an engine input of its own that is no channel and
+has no NMOS receiver, and each target plays the one as wide as it is.
 
 A mix-minus carrying its talkback is never ducked: its duck masks, and
 those of a monitor playing it, are lifted until the interrupt is
@@ -383,7 +418,7 @@ variable; the flag wins over the variable, the variable over the file.
 | `consoles` | `[]` | consoles known before any registers: `id`, `name`, `protocol` (`mcu`), `transport` (`bridge`), `strips` (8) |
 | `mxl.libraryPath` | `/opt/mxl/lib/libmxl.so` | libmxl, loaded at start |
 | `mxl.domains` | | `[{name, path, id}]`: the mounted MXL domains; `id`, the domain's MXL id, for NMOS when the domain has no `domain_def.json` |
-| `mxl.inputs.<channel>` | | `flow`; `altFlow` for a channel with `altInput`; `domain` with more than one domain; `channels`, the 1-based flow channel each leg reads; `maxDelayMs`, the channel's delay line, none by default |
+| `mxl.inputs.<channel>` | | `flow`; `altFlow` for a channel with `altInput`; `domain` with more than one domain; `channels`, the 1-based flow channel each leg reads; `maxDelayMs`, the channel's delay line, none by default; or `tone`, a line-up tone generator in place of a flow, `{}` or the `frequency` and `level` it starts at |
 | `mxl.outputs.<output>` | | `flow` in a set of one; `flows`, one member flow per replica by ordinal, in a set of more; `domain` with more than one domain; `mergedFlow`, the flow merging the member flows, which the NMOS sender names, in a set of more with `nmos.enabled` |
 | `engine.sampleRate` | `48000` | |
 | `engine.blockSize` | `48` | samples per block |
@@ -494,13 +529,13 @@ differ is withdrawn and resynced from another replica's engine core.
   from the state it applied once its clock is verified; it commits its
   outputs once its pages match the others'. A replica restarted on its
   volume catches up the same way.
-- An input the engine prunes is written to the log as down, and one
-  readable again as up, so every replica silences and raises it at the
-  same index. Only the leader orders these entries: a report made
-  while following, or lost to an election, is appended again once the
-  replica leads while the log does not hold it, after the write timeout
-  and then at doubling intervals up to four times it; a later report on
-  the same input replaces it.
+- An input goes down in the log once more than half of the set's audio
+  voters read it unreadable for `engine.pruneAfterBlocks` blocks, and up
+  once more than half read it again; the leader appends the entry, so
+  every replica silences and raises it at the same index. An input late
+  on one node alone, the leader's included, goes down nowhere: that
+  replica reads silence, diverges and withholds while the others
+  serve. Without such a majority the input stays as the log has it.
 - A command that switches an input is ordered alone and stamped later
   by the longest time a replica reports for building an input
   generation; the commands ordered after it take effect no earlier. One
@@ -578,16 +613,21 @@ ready and, in a set of one, the engine plays the state.
 - A set of one with an `mxl` section: both pass once the engine runs.
 - A set of one without an `mxl` section: both answer 503.
 - A set of more than one replica with an `mxl` section: `/healthz` passes
-  while the engine runs, with or without a core. `/readyz` passes once
-  the replica has joined and caught up and commits its outputs, or while
-  no other replica in contact with it commits. A replica with outputs
-  fails it while diverged, resyncing or of another compatibility key
-  than the set's baseline, and while withdrawn once the set applied its
-  first baseline: such a replica writes none of what it computes.
-  Before that first baseline a withdrawn replica passes, so the first
-  replicas of a new set turn ready. A learner is never ready. The set's
-  only voter is ready once it has joined and caught up, whatever its
-  state.
+  while the engine runs, with or without a core. `/readyz` follows
+  committing. A process that has committed since it started passes
+  while it or another audio replica commits, in any state. One that has
+  not committed since it started passes once it commits, except a pod
+  below the baseline's versions, which passes while another commits.
+  While no replica commits, every one fails, but a withdrawn replica
+  with no output enabled passes. Out of contact a replica keeps its last
+  `/readyz` value for `rollout::DEPARTED` (3 s), then passes only while
+  it commits. The first replica of a new set to commit turns ready; the
+  others each once they commit. The set's only voter passes once it has
+  caught up. A learner is never ready. In
+  a rollout, a new pod waiting for its hand-over fails `/readyz` until it
+  commits; the leader names it without reading readiness. A release
+  that never commits therefore stops the StatefulSet at its first new
+  pod.
 - A set of more than one replica without an `mxl` section: `/readyz`
   follows the replica alone and passes once it has joined and caught up,
   while `/healthz` answers 503. A liveness probe on `/healthz` restarts
@@ -602,8 +642,8 @@ channel input, `faderz_input_attached`,
 ## NMOS
 
 With `nmos.enabled` faderz is one NMOS Node (IS-04 v1.3, IS-05 v1.2,
-AMWA BCP-007-03 for MXL): a Receiver per channel, which is the channel's
-input reader, and a Source, Flow and Sender per output, all with
+AMWA BCP-007-03 for MXL): a Receiver per channel reading a flow, which
+is the channel's input reader, none for a tone channel, and a Source, Flow and Sender per output, all with
 transport `urn:x-nmos:transport:mxl` and 32-bit float audio at 48 kHz.
 The ids derive from `nmos.seed`, so a restart keeps them. Each domain's
 MXL id comes from its `domain_def.json`, else from `mxl.domains[].id`;

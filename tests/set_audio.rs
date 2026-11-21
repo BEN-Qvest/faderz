@@ -81,6 +81,20 @@ struct Set {
     members: Vec<String>,
     /// Each replica's member flow of the mix-minus output.
     mm_members: Vec<String>,
+    /// Per replica, by ordinal, its own copy of the input flows, in a
+    /// domain only it reads as `in`; empty when every replica reads the
+    /// inputs from `domain`.
+    locals: Vec<Local>,
+}
+
+/// One replica's copy of the input flows: the same samples at the same
+/// indices as every other replica's, in a domain of its own, so that one
+/// replica can lose an input alone.
+struct Local {
+    dir: Dir,
+    /// By input, in the order the set was given them; `None` once
+    /// stopped, which deletes the flow.
+    sources: Vec<Option<Source>>,
 }
 
 /// A replica on its own runtime.
@@ -148,7 +162,32 @@ impl Set {
             mm_members,
             ports,
             markers: Arc::default(),
+            locals: Vec::new(),
         };
+        (set, listeners)
+    }
+
+    /// A set of [`shape`] whose replicas each read the sines `signals`
+    /// (flow id, amplitude, frequency) from a domain of their own: ch1
+    /// reads the first, ch2 the second as input a and the third as input
+    /// b.
+    fn local(name: &str, signals: &[(String, f32, u64)]) -> (Set, Vec<std::net::TcpListener>) {
+        let inputs = json!({
+            "ch1": { "flow": signals[0].0, "domain": "in" },
+            "ch2": { "flow": signals[1].0, "altFlow": signals[2].0, "domain": "in" },
+        });
+        let (mut set, listeners) = Set::with(name, shape(), &["out-pgm", "out-mm"], |_| {
+            (Vec::new(), inputs)
+        });
+        set.locals = (0..REPLICAS)
+            .map(|n| {
+                let dir = domain(&format!("set-{name}-in-{n}"));
+                let sources = (signals.iter())
+                    .map(|(id, amp, freq)| Some(Source::sine(&dir.0, id, *amp, *freq)))
+                    .collect();
+                Local { dir, sources }
+            })
+            .collect();
         (set, listeners)
     }
 
@@ -169,6 +208,14 @@ impl Set {
             .map(|p| format!("localhost:{p}"))
             .collect();
         let api = json!({ "bind": "127.0.0.1", "port": 0 });
+        let mut domains = vec![json!({ "name": "d", "path": self.domain.0 })];
+        let mut outputs = self.outputs.clone();
+        if let Some(local) = self.locals.get(n) {
+            domains.push(json!({ "name": "in", "path": local.dir.0 }));
+            for output in outputs.as_object_mut().unwrap().values_mut() {
+                output["domain"] = json!("d");
+            }
+        }
         let config = json!({
             "listeners": { "api": api, "ops": api, "nmos": api },
             "auth": { "mode": "none" },
@@ -187,9 +234,9 @@ impl Set {
             "shape": self.shape,
             "mxl": {
                 "libraryPath": libmxl(),
-                "domains": [{ "name": "d", "path": self.domain.0 }],
+                "domains": domains,
                 "inputs": self.inputs,
-                "outputs": self.outputs,
+                "outputs": outputs,
             },
             "rt": { "rtCpu": "none" },
         });
@@ -254,6 +301,16 @@ impl Outputs {
         flows: Vec<String>,
         engines: Vec<Weak<Audio>>,
     ) -> (Arc<Outputs>, std::thread::JoinHandle<()>) {
+        Outputs::read_wide(domain, flows, engines, 2)
+    }
+
+    /// [`Outputs::read`] of flows of `channels` legs.
+    fn read_wide(
+        domain: PathBuf,
+        flows: Vec<String>,
+        engines: Vec<Weak<Audio>>,
+        channels: u32,
+    ) -> (Arc<Outputs>, std::thread::JoinHandle<()>) {
         let outputs = Arc::new(Outputs {
             blocks: Mutex::new(vec![BTreeMap::new(); flows.len()]),
             engines: Mutex::new(engines),
@@ -264,12 +321,13 @@ impl Outputs {
             let mut readers: Vec<Option<(Generation, SlotState)>> =
                 flows.iter().map(|_| None).collect();
             let mut next = vec![0u64; flows.len()];
-            let mut buf = vec![0.0f32; 2 * B as usize];
+            let mut buf = vec![0.0f32; channels as usize * B as usize];
             while !out.stop.load(Ordering::Relaxed) {
                 let last = Outputs::now();
                 for (n, flow) in flows.iter().enumerate() {
                     if readers[n].is_none() {
-                        readers[n] = attach(&domain, flow).map(|g| (g, SlotState::default()));
+                        readers[n] =
+                            attach_wide(&domain, flow, channels).map(|g| (g, SlotState::default()));
                     }
                     let Some((generation, state)) = readers[n].as_mut() else {
                         continue;
@@ -1039,6 +1097,128 @@ fn every_replica_lists_the_set_and_a_killed_one_as_down() {
     }
 }
 
+/// The replica that leads the set, as the first running one names it.
+fn leader(nodes: &[Option<Node>]) -> usize {
+    let first = nodes.iter().flatten().next().expect("a running replica");
+    let leader = first.ops("/readyz").1["replica"]["leader"].clone();
+    (0..REPLICAS)
+        .find(|&n| {
+            (nodes[n].as_ref()).is_some_and(|node| node.ops("/readyz").1["replica"]["id"] == leader)
+        })
+        .expect("a leader")
+}
+
+/// Whether replica `node`'s engine holds input `slot` up, as the log has
+/// it.
+fn input_up(node: &Node, slot: usize) -> bool {
+    let audio = node.server.audio.as_ref().unwrap();
+    audio.engine().status().inputs[slot].up
+}
+
+/// An input goes down only once a majority of the set's replicas cannot
+/// read it. The leader alone losing ch1 takes it down nowhere: the other
+/// two keep playing it alike, and the leader, reading silence, falls out
+/// of step and withholds. The two followers losing ch2 take it down on
+/// every replica, the leader that still reads it included. Fails with the
+/// leader appending its own engine's prune and readable reports in place
+/// of the set's decision: ch1 goes down everywhere at once, and ch2,
+/// which the leader's engine still reads, never does.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "three debug-build engines miss their deadlines on a shared host; CI runs it in release"
+)]
+fn an_input_goes_down_only_once_a_majority_loses_it() {
+    let _one = ONE_SET.lock().unwrap_or_else(|e| e.into_inner());
+    let signals = [
+        (new_id(), 0.5, 440),
+        (new_id(), 0.25, 1000),
+        (new_id(), 0.3, 220),
+    ];
+    let (mut set, listeners) = Set::local("liveness", &signals);
+    let nodes: Vec<Option<Node>> = (listeners.into_iter().enumerate())
+        .map(|(n, l)| Some(set.start(n, Some(l))))
+        .collect();
+    for n in 0..REPLICAS {
+        steady(&nodes, n);
+    }
+    let engines = (0..REPLICAS).map(|n| node(&nodes, n).engine()).collect();
+    let (outputs, reader) = Outputs::read(set.domain.0.clone(), set.members.clone(), engines);
+    // ch1 alone on the programme, heard on every replica.
+    let opened = Outputs::now() + 1;
+    write(&nodes, 0, &[("/channels/ch1/fader", json!(0))]);
+    for n in 0..REPLICAS {
+        let heard = until(30, || {
+            (outputs.compare(n, n, opened).levels.last()).is_some_and(|&l| l > -3_000)
+        });
+        assert!(heard, "replica {n} does not play ch1: {}", states(&nodes));
+    }
+
+    let led = leader(&nodes);
+    let others: Vec<usize> = (0..REPLICAS).filter(|&n| n != led).collect();
+    set.locals[led].sources[0] = None;
+    let from = Outputs::now() + 1;
+    let withheld = until(30, || !committing(node(&nodes, led)));
+    assert!(
+        withheld,
+        "the leader reading silence commits on: {}",
+        states(&nodes)
+    );
+    // Two seconds of the followers' programme after the leader lost ch1:
+    // alike, and ch1 in every window.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let c = loop {
+        let c = outputs.compare(others[0], others[1], from);
+        if c.compared >= 2_000 || Instant::now() >= deadline {
+            break c;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(
+        c.compared >= 2_000 && c.differing.is_empty(),
+        "the followers {others:?} did not write alike: {c:?}: {}",
+        states(&nodes)
+    );
+    assert!(
+        !c.levels.is_empty() && c.levels.iter().all(|&l| l > -3_000),
+        "the followers {others:?} lost ch1 with the leader: {c:?}"
+    );
+    for n in 0..REPLICAS {
+        assert!(
+            input_up(node(&nodes, n), 0),
+            "replica {n} holds ch1 down, which only the leader {led} lost: {}",
+            states(&nodes)
+        );
+    }
+
+    // The leader reads ch1 again and comes back.
+    let (id, amp, freq) = &signals[0];
+    set.locals[led].sources[0] = Some(Source::sine(&set.locals[led].dir.0, id, *amp, *freq));
+    for n in 0..REPLICAS {
+        steady(&nodes, n);
+    }
+
+    // Both followers lose ch2's input a.
+    let led = leader(&nodes);
+    let lost: Vec<usize> = (0..REPLICAS).filter(|&n| n != led).collect();
+    for &n in &lost {
+        set.locals[n].sources[1] = None;
+    }
+    for n in 0..REPLICAS {
+        let down = until(30, || !input_up(node(&nodes, n), 1));
+        assert!(
+            down,
+            "replica {n} holds ch2 up, which replicas {lost:?} lost: {}",
+            states(&nodes)
+        );
+    }
+    outputs.stop.store(true, Ordering::Relaxed);
+    reader.join().unwrap();
+    for node in nodes.into_iter().flatten() {
+        node.kill();
+    }
+}
+
 /// Contact runs from each replica's start. The set forms with the first
 /// replica alone and grows by two voters at once: with two of the three
 /// running the first commits alone and the second stays a learner, and
@@ -1442,6 +1622,232 @@ fn every_replica_applies_a_bus_limiter_alike() {
             "limiter enabled {enabled}: tone {amp}, ceiling {ceiling}, read (true peak, alike) {last:?}: {}",
             states(&nodes)
         );
+    }
+}
+
+/// A tone channel's generator is replicated state: through level,
+/// frequency and ident writes sent to each replica in turn, every replica
+/// writes the same bits, and each write moves the programme's level.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "three debug-build engines miss their deadlines on a shared host; CI runs it in release"
+)]
+fn every_replica_plays_a_tone_channel_alike() {
+    let _one = ONE_SET.lock().unwrap_or_else(|e| e.into_inner());
+    let shape = json!({
+        "sampleRate": 48000,
+        "frameRate": { "numerator": 25, "denominator": 1 },
+        "channels": [
+            { "id": "tn", "name": "Tone", "width": 2, "layout": "stereo", "altInput": false },
+        ],
+        "buses": [{ "id": "pgm", "name": "PGM", "kind": "program", "width": 2, "layout": "stereo" }],
+        "auxes": [], "mixMinus": [], "vcas": [], "monitorOutputs": [],
+        "outputs": [
+            { "id": "out-pgm", "name": "PGM", "source": "pgm", "width": 2, "layout": "stereo" },
+        ],
+    });
+    let inputs = json!({ "tn": { "tone": { "frequency": 1000, "level": -12 } } });
+    let (set, listeners) = Set::with("tone", shape, &["out-pgm"], |_| (Vec::new(), inputs));
+    let nodes: Vec<Option<Node>> = (listeners.into_iter().enumerate())
+        .map(|(n, l)| Some(set.start(n, Some(l))))
+        .collect();
+    for n in 0..REPLICAS {
+        steady(&nodes, n);
+    }
+    let engines = (0..REPLICAS).map(|n| node(&nodes, n).engine()).collect();
+    let (outputs, reader) = Outputs::read(set.domain.0.clone(), set.members.clone(), engines);
+    let from = Outputs::now() + 1;
+    write(
+        &nodes,
+        0,
+        &[
+            ("/buses/pgm/fader", json!(0)),
+            ("/channels/tn/fader", json!(0)),
+            ("/channels/tn/routes/pgm", json!(true)),
+        ],
+    );
+    let writes = [
+        ("/channels/tn/tone/level", json!(-6)),
+        ("/channels/tn/tone/frequency", json!(440)),
+        ("/channels/tn/tone/ident", json!(true)),
+        ("/channels/tn/tone/level", json!(-20.5)),
+        ("/channels/tn/tone/ident", json!(false)),
+        ("/channels/tn/tone/frequency", json!(1500)),
+    ];
+    for (i, (path, value)) in writes.into_iter().enumerate() {
+        // Long enough for every replica to play each setting a while.
+        std::thread::sleep(Duration::from_millis(400));
+        write(&nodes, i % REPLICAS, &[(path, value)]);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    for a in 0..REPLICAS {
+        for b in a + 1..REPLICAS {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let c = loop {
+                let c = outputs.compare(a, b, from);
+                if c.compared >= 2_500 || Instant::now() >= deadline {
+                    break c;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            assert!(
+                c.compared >= 2_500 && c.differing.is_empty(),
+                "replicas {a} and {b}: {c:?}: {}",
+                states(&nodes)
+            );
+            // Silence before the fader opens, then the tone at three
+            // levels, half of it while a leg is cut.
+            assert!(c.levels.len() >= 5, "the writes moved nothing: {c:?}");
+            assert!(
+                c.levels.last().is_some_and(|&l| l > -3_000),
+                "no tone: {c:?}"
+            );
+        }
+    }
+    outputs.stop.store(true, Ordering::Relaxed);
+    reader.join().unwrap();
+    for node in nodes.into_iter().flatten() {
+        node.kill();
+    }
+}
+
+/// The line-up tone is replicated state: through `/tone` writes, a fader
+/// move and a monitor source sent to each replica in turn, the
+/// programme, mix-minus, 5.1 clean feed and monitor outputs of every
+/// replica carry the same bits, with the ident of the stereo and the 5.1
+/// generators and the monitor on a target, and the tone is heard at its
+/// level on the programme, the mix-minus and the monitor playing the
+/// programme.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "three debug-build engines miss their deadlines on a shared host; CI runs it in release"
+)]
+fn every_replica_plays_the_line_up_tone_alike() {
+    let _one = ONE_SET.lock().unwrap_or_else(|e| e.into_inner());
+    let shape = json!({
+        "sampleRate": 48000,
+        "frameRate": { "numerator": 25, "denominator": 1 },
+        "channels": [
+            { "id": "ch", "name": "Pres", "width": 1, "layout": "mono", "altInput": false },
+        ],
+        "buses": [
+            { "id": "pgm", "name": "PGM", "kind": "program", "width": 2, "layout": "stereo" },
+            { "id": "s51", "name": "Clean 5.1", "kind": "cleanFeed", "width": 6, "layout": "5.1" },
+        ],
+        "auxes": [], "vcas": [],
+        "monitorOutputs": [{ "id": "mon", "name": "Monitor", "width": 2, "layout": "stereo" }],
+        "mixMinus": [{ "id": "mm1", "name": "N-1", "bus": "pgm", "width": 2, "layout": "stereo" }],
+        "outputs": [
+            { "id": "out-pgm", "name": "PGM", "source": "pgm", "width": 2, "layout": "stereo" },
+            { "id": "out-mm", "name": "N-1", "source": "mm1", "width": 2, "layout": "stereo" },
+            { "id": "out-51", "name": "Clean 5.1", "source": "s51", "width": 6, "layout": "5.1" },
+            { "id": "out-mon", "name": "Mon", "source": "mon", "width": 2, "layout": "stereo" },
+        ],
+    });
+    let outputs = ["out-pgm", "out-mm", "out-51", "out-mon"];
+    let (set, listeners) = Set::with("line-up", shape, &outputs, |domain| {
+        let src = new_id();
+        let sources = vec![Source::sine(domain, &src, 0.5, 440)];
+        (sources, json!({ "ch": { "flow": src } }))
+    });
+    let nodes: Vec<Option<Node>> = (listeners.into_iter().enumerate())
+        .map(|(n, l)| Some(set.start(n, Some(l))))
+        .collect();
+    for n in 0..REPLICAS {
+        steady(&nodes, n);
+    }
+    let engines =
+        || -> Vec<Weak<Audio>> { (0..REPLICAS).map(|n| node(&nodes, n).engine()).collect() };
+    let flows = |output: &str| -> Vec<String> {
+        (set.outputs[output]["flows"].as_array().unwrap().iter())
+            .map(|f| f.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let read = |output: &str, legs: u32| {
+        Outputs::read_wide(set.domain.0.clone(), flows(output), engines(), legs)
+    };
+    let read = [
+        ("programme", read("out-pgm", 2)),
+        ("mix-minus", read("out-mm", 2)),
+        ("5.1 clean feed", read("out-51", 6)),
+        ("monitor", read("out-mon", 2)),
+    ];
+    let from = Outputs::now() + 1;
+    write(
+        &nodes,
+        0,
+        &[
+            ("/channels/ch/fader", json!(0)),
+            ("/channels/ch/routes/pgm", json!(true)),
+            ("/channels/ch/routes/s51", json!(true)),
+            ("/buses/s51/fader", json!(0)),
+            ("/monitor/level", json!(0)),
+            ("/monitor/source", json!("pgm")),
+        ],
+    );
+    let level = -12.0;
+    let writes = [
+        ("/tone/targets", json!(["pgm", "mm1", "s51"])),
+        ("/tone/on", json!(true)),
+        ("/tone/level", json!(level)),
+        ("/tone/ident", json!(true)),
+        ("/buses/pgm/fader", json!(-10)),
+        ("/tone/ident", json!(false)),
+        ("/monitor/source", json!("s51")),
+        ("/tone/targets", json!(["pgm"])),
+        ("/tone/on", json!(false)),
+    ];
+    for (i, (path, value)) in writes.into_iter().enumerate() {
+        // Long enough for every replica to play each setting a while,
+        // the 5.1 ident's cycle of 1.75 s across two of them.
+        std::thread::sleep(Duration::from_millis(400));
+        write(&nodes, i % REPLICAS, &[(path, value)]);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    // A window of the tone on both legs: its energy is the window's
+    // samples times the square of the sample peak, two legs of half that.
+    let peak = 10f64.powf(level / 20.0);
+    let tone = ((WINDOW * B) as f64 * peak * peak).log10() * 1000.0;
+    for (what, (outputs, _)) in &read {
+        for a in 0..REPLICAS {
+            for b in a + 1..REPLICAS {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let c = loop {
+                    let c = outputs.compare(a, b, from);
+                    if c.compared >= 2_500 || Instant::now() >= deadline {
+                        break c;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                };
+                assert!(
+                    c.compared >= 2_500 && c.differing.is_empty(),
+                    "{what}: replicas {a} and {b}: {c:?}: {}",
+                    states(&nodes)
+                );
+                assert!(
+                    c.levels.len() >= 4,
+                    "{what}: the writes moved nothing: {c:?}"
+                );
+                // The monitor at 0 dB on the programme: its tone.
+                if *what != "5.1 clean feed" {
+                    assert!(
+                        (c.levels.iter()).any(|&l| (l as f64 - tone).abs() <= 2.0),
+                        "{what}: no tone at {level} dBFS ({tone:.0}): {c:?}"
+                    );
+                }
+            }
+        }
+    }
+    for (_, (outputs, _)) in &read {
+        outputs.stop.store(true, Ordering::Relaxed);
+    }
+    for (_, (_, reader)) in read {
+        reader.join().unwrap();
+    }
+    for node in nodes.into_iter().flatten() {
+        node.kill();
     }
 }
 

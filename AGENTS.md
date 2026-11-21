@@ -69,6 +69,22 @@ protocol versions (`samplez::COMPUTE_VERSION`,
   the output, old and new replicas running as peers. A raised one
   changes the key, and the rollout hands over at the first new pod:
   hitless, from one committer to the next.
+- Versions are ordered by compute, then protocol, then derivation. The
+  baseline is handed over only to a replica whose versions are not
+  below its own, so the derivation version only ever rises: never reuse
+  or lower one.
+- A rollback to lower versions is not a hand-over: the outputs stop
+  from the last report of the last replica on the higher versions until
+  the lower one takes the baseline, `rollout::DEPARTED` (3 s) plus about
+  2 s. Plan a rollback as an outage of that length.
+- A replica whose key differs from the baseline's sits in
+  `version_mismatch` and computes nothing. A new pod waiting for its
+  hand-over fails `/readyz` until it commits; the leader names it
+  without reading readiness, so the hand-over does not wait on it. A
+  pod below the baseline's versions passes `/readyz` while another
+  audio replica commits.
+- The roll brake: a release that never commits never turns a pod
+  ready, so the StatefulSet stops at its first new pod.
 - A samplez bump can raise compute or protocol on its own; its
   changelog says so.
 - Raise the derivation version for any change in how a command

@@ -146,7 +146,9 @@ impl Node {
         };
         let (receivers, senders) = crate::app::with_state(replica, |sm| {
             let m = &sm.product;
+            // A tone input reads no flow: it has no receiver.
             let receivers = (shape.channels.iter().zip(&engine.inputs))
+                .filter(|(_, input)| input.tone.is_none())
                 .map(|(c, input)| {
                     let (_, selected) = m.receiver(&c.id).expect("every channel is wired");
                     let legs = mxl.inputs[&c.id].channels.as_deref();
@@ -156,7 +158,12 @@ impl Node {
                         label: c.name.clone(),
                         channels: ChannelCount::AtLeast(least.unwrap_or(c.width as u32)),
                         group: c.id.clone(),
-                        domain: domain_of(&input.domain),
+                        domain: domain_of(
+                            input
+                                .domain
+                                .as_deref()
+                                .expect("a flow input names a domain"),
+                        ),
                         flow: Some(flow(&format!("channel {}", c.id), selected)?),
                     })
                 })
@@ -842,7 +849,8 @@ impl Resolver {
         self.engine
             .check_input_flow(slot, flow)
             .map_err(|e| Reject(e.0))?;
-        let domain = &self.engine.inputs[slot].domain;
+        let domain = (self.engine.inputs[slot].domain.as_deref())
+            .ok_or_else(|| Reject(format!("input {slot} reads no flow")))?;
         let instance = self.instance(domain).map_err(Reject)?;
         let fail = |e: samplez_mxl::Error| Reject(format!("flow {flow}: {e}"));
         if instance.is_flow_active(flow).map_err(fail)?.is_none() {
