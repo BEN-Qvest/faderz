@@ -143,6 +143,7 @@ export class MockServer {
       const r = this.cluster.replica(one[1]!);
       if (!r || !r.healthy || r.frozen !== 'none') {
         res.statusCode = 503;
+        noKeepAlive(res);
         res.end();
         return;
       }
@@ -173,6 +174,7 @@ export class MockServer {
     const reply = (template: string | null, status: number, body?: unknown) => {
       if (template) contract.assertResponse(template, method, status, body);
       res.statusCode = status;
+      noKeepAlive(res);
       if (body === undefined) {
         res.end();
         return;
@@ -223,6 +225,7 @@ export class MockServer {
     } catch (e) {
       console.error('[faderz mock]', e);
       res.statusCode = 500;
+      noKeepAlive(res);
       res.end(String(e));
     }
   }
@@ -350,6 +353,7 @@ export class MockServer {
     const c = this.cluster;
     const send = (status: number, body: unknown) => {
       res.statusCode = status;
+      noKeepAlive(res);
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify(body));
     };
@@ -509,4 +513,14 @@ export class MockServer {
     const duplicates = [...times.values()].filter((n) => n > 1).length;
     return { entries, summary: { total: entries.length, duplicates } };
   }
+}
+
+/**
+ * Answers without keep-alive, so no client pools the socket: Node closes
+ * an idle keep-alive socket after 5 s, and a client that reuses one at
+ * that moment gets ECONNRESET, as a test does after a long run of page
+ * interaction between two requests.
+ */
+function noKeepAlive(res: ServerResponse): void {
+  res.setHeader('Connection', 'close');
 }
