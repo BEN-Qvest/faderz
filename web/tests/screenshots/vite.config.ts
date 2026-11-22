@@ -2,6 +2,7 @@
 // and talk show on the example shape, its sessions named after invented
 // operators, and no automation.
 
+import { readFileSync } from 'node:fs';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { defineConfig, type Plugin } from 'vite';
 import { Cluster, type Replica } from '../../dev/mock/cluster.ts';
@@ -37,7 +38,7 @@ function show(state: State): void {
   vox.eq.bands[2] = { type: 'peak', freq: 3200, gain: 3, q: 1.2 };
   vox.eq.bands[3] = { type: 'highShelf', freq: 10000, gain: 2, q: 0.7 };
   vox.gate.enabled = true;
-  vox.comp = { enabled: true, threshold: -20, ratio: 4, attack: 5, release: 120, makeup: 4 };
+  vox.comp = { enabled: true, threshold: -20, ratio: 4, attack: 5, release: 120, makeup: 4, mix: 100 };
   vox.hpf.freq = 100;
   state.buses['pgm20']!.fader = -1;
   state.auxes['aux3']!.fader = -4;
@@ -108,8 +109,13 @@ function showMock(): Plugin {
   };
 }
 
+// The console reads its build's version, as web/vite.config.ts defines it.
+const faderzVersion = /^version = "([^"]+)"\r?$/m.exec(readFileSync(new URL('../../../Cargo.toml', import.meta.url), 'utf8'))?.[1];
+if (!faderzVersion) throw new Error('no version in ../../../Cargo.toml');
+
 export default defineConfig({
   root: new URL('../..', import.meta.url).pathname,
+  define: { __FADERZ_VERSION__: JSON.stringify(faderzVersion) },
   plugins: [svelte(), showMock()],
   server: { fs: { allow: ['..'] } },
 });
