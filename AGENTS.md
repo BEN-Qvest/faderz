@@ -104,6 +104,12 @@ pause into the derived targets, which would raise the derivation
 version; it stays at 4 there only because that release is the first
 under explicit versions, whose roll is a hand-over anyway.
 
+The release that takes samplez v0.20.0 runs at
+`samplez::COMPUTE_VERSION` 2 (from 1), `samplez_replica::PROTOCOL` 4
+(from 3) and `DERIVATION_VERSION` 10 (from 9), the state recording each
+IS-05 port's version for the shared NMOS versions. Its roll is a
+hand-over.
+
 ## Build and test
 
 `.github/workflows/ci.yml` holds the exact commands; run them as CI does.
