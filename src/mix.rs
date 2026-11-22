@@ -1,6 +1,7 @@
 //! The live state as the engine's gain matrix: one row per input channel
 //! (the legs of each channel in shape order, then those of the line-up
-//! tone's generators, [`tone_widths`]) and one column per output channel (the legs of
+//! tone's generators, [`tone_widths`], then the pre-strip rows of each
+//! channel with a direct out, [`pre_rows`]) and one column per output channel (the legs of
 //! each shape output in shape order), then per leg of each element the
 //! engine meters on columns of its own ([`Shape::meter_columns`]).
 //!
@@ -85,10 +86,10 @@ fn talking(shape: &Shape, state: &Value) -> bool {
 /// Where a channel's signal is taken.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tap {
-    /// The selected input before its strip. A channel meter reads it
-    /// there ([`meter_taps`]); the matrix rows carry the channel after
-    /// its strip, so a direct out at this tap carries the pre-fader
-    /// signal.
+    /// The selected input after its delay and before its strip. A
+    /// channel meter reads it there ([`meter_taps`]) and a direct out
+    /// takes it from the channel's pre-strip rows ([`pre_rows`]); the
+    /// channel's own rows carry it after its strip.
     Input,
     /// After the strip: trim, leg trim, polarity and processing.
     PreFader,
@@ -101,7 +102,8 @@ enum Tap {
 /// The gain of channel `id` at `tap`, the same on every leg.
 fn channel(state: &Value, id: &str, tap: Tap) -> f64 {
     // Trim, leg trim, polarity and the processing are the input's strip,
-    // which runs before the matrix: a row's input tap is after it too.
+    // which runs before the matrix; the input tap is on rows of its own,
+    // ahead of it.
     if matches!(tap, Tap::Input | Tap::PreFader) {
         return 1.0;
     }
@@ -398,7 +400,8 @@ fn gains(shape: &Shape, state: &Value, factors: &[Factors]) -> Vec<Vec<f32>> {
     let mix = Mix::of(shape, state, &all, |slot| factors[slot]);
     let columns = columns(shape);
     let width = columns.iter().map(|c| c.1).sum();
-    let mut m = vec![vec![0.0; width]; mix.rows + tone_widths(shape).iter().sum::<usize>()];
+    let tone_rows = tone_widths(shape).iter().sum::<usize>();
+    let mut m = vec![vec![0.0; width]; mix.rows + tone_rows + pre_strip_rows(shape)];
     let rows: Vec<usize> = (0..mix.rows).collect();
     let mut g = Vec::with_capacity(mix.rows * 8);
     let mut first = 0;
@@ -409,8 +412,82 @@ fn gains(shape: &Shape, state: &Value, factors: &[Factors]) -> Vec<Vec<f32>> {
         placed.push((source, width, first));
         first += width;
     }
-    put_tone(&mut m, mix.rows, shape, state, placed);
+    put_tone(&mut m, mix.rows, shape, state, placed.iter().copied());
+    put_pre(&mut m, shape, state, placed);
     m
+}
+
+/// The first matrix row of each channel's pre-strip rows, in shape
+/// order, none for a channel without them. A channel with a direct out
+/// ([`Shape::has_direct_out`]) has them, one per leg: samplez adds an
+/// input's pre-strip rows after every input's own rows, the line-up
+/// tone generators' included, in configuration order.
+pub(crate) fn pre_rows(shape: &Shape) -> Vec<Option<usize>> {
+    let own: usize = shape.channels.iter().map(|c| c.width).sum();
+    let mut row = own + tone_widths(shape).iter().sum::<usize>();
+    (shape.channels.iter())
+        .map(|c| {
+            shape.has_direct_out(&c.id).then(|| {
+                row += c.width;
+                row - c.width
+            })
+        })
+        .collect()
+}
+
+/// How many pre-strip rows the matrix has ([`pre_rows`]).
+pub(crate) fn pre_strip_rows(shape: &Shape) -> usize {
+    (shape.channels.iter())
+        .filter(|c| shape.has_direct_out(&c.id))
+        .map(|c| c.width)
+        .sum()
+}
+
+/// Where a channel's direct out is taken, per model `DirectOut`.
+fn direct_tap(channel: &Value) -> Tap {
+    match channel["directOut"]["tap"].as_str() {
+        Some("input") => Tap::Input,
+        Some("postFader") => Tap::PostFader,
+        _ => Tap::PreFader,
+    }
+}
+
+/// Writes the pre-strip rows ([`pre_rows`]) of each of `columns`, an
+/// element, its width and its first column. A channel's direct out at
+/// [`Tap::Input`] takes the channel there at unity, leg to leg as
+/// [`Mix::element`] places a direct out and folded as [`put`] folds it;
+/// every other coefficient of those rows is 0. They take no duck mask
+/// ([`duck::masks`]).
+fn put_pre<'c>(
+    m: &mut [Vec<f32>],
+    shape: &Shape,
+    state: &Value,
+    columns: impl IntoIterator<Item = (&'c str, usize, usize)>,
+) {
+    let pre = pre_rows(shape);
+    let mut g = Vec::new();
+    let mut rows = Vec::new();
+    for (id, width, first) in columns {
+        for (c, at) in shape.channels.iter().zip(&pre) {
+            let Some(at) = *at else {
+                continue;
+            };
+            let input = c.id == id && direct_tap(&state["channels"][&c.id]) == Tap::Input;
+            g.clear();
+            g.resize(c.width * c.width, 0.0);
+            if input {
+                for i in 0..c.width {
+                    for j in 0..c.width {
+                        g[i * c.width + j] =
+                            pan_image(c.width, c.width, i, j, &Place::FRONT, Image::Normal);
+                    }
+                }
+            }
+            rows.clear();
+            rows.extend(at..at + c.width);
+            put(m, &rows, first, width, c.width, &g);
+        }
+    }
 }
 
 /// The legs of each of the line-up tone's generators, one engine input
@@ -472,7 +549,8 @@ fn put_tone<'c>(
 ) {
     let widths = tone_widths(shape);
     let mix = Mix::of(shape, state, &[], |_| unreachable!("no channel"));
-    let rows: Vec<usize> = (tone_row..m.len()).collect();
+    let tones = tone_row..tone_row + widths.iter().sum::<usize>();
+    let rows: Vec<usize> = tones.clone().collect();
     let mut g = Vec::new();
     for (id, width, first) in columns {
         let ew = mix.tone(id, &widths, &mut g);
@@ -481,7 +559,7 @@ fn put_tone<'c>(
             continue;
         }
         let generator = generator_row(&widths, ew);
-        for (row, r) in m[tone_row..].iter_mut().enumerate() {
+        for (row, r) in m[tones.clone()].iter_mut().enumerate() {
             for leg in 0..width {
                 r[first + leg] = f32::from(u8::from(row == generator + leg));
             }
@@ -551,7 +629,7 @@ pub(crate) fn flow<'w>(state: &Value, id: &str, w: &'w Wiring) -> &'w str {
 
 /// Everything the engine of `shape` plays from `state`: the gain matrix
 /// ([`matrix`]), each channel's strip ([`strip::params`]) and input
-/// delay ([`strip::delay`]), each tone channel's generator ([`strip::tone`]), each output's strip ([`strip::output_strips`]), delay ([`strip::output_delays`]) and limiter ([`strip::limiters`]), the duck groups ([`duck::targets`])
+/// delay ([`strip::delay`]), each tone channel's generator ([`strip::tone`]), each channel's pre-strip meter ([`pre_strip_meters`]), each output's strip ([`strip::output_strips`]), delay ([`strip::output_delays`]) and limiter ([`strip::limiters`]), the duck groups ([`duck::targets`])
 /// and masks ([`duck::masks`]) and the flow its selected input reads
 /// ([`selected`]), one slot per channel; then a slot per line-up tone
 /// generator ([`tone_widths`]), which reads no flow, has no strip and
@@ -646,11 +724,13 @@ struct Moved {
     elements: BTreeSet<String>,
     /// The columns of the monitor outputs.
     monitor: bool,
-    /// The strips, delays, tone generators and flows of these slots.
+    /// The strips, delays, tone generators, flows and pre-strip meters of
+    /// these slots.
     strips: BTreeSet<usize>,
     delays: BTreeSet<usize>,
     tones: BTreeSet<usize>,
     flows: BTreeSet<usize>,
+    meters: BTreeSet<usize>,
     /// The line-up tone's generators ([`line_up`]).
     line_up: bool,
     /// The duck masks: a group's targets or destinations, or the
@@ -691,6 +771,7 @@ impl Derived {
                 delays: (shape.channels.iter())
                     .map(|c| strip::delay(&state["channels"][&c.id]))
                     .collect(),
+                pre_strip_meters: pre_strip_meters(shape, state),
                 tones: (shape.channels.iter())
                     .map(|c| (c.tone.is_some()).then(|| strip::tone(&state["channels"][&c.id])))
                     .chain(generators.iter().map(|_| Some(line_up(state))))
@@ -765,15 +846,27 @@ impl Derived {
             }
         }
         // The rows and columns written above hold the mix in place of the
-        // tone again.
+        // tone again, and a direct out's tap moves it between the
+        // channel's own rows and its pre-strip rows.
         let placed = (self.columns.iter()).map(|(id, width, first)| (id.as_str(), *width, *first));
-        put_tone(&mut self.targets.gains, self.tone_row, shape, state, placed);
+        put_tone(
+            &mut self.targets.gains,
+            self.tone_row,
+            shape,
+            state,
+            placed.clone(),
+        );
+        put_pre(&mut self.targets.gains, shape, state, placed);
         for slot in moved.strips {
             let c = &shape.channels[slot];
             self.targets.strips[slot] = strip::params(&state["channels"][&c.id], c.width);
         }
         for slot in moved.delays {
             self.targets.delays[slot] = strip::delay(&state["channels"][&shape.channels[slot].id]);
+        }
+        for slot in moved.meters {
+            self.targets.pre_strip_meters[slot] =
+                metered_at_input(&state["channels"][&shape.channels[slot].id]);
         }
         for slot in moved.tones {
             let c = &shape.channels[slot];
@@ -851,6 +944,9 @@ impl Moved {
                         Some("delay") => {
                             moved.delays.insert(s);
                         }
+                        Some("meterTap") => {
+                            moved.meters.insert(s);
+                        }
                         Some("tone") => {
                             moved.tones.insert(s);
                         }
@@ -868,6 +964,7 @@ impl Moved {
                             moved.delays.insert(s);
                             moved.tones.insert(s);
                             moved.flows.insert(s);
+                            moved.meters.insert(s);
                             moved.monitor = true;
                             moved.masks = true;
                         }
@@ -877,6 +974,7 @@ impl Moved {
                             moved.delays.insert(s);
                             moved.tones.insert(s);
                             moved.flows.insert(s);
+                            moved.meters.insert(s);
                         }
                     }
                 }
@@ -954,8 +1052,9 @@ pub struct MeterTap {
 }
 
 /// Each channel's [`MeterTap`]: an input tap reads the engine's meter of
-/// the input before its strip, a pre-fader tap its meter after the
-/// strip, and a post-fader tap adds the fader, mute and VCAs to that.
+/// the input before its strip, which [`pre_strip_meters`] switches on, a
+/// pre-fader tap its meter after the strip, and a post-fader tap adds the
+/// fader, mute and VCAs to that.
 pub fn meter_taps(shape: &Shape, state: &Value) -> Vec<MeterTap> {
     let tap = |v: &Value| match v.as_str() {
         Some("input") => Tap::Input,
@@ -973,6 +1072,22 @@ pub fn meter_taps(shape: &Shape, state: &Value) -> Vec<MeterTap> {
             }
         })
         .collect()
+}
+
+/// Whether each channel's pre-strip meter runs, per input slot
+/// (samplez `PreStripMeter`): exactly while its `meterTap` is input, the
+/// one tap that reads it. The engine copies and meters an input before
+/// its strip only while it runs, so a desk metering after the strip pays
+/// nothing for it.
+pub fn pre_strip_meters(shape: &Shape, state: &Value) -> Vec<bool> {
+    (shape.channels.iter())
+        .map(|c| metered_at_input(&state["channels"][&c.id]))
+        .collect()
+}
+
+/// Whether a channel's `meterTap` is input.
+fn metered_at_input(channel: &Value) -> bool {
+    channel["meterTap"] == "input"
 }
 
 /// A channel's gain at [`Tap::PostFader`] and at [`Tap::Mix`]
@@ -1298,13 +1413,10 @@ impl<'a> Mix<'a> {
 /// `None` when it does not.
 fn feed(c: &Chan<'_>, kind: &Kind<'_>, id: &str) -> Option<(Tap, f64, Place)> {
     match kind {
+        // At the input tap its pre-strip rows carry it ([`put_pre`]).
         Kind::Channel if c.id == id => {
-            let tap = match c.state["directOut"]["tap"].as_str() {
-                Some("input") => Tap::Input,
-                Some("postFader") => Tap::PostFader,
-                _ => Tap::PreFader,
-            };
-            Some((tap, 1.0, Place::FRONT))
+            let tap = direct_tap(c.state);
+            (tap != Tap::Input).then_some((tap, 1.0, Place::FRONT))
         }
         Kind::Bus => on(&c.routes[id]).then_some((Tap::Mix, 1.0, c.place)),
         Kind::Aux => {
@@ -1623,8 +1735,8 @@ mod tests {
     }
 
     // Rows: ch1, ch2, st1 L, st1 R, then the line-up tone's mono and
-    // stereo generators' legs. Columns: o-pgm L R, o-aux, o-mm L R,
-    // o-mon L R, o-ch1, then cf L R.
+    // stereo generators' legs, then ch1's pre-strip row. Columns: o-pgm
+    // L R, o-aux, o-mm L R, o-mon L R, o-ch1, then cf L R.
 
     /// A fresh state is silent everywhere but the direct out, which taps
     /// before the closed faders.
@@ -1632,7 +1744,7 @@ mod tests {
     fn the_initial_state_passes_only_the_direct_out() {
         let shape = shape();
         let m = matrix(&shape, &shape.initial_state());
-        assert_eq!(m.len(), 7);
+        assert_eq!(m.len(), 8);
         // The outputs' 8 columns, then cf's 2, which no output carries.
         assert!(m.iter().all(|r| r.len() == 10));
         for (row, r) in m.iter().enumerate() {
@@ -1641,6 +1753,127 @@ mod tests {
                 assert!(close(*g, want), "[{row}][{col}] = {g}");
             }
         }
+    }
+
+    /// A direct out at the input tap is the channel before its strip,
+    /// which only its pre-strip rows carry: at unity, leg to leg and
+    /// folded onto a narrower output, with its own rows 0 in that column,
+    /// whatever the fader. At preFader and postFader it is on its own
+    /// rows and the pre-strip rows are 0. Only a channel with a direct out
+    /// has them, after every channel's and tone generator's rows, and a
+    /// tap write derives the same bits as the whole state.
+    #[test]
+    fn a_direct_out_at_the_input_tap_takes_the_pre_strip_rows() {
+        let mut v = small();
+        v["outputs"] = json!([
+            { "id": "o-pgm", "name": "PGM", "source": "pgm", "width": 2, "layout": "stereo" },
+            { "id": "o-st1", "name": "DO st", "source": "st1", "width": 2, "layout": "stereo" },
+            { "id": "o-st1m", "name": "DO st m", "source": "st1", "width": 1, "layout": "mono" },
+            { "id": "o-ch2", "name": "DO 2", "source": "ch2", "width": 1, "layout": "mono" },
+        ]);
+        let shape = Shape::parse(&v).unwrap();
+        // After the channels' 4 legs and the tones' 3, ch2's and st1's.
+        assert_eq!(pre_rows(&shape), [None, Some(7), Some(8)]);
+        assert_eq!(pre_strip_rows(&shape), 3);
+        let mut s = shape.initial_state();
+        for ch in ["ch2", "st1"] {
+            s["channels"][ch]["fader"] = json!(-10);
+            s["channels"][ch]["directOut"]["tap"] = json!("input");
+        }
+        let m = matrix(&shape, &s);
+        assert_eq!(m.len(), 10);
+        // Columns: o-pgm L R, o-st1 L R, o-st1m, o-ch2, then the meters'.
+        let at = |rows: std::ops::Range<usize>, col: usize| -> Vec<f32> {
+            rows.map(|r| m[r][col]).collect()
+        };
+        assert_eq!(at(0..10, 5), [0., 0., 0., 0., 0., 0., 0., 1., 0., 0.]);
+        assert_eq!(at(7..10, 2), [0., 1., 0.]);
+        assert_eq!(at(7..10, 3), [0., 0., 1.]);
+        let h = (pan(2, 1, 0, 0, 0.0) as f32, pan(2, 1, 1, 0, 0.0) as f32);
+        assert_eq!(at(7..10, 4), [0., h.0, h.1]);
+        for col in 2..6 {
+            assert!(
+                at(0..7, col).iter().all(|&g| g == 0.0),
+                "own rows, col {col}"
+            );
+        }
+        for col in [0, 1, 6, 7] {
+            assert!(
+                at(7..10, col).iter().all(|&g| g == 0.0),
+                "pre rows, col {col}"
+            );
+        }
+        let mut d = Derived::new(&shape, &[], &s);
+        for (ch, tap) in [("ch2", "preFader"), ("st1", "postFader")] {
+            let path = format!("/channels/{ch}/directOut/tap");
+            let vcas = s["vcas"].clone();
+            crate::state::set_at(&mut s, &path, json!(tap));
+            d.update(&shape, &[], &s, &vcas, [path.as_str()]);
+            assert_eq!(d.targets().gains, matrix(&shape, &s), "{ch} at {tap}");
+        }
+        let m = matrix(&shape, &s);
+        assert!(m[7..].iter().flatten().all(|&g| g == 0.0));
+        assert_eq!(m[1][5], 1.0, "ch2 pre-fader on its own row");
+        assert!(
+            close(m[2][2], gain(-10.0)),
+            "st1 post-fader on its own rows"
+        );
+    }
+
+    /// A channel's pre-strip meter runs exactly while its meterTap is
+    /// input: a desk metering at preFader and postFader runs none, so the
+    /// engine copies and meters no input before its strip and nothing is
+    /// sent, the engine starting with every one off. A meterTap write
+    /// moves it alone, to the bits of the whole state, and a diff carries
+    /// it as a PreStripMeter entry.
+    #[test]
+    fn pre_strip_meters_run_exactly_at_the_input_tap() {
+        use samplez::engine::Entry;
+        let shape = shape();
+        let mut s = shape.initial_state();
+        let off = targets(&shape, &[], &s);
+        assert_eq!(off.pre_strip_meters, [false; 3], "every channel postFader");
+        s["channels"]["ch1"]["meterTap"] = json!("preFader");
+        assert_eq!(targets(&shape, &[], &s).pre_strip_meters, [false; 3]);
+        let pre = |t: &Targets| -> Vec<Entry> {
+            (Targets::default().diff(t).into_iter())
+                .filter(|e| matches!(e, Entry::PreStripMeter { .. }))
+                .collect()
+        };
+        assert!(pre(&off).is_empty());
+        let mut d = Derived::new(&shape, &[], &s);
+        for (ch, tap, want) in [
+            ("st1", "input", [false, false, true]),
+            ("ch1", "input", [true, false, true]),
+            ("st1", "postFader", [true, false, false]),
+            ("ch1", "preFader", [false; 3]),
+        ] {
+            let path = format!("/channels/{ch}/meterTap");
+            let vcas = s["vcas"].clone();
+            crate::state::set_at(&mut s, &path, json!(tap));
+            let before = d.targets().clone();
+            d.update(&shape, &[], &s, &vcas, [path.as_str()]);
+            assert_eq!(d.targets().pre_strip_meters, want, "{ch} at {tap}");
+            assert_eq!(d.targets().pre_strip_meters, pre_strip_meters(&shape, &s));
+            let slot = ["ch1", "ch2", "st1"].iter().position(|c| *c == ch).unwrap();
+            let entries = before.diff(d.targets());
+            assert_eq!(
+                entries,
+                [Entry::PreStripMeter {
+                    slot,
+                    enabled: tap == "input"
+                }]
+            );
+        }
+        s["channels"]["st1"]["meterTap"] = json!("input");
+        let on = targets(&shape, &[], &s);
+        assert_eq!(
+            pre(&on),
+            [Entry::PreStripMeter {
+                slot: 2,
+                enabled: true
+            }]
+        );
     }
 
     /// A bus no output carries gets the columns an output of it would:
@@ -1658,8 +1891,10 @@ mod tests {
             { "id": "o-cf", "name": "CF", "source": "cf", "width": 2, "layout": "stereo" },
         ]);
         let cf = matrix(&Shape::parse(&with_output).unwrap(), &s);
-        for (row, r) in m.iter().enumerate() {
-            assert_eq!(r[8..], cf[row][..2], "row {row}");
+        // Without o-ch1 the shape has no pre-strip row, m's last.
+        assert_eq!(cf.len() + 1, m.len());
+        for (row, (r, cf)) in m.iter().zip(&cf).enumerate() {
+            assert_eq!(r[8..], cf[..2], "row {row}");
         }
         assert!(m[0][8] > 0.3);
     }
@@ -2766,9 +3001,22 @@ mod tests {
                     .collect()
             };
             // The line-up tone is off: its rows, after the channels', are 0.
+            // ch1's direct out, column 7, at the input tap is on its
+            // pre-strip row, where the matrix before had it on ch1's own
+            // row; the row is 0 in every other column.
             let mut m = matrix(&shape, &s);
-            let tone = m.split_off(shape.channels.iter().map(|c| c.width).sum());
+            let mut tone = m.split_off(shape.channels.iter().map(|c| c.width).sum());
+            let pre = tone.split_off(tone_widths(&shape).iter().sum());
             assert!(tone.iter().flatten().all(|g| g.to_bits() == 0), "{s}");
+            assert_eq!(pre.len(), 1);
+            for (col, g) in pre[0].iter().enumerate() {
+                if col == 7 && s["channels"]["ch1"]["directOut"]["tap"] == "input" {
+                    assert_eq!(m[0][col].to_bits(), 0, "{s}");
+                    m[0][col] = *g;
+                } else {
+                    assert_eq!(g.to_bits(), 0, "column {col}: {s}");
+                }
+            }
             assert_eq!(bits(m), bits(before::matrix(&shape, &s)), "{s}");
         }
     }
@@ -2793,7 +3041,8 @@ mod tests {
     /// channels'.
     fn tone_rows(m: &[Vec<f32>], shape: &Shape) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
         let mut m = m.to_vec();
-        let tone = m.split_off(shape.channels.iter().map(|c| c.width).sum());
+        let mut tone = m.split_off(shape.channels.iter().map(|c| c.width).sum());
+        tone.truncate(tone_widths(shape).iter().sum());
         (tone, m)
     }
 
@@ -2901,8 +3150,8 @@ mod tests {
         }
         assert_eq!(
             (duck::masks(&shape, &s).len(), t.gains.len()),
-            (7, 7),
-            "the masks have the tone's rows"
+            (8, 8),
+            "the masks have the tone's rows and o-ch1's pre-strip row"
         );
     }
 
