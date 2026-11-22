@@ -120,6 +120,12 @@ struct Reader {
     generation: Generation,
     state: SlotState,
     buf: Vec<f32>,
+    /// How many blocks behind the clock it reads: 100 (100 ms), plus the
+    /// engine's reader margin where a test sets one, as the engine writes
+    /// each block that much later ([`Reader::after_margin`]).
+    lag: u64,
+    /// What the last read of [`Reader::recent`] returned.
+    outcome: Option<Outcome>,
 }
 
 impl Reader {
@@ -147,16 +153,27 @@ impl Reader {
             generation,
             state: SlotState::default(),
             buf: vec![0.0; channels as usize * B as usize],
+            lag: 100,
+            outcome: None,
         }
+    }
+
+    /// The reader of an engine whose `readerMarginSamples` is `margin`:
+    /// the engine computes and writes each block that many samples after
+    /// its time, so a block 100 ms behind the clock is not written yet.
+    fn after_margin(mut self, margin: u64) -> Reader {
+        self.lag += margin.div_ceil(B);
+        self
     }
 
     /// A recent block, 100 ms behind the clock, when it was written:
     /// both legs, planar.
     fn recent(&mut self) -> Option<&[f32]> {
         let api = self.generation.api();
-        let k = time::timestamp_to_index(api, time::now(api)) / B - 100;
+        let k = time::timestamp_to_index(api, time::now(api)) / B - self.lag;
         let input = self.generation.input(0).unwrap();
         let o = input.read(&mut self.state, k, &GroupWait::Skipped, &mut self.buf);
+        self.outcome = Some(o);
         (o == Outcome::Copy).then_some(&self.buf[..])
     }
 
@@ -164,7 +181,7 @@ impl Reader {
     /// 100 ms behind the clock, when all were written.
     fn peaks(&mut self) -> Option<(f32, f32)> {
         let api = self.generation.api();
-        let last = time::timestamp_to_index(api, time::now(api)) / B - 100;
+        let last = time::timestamp_to_index(api, time::now(api)) / B - self.lag;
         let input = self.generation.input(0).unwrap();
         let n = B as usize;
         let mut peaks = (0.0f32, 0.0f32);
@@ -184,7 +201,7 @@ impl Reader {
     /// clock, oldest first.
     fn history(&mut self) -> Vec<f32> {
         let api = self.generation.api();
-        let last = time::timestamp_to_index(api, time::now(api)) / B - 100;
+        let last = time::timestamp_to_index(api, time::now(api)) / B - self.lag;
         let input = self.generation.input(0).unwrap();
         let n = B as usize;
         let mut left = Vec::new();
@@ -203,12 +220,13 @@ impl Reader {
     /// The block 100 ms behind libmxl's clock, written by now.
     fn behind(&self) -> u64 {
         let api = self.generation.api();
-        time::timestamp_to_index(api, time::now(api)) / B - 100
+        time::timestamp_to_index(api, time::now(api)) / B - self.lag
     }
 
     /// The left leg of every block from block `from` on, in order, until
     /// a whole block reads `left` within the rounding of an f32 gain,
-    /// within 10 s. A block not written is left out.
+    /// within 10 s. A block not written yet is waited for, and one that
+    /// cannot be read otherwise is left out.
     async fn trace(&mut self, from: u64, left: f32) -> Vec<f32> {
         let n = B as usize;
         let mut state = SlotState::default();
@@ -219,12 +237,16 @@ impl Reader {
             let last = self.behind();
             let input = self.generation.input(0).unwrap();
             while k <= last {
-                if input.read(&mut state, k, &GroupWait::Skipped, &mut self.buf) == Outcome::Copy {
-                    let block = &self.buf[..n];
-                    trace.extend_from_slice(block);
-                    if block.iter().all(|v| (v - left).abs() <= 1e-6) {
-                        return trace;
+                match input.read(&mut state, k, &GroupWait::Skipped, &mut self.buf) {
+                    Outcome::Copy => {
+                        let block = &self.buf[..n];
+                        trace.extend_from_slice(block);
+                        if block.iter().all(|v| (v - left).abs() <= 1e-6) {
+                            return trace;
+                        }
                     }
+                    Outcome::Late => break,
+                    _ => {}
                 }
                 k += 1;
             }
@@ -270,7 +292,14 @@ impl Reader {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        panic!("{what}: expected ({left}, {right}), last read {last:?}");
+        match last {
+            Some(last) => panic!("{what}: expected ({left}, {right}), last read {last:?}"),
+            None => panic!(
+                "{what}: expected ({left}, {right}), no block read in 10 s {} blocks behind \
+                 the clock, last outcome {:?}",
+                self.lag, self.outcome
+            ),
+        }
     }
 }
 
@@ -1000,7 +1029,9 @@ async fn the_routing_reaches_every_output_flow() {
     let near = |leg: &[f32], want: f32| leg.iter().all(|v| (v - want).abs() <= 1e-6);
     for step in routing::steps() {
         match &step.change {
-            routing::Change::Patch(changes) => patch(&server, changes).await,
+            routing::Change::Patch(changes) => {
+                patch(&server, changes).await;
+            }
             routing::Change::Tally(source, state) => tally(&server, source, state).await,
         }
         tokio::time::sleep(routing::SETTLE).await;
@@ -1155,15 +1186,36 @@ async fn a_scene_recall_crossfades_over_its_time() {
         mm: new_id(),
     };
     let _ch1 = Source::start(&domain.0, &flows.ch1, vec![CH1]);
-    let server = start(&data.0, &domain.0, &flows).await;
+    let rate = shape()["sampleRate"].as_u64().unwrap();
+    let block = 48;
+    let server = start_engine(
+        &data.0,
+        &domain.0,
+        shape(),
+        json!({
+            "ch1": { "flow": flows.ch1 },
+            "ch2": { "flow": flows.ch2, "altFlow": flows.ch2b },
+            "st1": { "flow": flows.st1 },
+        }),
+        json!({ "out-pgm": { "flow": flows.pgm }, "out-mm": { "flow": flows.mm } }),
+        // Every sample of the crossfade is read, which a debug engine on
+        // a loaded host writes whole only with time in hand, as in
+        // a_burst_ducks_the_programme_but_not_the_me: a skipped block
+        // reads as silence in the middle of the rise.
+        json!({
+            "blockSize": block,
+            "readerMarginSamples": rate / 10,
+            "maxCatchupBlocks": rate / 10 / block,
+        }),
+    )
+    .await;
     appears(&domain.0, &flows.pgm).await;
-    let mut pgm = Reader::new(&domain.0, &flows.pgm);
+    let mut pgm = Reader::new(&domain.0, &flows.pgm).after_margin(rate / 10);
     let deadline = Instant::now() + Duration::from_secs(10);
     while get(server.ops, "/readyz").await.0 != 200 {
         assert!(Instant::now() < deadline, "ready");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let rate = shape()["sampleRate"].as_u64().unwrap();
     // samplez's default rampSamples: a gain change without a fade ramps
     // over it.
     let ramp = 480;
@@ -1185,15 +1237,31 @@ async fn a_scene_recall_crossfades_over_its_time() {
             .filter(|&&v| v > low + 1e-6 && v < high - 1e-6)
             .count() as u64
     };
+    let counters = server.audio.as_ref().unwrap().engine().counters();
+    let counts =
+        || [&counters.command_late, &counters.overrun_skipped_samples].map(|c| c.load(Relaxed));
     for ms in [400u64, 0] {
         patch(&server, &[("/channels/ch1/fader", json!(-20))]).await;
         pgm.expect(low, 0.0, "the fader down").await;
         let from = pgm.behind();
+        let before = counts();
         let body = json!({ "commandId": faderz::app::uuid().unwrap(), "crossfadeMs": ms });
         posted(&server, &path, &body).await;
         let trace = pgm.trace(from, high).await;
-        let rising = trace.windows(2).all(|w| w[1] >= w[0] - 1e-6);
-        assert!(rising, "crossfade {ms} ms: the level falls on its way up");
+        // A late recall goes again without its fade, a skip zero-fills.
+        let after = counts();
+        assert!(
+            after == before,
+            "crossfade {ms} ms: [command_late, overrun_skipped_samples] {before:?} -> {after:?}: \
+             the recall applied late or the engine was starved for over 100 ms"
+        );
+        let fall = trace.windows(2).position(|w| w[1] < w[0] - 1e-6);
+        assert!(
+            fall.is_none(),
+            "crossfade {ms} ms: the level falls on its way up, at sample {fall:?} of {}: {:?}",
+            trace.len(),
+            fall.map(|i| &trace[i.saturating_sub(2)..(i + 4).min(trace.len())])
+        );
         let mid = between(&trace);
         let len = ms * rate / 1000;
         if ms == 0 {
@@ -1212,6 +1280,71 @@ async fn a_scene_recall_crossfades_over_its_time() {
             "crossfade {ms} ms: no level half way"
         );
     }
+    server.stop().await;
+}
+
+/// A write right after a start lands over the gains the start sends.
+/// Those wait for the strips' ramps, and the engine applies its changes
+/// in index order, not in the order they are sent: a write placed below
+/// them would be overwritten, and the output would keep the start's mix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_right_after_a_start_lands_over_the_starts_gains() {
+    let domain = domain("after-start");
+    let data = data("after-start");
+    let flows = Flows {
+        ch1: new_id(),
+        ch2: new_id(),
+        ch2b: new_id(),
+        st1: new_id(),
+        pgm: new_id(),
+        mm: new_id(),
+    };
+    let _ch1 = Source::start(&domain.0, &flows.ch1, vec![CH1]);
+    // A ramp of 2 s puts the gains a start sends 2 s past its strips, far
+    // above the index of a write made as soon as it is ready.
+    let boot = || {
+        start_engine(
+            &data.0,
+            &domain.0,
+            shape(),
+            json!({
+                "ch1": { "flow": flows.ch1 },
+                "ch2": { "flow": flows.ch2, "altFlow": flows.ch2b },
+                "st1": { "flow": flows.st1 },
+            }),
+            json!({ "out-pgm": { "flow": flows.pgm }, "out-mm": { "flow": flows.mm } }),
+            json!({ "rampSamples": 96_000 }),
+        )
+    };
+    let server = boot().await;
+    appears(&domain.0, &flows.pgm).await;
+    let mut pgm = Reader::new(&domain.0, &flows.pgm);
+    patch(
+        &server,
+        &[
+            ("/channels/ch1/pan/lr", json!(-1)),
+            ("/channels/ch1/fader", json!(0)),
+        ],
+    )
+    .await;
+    pgm.expect(CH1, 0.0, "ch1 open").await;
+    server.stop().await;
+    // Started again on its data, the server sends ch1 open once the
+    // strips' ramps are over; the write comes once it has sent that.
+    drop(pgm);
+    let server = boot().await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while get(server.ops, "/readyz").await.0 != 200 {
+        assert!(Instant::now() < deadline, "ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    patch(&server, &[("/channels/ch1/fader", json!(-20))]).await;
+    appears(&domain.0, &flows.pgm).await;
+    let mut pgm = Reader::new(&domain.0, &flows.pgm);
+    let low = CH1 * 10f32.powf(-20.0 / 20.0);
+    // Overwritten, the write never settles: the start's gain cuts its
+    // ramp short and takes ch1 back open.
+    pgm.expect(low, 0.0, "the write after the start").await;
     server.stop().await;
 }
 
@@ -1818,13 +1951,15 @@ async fn a_direct_out_at_the_input_tap_is_delayed_but_not_processed() {
     .await;
     appears(&domain.0, &at_input).await;
     appears(&domain.0, &pre_fader).await;
-    patch(&server, &direct::changes()).await;
     let api = api();
     let engine = server.audio.as_ref().unwrap().engine();
+    let late = engine.counters().command_late.load(Relaxed);
+    let revision = patch(&server, &direct::changes()).await;
+    applied(&server, revision).await;
     let skipped = engine.counters().overrun_skipped_samples.load(Relaxed);
     let now = || time::timestamp_to_index(&api, time::now(&api));
     // A pulse of 100 ms from 0.5 s on, off the block grid: the changes
-    // have applied and the delay's crossfade ended long before.
+    // are in and the delay's crossfade ends long before.
     let start = now() + rate / 2 + 7;
     let end = start + rate / 10;
     pulse[1].store(end, Relaxed);
@@ -1835,10 +1970,17 @@ async fn a_direct_out_at_the_input_tap_is_delayed_but_not_processed() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     pulse[0].store(u64::MAX, Relaxed);
-    assert_eq!(
-        engine.counters().overrun_skipped_samples.load(Relaxed),
-        skipped,
-        "samples skipped, the engine was starved for over 100 ms"
+    let counters = engine.counters();
+    let now_skipped = counters.overrun_skipped_samples.load(Relaxed);
+    assert!(
+        now_skipped == skipped,
+        "samples skipped ({skipped} -> {now_skipped}), the engine was starved for over 100 ms"
+    );
+    let now_late = counters.command_late.load(Relaxed);
+    assert!(
+        now_late == late,
+        "changes applied late: command_late {late} -> {now_late}, they reached the engine \
+         after their index"
     );
     direct::check(
         &span_left(&domain.0, &at_input, 1, from, to),
@@ -1937,7 +2079,9 @@ async fn a_bus_delay_plays_every_output_carrying_it_exactly_that_late() {
     let steps = [0, off_grid, line, 0, off_grid].map(|d| (Some(d), d));
     for (write, delay) in steps.into_iter().chain([(None, off_grid)]) {
         match write {
-            Some(d) => patch(&server, &[("/buses/pgm/delay", json!(d))]).await,
+            Some(d) => {
+                patch(&server, &[("/buses/pgm/delay", json!(d))]).await;
+            }
             None => {
                 server.stop().await;
                 server = boot().await;
@@ -2273,21 +2417,29 @@ async fn the_line_up_tone_replaces_the_mix_of_its_targets() {
 /// carries the tone at sample peak `peak`, so the last window of the
 /// cycle sounds on every leg. A block is judged only when every tone
 /// index it can carry, whatever the limiter's delay, lies in one window
-/// away from the ident's fades.
-async fn idents(domain: &Path, flow: &str, legs: usize, from: u64, peak: f32, what: &str) {
+/// away from the ident's fades. The engine runs `margin` samples behind
+/// its time ([`Reader::after_margin`]).
+async fn idents(
+    domain: &Path,
+    flow: &str,
+    legs: usize,
+    from: u64,
+    peak: f32,
+    margin: u64,
+    what: &str,
+) {
     let rate = shape()["sampleRate"].as_u64().unwrap();
     let (window, edge) = (rate / 4, rate / 100);
     let late = samplez_dsp::LIMITER_DELAY as u64;
     let cycle = legs as u64 + 1;
-    let mut reader = Reader::wide(domain, flow, legs as u32);
-    let api = api();
+    let mut reader = Reader::wide(domain, flow, legs as u32).after_margin(margin);
     let n = B as usize;
     let mut seen = std::collections::BTreeSet::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     while seen.len() < cycle as usize {
         assert!(Instant::now() < deadline, "{what}: windows read {seen:?}");
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let k = time::timestamp_to_index(&api, time::now(&api)) / B - 100;
+        let k = reader.behind();
         let (lo, hi) = (k * B - late - edge, k * B + B + edge);
         if k * B < from || lo / window != (hi - 1) / window {
             continue;
@@ -2342,7 +2494,12 @@ async fn each_line_up_target_idents_its_own_legs() {
             output("out-mon", "mon", 2, "stereo"),
         ],
     });
-    let server = start_with(
+    // A debug engine on a loaded host keeps up only with time in hand, as
+    // in a_diff_beyond_the_engines_queue_lands_whole: past the default
+    // backlog of two blocks it skips and zero-fills, which reads as a
+    // leg that does not sound.
+    let margin = 48000 / 10;
+    let server = start_engine(
         &data.0,
         &domain.0,
         shape,
@@ -2351,6 +2508,11 @@ async fn each_line_up_target_idents_its_own_legs() {
             "out-pgm": { "flow": pgm },
             "out-51": { "flow": s51 },
             "out-mon": { "flow": mon },
+        }),
+        json!({
+            "blockSize": B,
+            "readerMarginSamples": margin,
+            "maxCatchupBlocks": margin / B,
         }),
     )
     .await;
@@ -2372,8 +2534,17 @@ async fn each_line_up_target_idents_its_own_legs() {
     .await;
     let h = std::f32::consts::FRAC_1_SQRT_2;
     Reader::new(&domain.0, &mon)
+        .after_margin(margin)
         .expect(CH1 * h, CH1 * h, "the monitor plays the programme's mix")
         .await;
+    let counters = server.audio.as_ref().unwrap().engine().counters();
+    let starved = || {
+        (
+            counters.overrun_skipped_samples.load(Relaxed),
+            counters.command_late.load(Relaxed),
+        )
+    };
+    let before = starved();
     patch(
         &server,
         &[
@@ -2388,17 +2559,33 @@ async fn each_line_up_target_idents_its_own_legs() {
     let api = api();
     let from = time::timestamp_to_index(&api, time::now(&api)) + 48000 / 2;
     let peak = 10f32.powf(-20.0 / 20.0);
-    idents(&domain.0, &pgm, 2, from, peak, "the stereo programme").await;
-    idents(&domain.0, &s51, 6, from, peak, "the 5.1 clean feed").await;
+    idents(
+        &domain.0,
+        &pgm,
+        2,
+        from,
+        peak,
+        margin,
+        "the stereo programme",
+    )
+    .await;
+    idents(&domain.0, &s51, 6, from, peak, margin, "the 5.1 clean feed").await;
     idents(
         &domain.0,
         &mon,
         2,
         from,
         peak,
+        margin,
         "the monitor on the programme",
     )
     .await;
+    let after = starved();
+    assert_eq!(
+        after, before,
+        "the engine was starved: (overrun_skipped_samples, command_late) went from \
+         {before:?} to {after:?}"
+    );
     let engine = server.audio.as_ref().unwrap().engine().status();
     let tones: Vec<&str> = (engine.inputs.iter())
         .filter(|i| i.state == samplez::InputState::Tone)
@@ -2503,16 +2690,26 @@ async fn a_diff_beyond_the_engines_queue_lands_whole() {
         .collect();
     let _c0 = Source::start(&domain.0, &ids[0], vec![CH1]);
     let _c1 = Source::start(&domain.0, &ids[1], vec![CH2B]);
-    let server = start_with(
+    let block = 48;
+    let server = start_engine(
         &data.0,
         &domain.0,
         shape,
         Value::Object(inputs),
         json!({ "out-pgm": { "flow": pgm_id } }),
+        // A debug engine of 40 channels on a loaded host keeps up only
+        // with time in hand, as in a_burst_ducks_the_programme_but_not_the_me:
+        // past the default backlog of two blocks it skips and zero-fills,
+        // and the programme read back is silence.
+        json!({
+            "blockSize": block,
+            "readerMarginSamples": 48_000 / 10,
+            "maxCatchupBlocks": 48_000 / 10 / block,
+        }),
     )
     .await;
     appears(&domain.0, &pgm_id).await;
-    let mut pgm = Reader::new(&domain.0, &pgm_id);
+    let mut pgm = Reader::new(&domain.0, &pgm_id).after_margin(48_000 / 10);
     pgm.expect(0.0, 0.0, "every fader closed").await;
     // Centre pan: 2 N coefficients, beyond the engine's 64.
     let paths: Vec<String> = (0..N).map(|i| format!("/channels/c{i}/fader")).collect();

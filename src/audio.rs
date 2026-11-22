@@ -115,6 +115,9 @@ pub struct Audio {
     /// state counts and where the last one this engine applied starts the
     /// measurement.
     resets: Mutex<BTreeMap<usize, Resets>>,
+    /// The revision [`Audio::follow`] last sent the engine the changes
+    /// of, and the index the last of them applies at ([`Audio::sent`]).
+    sent: Mutex<(u64, u64)>,
 }
 
 /// What the engine was sent: every coefficient, each input's flow, none
@@ -273,6 +276,7 @@ impl Audio {
             ),
             inputs: Mutex::new(InputHealth::new(metrics, shape)),
             resets: Mutex::default(),
+            sent: Mutex::default(),
             ops,
         }
     }
@@ -284,6 +288,16 @@ impl Audio {
 
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// The revision whose changes [`Audio::follow`] last sent the engine,
+    /// and the index the last of them applies at: once the engine has
+    /// produced that index, each was applied or counted in
+    /// `command_late`. `(0, 0)` until the first changes are sent. Read
+    /// only by the integration tests, to wait for a write to reach the
+    /// engine.
+    pub fn sent(&self) -> (u64, u64) {
+        *self.sent.lock().expect("sent lock poisoned")
     }
 
     /// Stops the engine and releases its writers, which deletes their
@@ -355,7 +369,8 @@ impl Audio {
         let (view, fades) = crate::app::with_state(replica, |sm| {
             (sm.product.engine_view(), sm.product.gain_fades())
         });
-        self.apply(&state, &view, &fades, &mut sent, 0, true).await;
+        let mut last = self.apply(&state, &view, &fades, &mut sent, 0, true).await;
+        *self.sent.lock().expect("sent lock poisoned") = (revision, last);
         // A resend asked for meanwhile marks it ready once done. The lock
         // is held over the check and the store, so a hold() cannot fall
         // between them and be overwritten.
@@ -401,8 +416,15 @@ impl Audio {
             let (view, fades) = crate::app::with_state(replica, |sm| {
                 (sm.product.engine_view(), sm.product.gain_fades())
             });
-            self.apply(&state, &view, &fades, &mut sent, at, false)
+            // The engine applies changes in index order, not in the order
+            // sent: a diff placed below the changes sent before it, as
+            // below the start's gains held back for the strips' ramps,
+            // would be overwritten by them.
+            let at = at.max(last);
+            last = self
+                .apply(&state, &view, &fades, &mut sent, at, false)
                 .await;
+            *self.sent.lock().expect("sent lock poisoned") = (revision, last);
             if let Some(n) = resent {
                 let asked = self.resends_asked.lock().expect("resend lock poisoned");
                 if *asked == n {
@@ -485,6 +507,7 @@ impl Audio {
     /// when the fade is towards that gain, and the engine takes it at the
     /// index the gain goes at; the state the deltas built may lag the
     /// fades read, and the gain then goes without, over the ramp length.
+    /// The index the last change sent applies at.
     async fn apply(
         &self,
         state: &Value,
@@ -493,8 +516,10 @@ impl Audio {
         sent: &mut Sent,
         at: u64,
         settle: bool,
-    ) {
+    ) -> u64 {
         let mut at = at.next_multiple_of(self.block);
+        // A route or an enable can apply past `at`.
+        let mut last = 0;
         let targets = view.targets(&self.shape, state);
         for (slot, (sent, next)) in sent.strips.iter_mut().zip(targets.strips).enumerate() {
             for (p, n) in sent.iter_mut().zip(next) {
@@ -600,6 +625,7 @@ impl Audio {
                 };
                 match sent_now {
                     Ok(k) => {
+                        last = last.max(k);
                         // A detached channel is silent before any gain
                         // sent with it applies, so one detached at start
                         // is never heard.
@@ -619,7 +645,10 @@ impl Audio {
         for (slot, enabled) in targets.outputs.into_iter().enumerate() {
             while enabled != sent.outputs[slot] {
                 match self.engine.set_output_enabled(slot, enabled, at) {
-                    Ok(_) => sent.outputs[slot] = enabled,
+                    Ok(k) => {
+                        last = last.max(k);
+                        sent.outputs[slot] = enabled;
+                    }
                     Err(EntryError::Full) => tokio::time::sleep(FULL_RETRY).await,
                     Err(e) => {
                         tracing::warn!(slot, enabled, "output enable refused: {e}");
@@ -676,6 +705,7 @@ impl Audio {
                 }
             }
         }
+        last.max(at)
     }
 
     /// Sends one change through `set` at `at`. When the engine no longer
