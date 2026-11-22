@@ -72,6 +72,11 @@ pub struct BusShape {
     pub kind: String,
     pub width: usize,
     pub layout: String,
+    /// The longest delay the element's output delay line takes, in
+    /// samples, from `mxl.outputs.<id>.maxDelayMs` of the outputs
+    /// carrying it; none without a line.
+    #[serde(default, rename = "maxDelay", skip_serializing_if = "Option::is_none")]
+    pub max_delay: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,6 +86,11 @@ pub struct ElementShape {
     pub name: String,
     pub width: usize,
     pub layout: String,
+    /// The longest delay an aux's output delay line takes, in
+    /// samples, from `mxl.outputs.<id>.maxDelayMs` of the outputs
+    /// carrying it; none without a line.
+    #[serde(default, rename = "maxDelay", skip_serializing_if = "Option::is_none")]
+    pub max_delay: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,6 +146,23 @@ fn layout_width(layout: &str) -> usize {
         "5.1" => 6,
         _ => 8,
     }
+}
+
+/// The EQ, gate and compressor of an empty start, off and flat, and
+/// their default order: those of every channel, bus, aux and mix-minus
+/// output.
+pub fn initial_processing() -> Value {
+    json!({
+        "eq": { "enabled": false, "bands": [
+            { "type": "lowShelf", "freq": 100, "gain": 0, "q": 0.7 },
+            { "type": "peak", "freq": 400, "gain": 0, "q": 1 },
+            { "type": "peak", "freq": 2500, "gain": 0, "q": 1 },
+            { "type": "highShelf", "freq": 8000, "gain": 0, "q": 0.7 },
+        ]},
+        "gate": { "enabled": false, "threshold": -50, "range": 20, "attack": 1, "release": 200 },
+        "comp": { "enabled": false, "threshold": -18, "ratio": 3, "attack": 10, "release": 150, "makeup": 0 },
+        "dynamicsBeforeEq": false,
+    })
 }
 
 impl Shape {
@@ -274,6 +301,26 @@ impl Shape {
         self.buses.iter().any(|e| e.id == id) || self.auxes.iter().any(|e| e.id == id)
     }
 
+    /// The delay line of channel, bus or aux `id`, in samples: none for
+    /// one without a line or any other element.
+    pub fn delay_line(&self, id: &str) -> Option<u32> {
+        let channel = self
+            .channels
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.max_delay);
+        let bus = self.buses.iter().find(|e| e.id == id).map(|e| e.max_delay);
+        let aux = self.auxes.iter().find(|e| e.id == id).map(|e| e.max_delay);
+        channel.or(bus).or(aux).flatten()
+    }
+
+    /// Whether `id` names a bus, an aux or a mix-minus output, the
+    /// elements whose state holds EQ and dynamics: an output carrying one
+    /// has the engine's output strip.
+    pub fn has_strip(&self, id: &str) -> bool {
+        self.has_limiter(id) || self.mix_minus.iter().any(|e| e.id == id)
+    }
+
     /// The live state of an empty start: input channels closed, a tone
     /// channel's generator as configured with no ident, buses at 0 dB,
     /// nothing muted, every channel routed to every bus, sends off,
@@ -281,17 +328,12 @@ impl Shape {
     /// metering with every loudness measurement running, duck groups as
     /// [`duck::initial_state`] sets them, no scenes and no tally.
     pub fn initial_state(&self) -> Value {
-        let eq = || {
-            json!({ "enabled": false, "bands": [
-                { "type": "lowShelf", "freq": 100, "gain": 0, "q": 0.7 },
-                { "type": "peak", "freq": 400, "gain": 0, "q": 1 },
-                { "type": "peak", "freq": 2500, "gain": 0, "q": 1 },
-                { "type": "highShelf", "freq": 8000, "gain": 0, "q": 0.7 },
-            ]})
-        };
-        let gate =
-            json!({ "enabled": false, "threshold": -50, "range": 20, "attack": 1, "release": 200 });
-        let comp = json!({ "enabled": false, "threshold": -18, "ratio": 3, "attack": 10, "release": 150, "makeup": 0 });
+        let processing = initial_processing();
+        let (eq, gate, comp) = (
+            || processing["eq"].clone(),
+            &processing["gate"],
+            &processing["comp"],
+        );
         let bus = |width: usize| {
             json!({
                 "polarity": vec![false; width],
@@ -373,6 +415,7 @@ impl Shape {
             "mixMinus": by_id(self.mix_minus.iter().map(|m| (m.id.clone(), json!({
                 "exclude": [], "fader": 0, "mute": false,
                 "interrupt": { "source": null, "active": false },
+                "eq": eq(), "gate": gate, "comp": comp, "dynamicsBeforeEq": false,
             }))).collect()),
             "vcas": by_id(self.vcas.iter().map(|v| (v.id.clone(), json!({
                 "offset": 0, "mute": false, "members": [], "solo": "off",

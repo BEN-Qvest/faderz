@@ -127,7 +127,10 @@ struct Sent {
     /// not sent, as all are at start: the engine's strip passes its input
     /// unchanged until set.
     strips: Vec<Vec<Option<StripParam>>>,
-    /// The limiters, input delays, tone generators, duck groups and masks
+    /// Each output's strip parameters ([`strip::output_strips`]), as
+    /// `strips`.
+    output_strips: Vec<Vec<Option<StripParam>>>,
+    /// The limiters, input and output delays, tone generators, duck groups and masks
     /// the engine holds, as targets; `None` after a resend asked for, when
     /// every limiter, delay, tone, setting and mask goes again.
     ducks: Option<Targets>,
@@ -147,6 +150,7 @@ impl Sent {
     fn clear(&mut self, engine: &Engine) {
         self.matrix.iter_mut().flatten().for_each(|g| *g = f32::NAN);
         self.strips.iter_mut().flatten().for_each(|p| *p = None);
+        (self.output_strips.iter_mut().flatten()).for_each(|p| *p = None);
         self.ducks = None;
         self.loudness_held = false;
         let status = engine.status();
@@ -336,6 +340,9 @@ impl Audio {
                 .iter()
                 .map(|c| vec![None; strip::params(&Value::Null, c.width).len()])
                 .collect(),
+            output_strips: (strip::output_strips(&self.shape, &Value::Null).into_iter())
+                .map(|p| vec![None; p.len()])
+                .collect(),
             // What an engine holds before any duck entry: every group at
             // its defaults and every mask 0.
             ducks: Some(Targets {
@@ -500,9 +507,22 @@ impl Audio {
                 }
             }
         }
+        let output_strips = sent.output_strips.iter_mut().zip(targets.output_strips);
+        for (output, (sent, next)) in output_strips.enumerate() {
+            for (p, n) in sent.iter_mut().zip(next) {
+                if *p != Some(n)
+                    && self
+                        .send(&mut at, |at| self.engine.set_output_strip(output, n, at))
+                        .await
+                {
+                    *p = Some(n);
+                }
+            }
+        }
         let next = Targets {
             limiters: targets.limiters,
             delays: targets.delays,
+            output_delays: targets.output_delays,
             tones: targets.tones,
             ducks: targets.ducks,
             masks: targets.masks,
@@ -522,6 +542,10 @@ impl Audio {
                 }
                 &Entry::Delay { slot, samples } => {
                     let set = |at| self.engine.set_delay(slot, samples, at);
+                    self.send(&mut at, set).await
+                }
+                &Entry::OutputDelay { output, samples } => {
+                    let set = |at| self.engine.set_output_delay(output, samples, at);
                     self.send(&mut at, set).await
                 }
                 &Entry::Tone {
@@ -839,7 +863,7 @@ fn engine_status(status: &samplez::Status) -> Value {
     json!({ "inputs": inputs, "outputs": outputs })
 }
 
-/// Notes in `held` the limiter, delay, tone, duck setting or mask `entry`
+/// Notes in `held` the limiter, input or output delay, tone, duck setting or mask `entry`
 /// sent.
 fn hold_entry(held: &mut Targets, entry: Entry) {
     match entry {
@@ -863,6 +887,12 @@ fn hold_entry(held: &mut Targets, entry: Entry) {
                 held.delays.resize(slot + 1, 0);
             }
             held.delays[slot] = samples;
+        }
+        Entry::OutputDelay { output, samples } => {
+            if held.output_delays.len() <= output {
+                held.output_delays.resize(output + 1, 0);
+            }
+            held.output_delays[output] = samples;
         }
         Entry::Limiter { output, params } => {
             if held.limiters.len() <= output {

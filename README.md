@@ -56,13 +56,37 @@ mutes, bus and aux polarity, mix-minus exclusions and talkback
 interrupts, the monitor's source, channel and VCA PFL and AFL listening
 (PFL over AFL; PFL centred before the pan, AFL at the pan before the AFV
 stage), fold-down, image, level, dim, talkback dim, cut, mono and speaker mutes
-and solos, duck groups, the channel delay, the bus and aux true-peak
-limiter on every output carrying that bus or aux, and the scene crossfade. An output carrying a bus or aux is
+and solos, duck groups, the channel delay, the bus, aux and mix-minus EQ,
+gate and compressor on every output carrying that element, the bus and
+aux delay and true-peak limiter on every output carrying that bus or aux, and the
+scene crossfade. An output carrying a bus or aux is
 late by the limiter's look-ahead, 53 samples (about 1.1 ms at 48 kHz), whether
 the limiter is on or off, so that turning it on needs no restart; an
-output carrying a mix-minus, a direct out or the monitor is not. The rest of the state is kept, shown and replicated but not
-applied to the audio in this version: bus and aux EQ,
-dynamics and delay.
+output carrying a mix-minus, a direct out or the monitor is not.
+
+A bus's, aux's or mix-minus output's EQ, gate and compressor, in its
+`dynamicsBeforeEq` order, run on each output carrying it, after the
+element's fader and mute and before the output's limiter: on the mix,
+on the line-up tone while it replaces the mix, and on a mix-minus
+output's talkback while it interrupts. A bus's polarity stays in the
+mix, per leg of the bus. An output narrower than its element processes
+the fold-down, so a stereo and a mono output of one bus each compress
+on their own signal. The monitor, AFL and the mix-minus outputs of a
+bus sum the element's channels and do not hear its processing, as they
+do not hear its limiter. A bus's, aux's or mix-minus output's meter
+reads the level after its processing, delay and limiter when the element has
+an output of its full width, the first such output in `outputs`; it
+reads the element's matrix columns, before any processing, when the
+element has none. An output narrower than its element, a fold-down,
+has no meter of its own. The line-up tone runs through the strip of
+each output carrying the element, as the mix does. A mix-minus output's
+EQ and dynamics are set through `PATCH /api/v1/state` and the
+WebSocket `set` message at `/mixMinus/<id>/eq/...`, `gate/...`,
+`comp/...` and `dynamicsBeforeEq`; the console has no control for
+them. faderz 0.4.10 and earlier kept bus and aux EQ and
+dynamics without applying them: a state or scene that stored them on
+plays them from the first release that applies them, and a mix-minus
+output's processing starts off and flat.
 
 A channel delays its input by its `delay`, in samples, exactly, for lip
 sync: opt-in per channel through `mxl.inputs.<channel>.maxDelayMs`, the
@@ -76,10 +100,28 @@ scene holds a delay past the line, shortened since the scene was stored,
 sets that channel's delay to 0 and names the channel in its answer's
 `delaysNotApplied`.
 
-Once a channel has a line, a snapshot carries it as the shape's
-`maxDelay`, and a recall that set a delay to 0 carries its answer;
-faderz 0.4.9 and earlier read neither. Rolling back to such a release
-needs the data volume cleared.
+A bus or aux delays every output carrying it by its `delay`, in
+samples, exactly, after its EQ and dynamics and before the output's
+limiter, so such an output is late by the delay plus the limiter's
+look-ahead. A mix-minus output of the bus, the monitor and AFL are not
+delayed. The line is opt-in per output through
+`mxl.outputs.<output>.maxDelayMs`, the same on every output carrying
+one bus or aux, which is refused otherwise, as is a line on an output
+carrying anything else. The shape gives the element's line as its
+`maxDelay`; without one it takes no delay but 0, and a write past it is
+refused. Each output's line counts once per leg of the output in
+`engine.delayBudgetSamples`, beside the channels' lines. A recall sets a
+bus's or aux's delay past its line to 0 and names it in
+`delaysNotApplied`; a loaded state drops it to 0. faderz 0.4.10 and
+earlier kept a bus or aux delay without applying it and took any up to
+5 s: such a delay with no line, or past its line, is 0 from the first
+release that applies it.
+
+Once a channel, bus or aux has a line, a snapshot carries it as the
+shape's `maxDelay`, and a recall that set a delay to 0 carries its
+answer; faderz 0.4.9 and earlier read neither of a channel, and faderz
+0.4.10 and earlier neither of a bus or aux. Rolling back to such a
+release needs the data volume cleared.
 
 A channel whose input is configured `tone` in place of a `flow` plays
 samplez's line-up tone generator: a sine of whole hertz at a sample-peak
@@ -101,8 +143,9 @@ earlier do not read either.
 The line-up tone (`/tone`) is a 1 kHz sine at `level`, -30 to 0 dBFS
 sample peak, on every leg. While `on`, each output whose bus, aux or
 mix-minus is in `targets` carries the tone in place of its mix, after
-the element's fader and before the output's limiter, so the fader does
-not scale it and the limiter still applies; an output narrower than its
+the element's fader and before the output's strip and limiter, so the
+fader does not scale it and the element's EQ, dynamics and limiter still
+apply; an output narrower than its
 element carries the tone's first legs. The element's meters show the
 tone, and a monitor playing the element plays the tone as it plays a
 source, through its own level, dim, downmix, mono and speaker controls;
@@ -432,7 +475,7 @@ variable; the flag wins over the variable, the variable over the file.
 | `mxl.libraryPath` | `/opt/mxl/lib/libmxl.so` | libmxl, loaded at start |
 | `mxl.domains` | | `[{name, path, id}]`: the mounted MXL domains; `id`, the domain's MXL id, for NMOS when the domain has no `domain_def.json` |
 | `mxl.inputs.<channel>` | | `flow`; `altFlow` for a channel with `altInput`; `domain` with more than one domain; `channels`, the 1-based flow channel each leg reads; `maxDelayMs`, the channel's delay line, none by default; or `tone`, a line-up tone generator in place of a flow, `{}` or the `frequency` and `level` it starts at |
-| `mxl.outputs.<output>` | | `flow` in a set of one; `flows`, one member flow per replica by ordinal, in a set of more; `domain` with more than one domain; `mergedFlow`, the flow merging the member flows, which the NMOS sender names, in a set of more with `nmos.enabled` |
+| `mxl.outputs.<output>` | | `flow` in a set of one; `flows`, one member flow per replica by ordinal, in a set of more; `domain` with more than one domain; `mergedFlow`, the flow merging the member flows, which the NMOS sender names, in a set of more with `nmos.enabled`; `maxDelayMs`, the delay line of the bus or aux the output carries, none by default, the same on every output carrying it |
 | `engine.sampleRate` | `48000` | |
 | `engine.blockSize` | `48` | samples per block |
 | `engine.readerMarginSamples` | `1536` | read delay behind libmxl's clock; delays every output by as much |

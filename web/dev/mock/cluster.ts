@@ -224,7 +224,7 @@ function leaves(value: unknown, base: string, out: Change[] = []): Change[] {
 export function recallGroup(path: string): RecallGroup | null {
   const [group, , key] = parsePointer(path);
   if (group === 'afv') return key === 'open' ? null : 'afv';
-  if (group === 'mixMinus') return key === 'exclude' ? 'routing' : key === 'interrupt' ? null : (key as RecallGroup);
+  if (group === 'mixMinus' && (key === 'exclude' || key === 'interrupt')) return key === 'exclude' ? 'routing' : null;
   if (group === 'vcas') return key === 'offset' ? 'fader' : key === 'members' ? 'routing' : key === 'solo' ? null : 'mute';
   if (group === 'ducks') return duckRecallGroup(parsePointer(path).slice(2));
   switch (key) {
@@ -1066,11 +1066,12 @@ export class Cluster {
     if (input && value === 'b' && !this.shape.channels.find((c) => c.id === input[1])?.altInput) {
       return `channel ${input[1]} has no B input`;
     }
-    const delay = /^\/channels\/([^/]+)\/delay$/.exec(path);
+    const delay = /^\/(channels|buses|auxes)\/([^/]+)\/delay$/.exec(path);
     if (delay && typeof value === 'number' && value > 0) {
-      const line = this.shape.channels.find((c) => c.id === delay[1])?.maxDelay;
-      if (line === undefined) return `channel ${delay[1]} has no delay line`;
-      if (value > line) return `channel ${delay[1]} delays at most ${line} samples, its delay line`;
+      const kind = { channels: 'channel', buses: 'bus', auxes: 'aux' }[delay[1] as 'channels' | 'buses' | 'auxes'];
+      const line = (this.shape[delay[1] as 'channels' | 'buses' | 'auxes'] as Array<{ id: string; maxDelay?: number }>).find((e) => e.id === delay[2])?.maxDelay;
+      if (line === undefined) return `${kind} ${delay[2]} has no delay line`;
+      if (value > line) return `${kind} ${delay[2]} delays at most ${line} samples, its delay line`;
     }
     if (path === '/tone/targets') {
       const outputs = new Set([...this.shape.buses, ...this.shape.auxes, ...this.shape.mixMinus].map((e) => e.id));

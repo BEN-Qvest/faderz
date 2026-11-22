@@ -36,7 +36,7 @@ pub fn crossfade_lead(rate: u64) -> u64 {
 /// ([`Product::DERIVATION_VERSION`], in samplez's compatibility key): a
 /// change to any of them takes another version, so replicas deriving
 /// differently never run side by side.
-pub const DERIVATION_VERSION: u32 = 10;
+pub const DERIVATION_VERSION: u32 = 11;
 
 /// The layout [`Product::save`] writes. A snapshot carries it beside
 /// the state, which binaries before it read from the top level: they
@@ -453,8 +453,8 @@ pub enum Answer {
     Refused { message: String },
     /// The console a `PutConsole` created.
     Created,
-    /// The channels a `Recall` set to a delay of 0: their stored delay is
-    /// past their delay line.
+    /// The channels, buses and auxes a `Recall` set to a delay of 0:
+    /// their stored delay is past their delay line.
     Recalled { delays: Vec<String> },
 }
 
@@ -1220,21 +1220,23 @@ impl Mixer {
                 .any(|c| &c.id == channel && c.alt_input)
         {
             return Err(format!("channel {channel} has no B input"));
-        } else if let [group, channel, leaf] = tokens(path).as_slice()
-            && (group.as_str(), leaf.as_str()) == ("channels", "delay")
-        {
-            // The engine refuses a delay past the input's line.
-            let line = (shape.channels.iter())
-                .find(|c| &c.id == channel)
-                .and_then(|c| c.max_delay);
+        } else if let Some(element) = delayed_element(path) {
+            // The engine refuses a delay past the line of the channel's
+            // input or of the bus's or aux's outputs.
+            let line = shape.delay_line(&element);
             let samples = value.as_u64().unwrap_or(0);
+            let kind = match tokens(path)[0].as_str() {
+                "channels" => "channel",
+                "buses" => "bus",
+                _ => "aux",
+            };
             match line {
                 None if samples > 0 => {
-                    return Err(format!("channel {channel} has no delay line"));
+                    return Err(format!("{kind} {element} has no delay line"));
                 }
                 Some(max) if samples > u64::from(max) => {
                     return Err(format!(
-                        "channel {channel} delays at most {max} samples, its delay line"
+                        "{kind} {element} delays at most {max} samples, its delay line"
                     ));
                 }
                 _ => {}
@@ -1763,11 +1765,11 @@ impl Mixer {
             // A scene keeps the ids and delays of the shape it was stored
             // in.
             if let Err(e) = self.check_references(&path, &v) {
-                let Some(channel) = delayed_channel(&path) else {
+                let Some(element) = delayed_element(&path) else {
                     continue;
                 };
-                tracing::warn!(scene, channel, "recall sets the delay to 0: {e}");
-                short.push(channel);
+                tracing::warn!(scene, element, "recall sets the delay to 0: {e}");
+                short.push(element);
                 v = json!(0);
             }
             if *current != v {
@@ -2089,8 +2091,8 @@ impl Mixer {
             if fits {
                 set_at(&mut state, &path, value);
             } else {
-                if let Some(channel) = delayed_channel(&path) {
-                    tracing::warn!(channel, %value, "the delay line no longer takes the saved delay: 0");
+                if let Some(element) = delayed_element(&path) {
+                    tracing::warn!(element, %value, "the delay line no longer takes the saved delay: 0");
                 }
                 dropped.push(path);
             }
@@ -2413,6 +2415,7 @@ impl Product for Mixer {
             self.shape = Some(Arc::new(saved.shape));
             self.state = Arc::new(saved.state);
             fill_pan(Arc::make_mut(&mut self.state));
+            fill_mix_minus(Arc::make_mut(&mut self.state));
             // Taken before duck groups were kept: its shape has none.
             if self.state.get("ducks").is_none() {
                 Arc::make_mut(&mut self.state)["ducks"] = json!({});
@@ -2449,6 +2452,20 @@ fn fill_pan(state: &mut Value) {
     for pan in channels.filter_map(|(_, c)| c.get_mut("pan")?.as_object_mut()) {
         for (leaf, initial) in [("frontRear", -1), ("spread", 1), ("lfeSend", -90)] {
             pan.entry(leaf).or_insert(json!(initial));
+        }
+    }
+}
+
+/// A snapshot an older binary saved has no EQ or dynamics in its
+/// mix-minus outputs: the initial ones fill them in, off, as a
+/// configured state does ([`Mixer::reconcile`]), so a write can reach
+/// them and every output strip has its parameters.
+fn fill_mix_minus(state: &mut Value) {
+    let processing = crate::shape::initial_processing();
+    let elements = state["mixMinus"].as_object_mut().into_iter().flatten();
+    for m in elements.filter_map(|(_, m)| m.as_object_mut()) {
+        for (leaf, initial) in processing.as_object().into_iter().flatten() {
+            m.entry(leaf).or_insert(initial.clone());
         }
     }
 }
@@ -2502,10 +2519,14 @@ fn changed(values: Vec<(String, Value)>) -> Effect<Edits> {
 /// Leaves to write, as paths and values.
 type Leaves = Vec<(String, Value)>;
 
-/// The channel whose delay `path` is.
-fn delayed_channel(path: &str) -> Option<String> {
+/// The channel, bus or aux whose delay `path` is.
+fn delayed_element(path: &str) -> Option<String> {
     match tokens(path).as_slice() {
-        [group, channel, leaf] if group == "channels" && leaf == "delay" => Some(channel.clone()),
+        [group, element, leaf]
+            if matches!(group.as_str(), "channels" | "buses" | "auxes") && leaf == "delay" =>
+        {
+            Some(element.clone())
+        }
         _ => None,
     }
 }
@@ -2601,6 +2622,8 @@ fn recall_group(path: &str) -> Option<&'static str> {
         "mixMinus" => match key? {
             "exclude" => Some("routing"),
             "interrupt" => None,
+            "eq" => Some("eq"),
+            "gate" | "comp" | "dynamicsBeforeEq" => Some("dynamics"),
             "fader" => Some("fader"),
             "mute" => Some("mute"),
             _ => None,
@@ -4412,10 +4435,30 @@ mod tests {
     }
 
     /// [`wide_with`] with ch4 a tone channel at 440 Hz, -20 dBFS, wired
-    /// to no flow.
+    /// to no flow, and an output carrying each aux, the mix-minus output
+    /// where there is one, and the clean feed folded to mono; the
+    /// programme bus has a delay line of 960 samples, aux2 one of 480.
     fn wide_toned(fold: bool) -> Mixer {
         let m = wide_with(fold);
         let mut shape = m.shape().clone();
+        let output = |source: &str, width: usize, layout: &str| crate::shape::OutputShape {
+            id: format!("out-{source}-{width}"),
+            name: source.into(),
+            source: source.into(),
+            width,
+            layout: layout.into(),
+        };
+        shape.outputs.extend([
+            output("aux1", 1, "mono"),
+            output("aux2", 2, "stereo"),
+            output("cf", 1, "mono"),
+        ]);
+        if !fold {
+            shape.outputs.push(output("mm1", 2, "stereo"));
+        }
+        shape.buses[0].max_delay = Some(960);
+        let aux2 = shape.auxes.iter().position(|a| a.id == "aux2").unwrap();
+        shape.auxes[aux2].max_delay = Some(480);
         let slot = (shape.channels.iter().position(|c| c.id == "ch4")).unwrap();
         shape.channels[slot].alt_input = false;
         shape.channels[slot].tone = Some(crate::shape::ChannelTone {
@@ -4510,7 +4553,7 @@ mod tests {
             let some = |next: &mut dyn FnMut(u64) -> u64| -> Value {
                 json!(channels.iter().filter(|_| next(3) == 0).collect::<Vec<_>>())
             };
-            match next(42) {
+            match next(45) {
                 0 => (format!("/channels/{ch}/fader"), db),
                 1 => (format!("/channels/{ch}/mute"), flag),
                 2 => (
@@ -4662,6 +4705,41 @@ mod tests {
                     2 => ("/tone/level".into(), json!(-(next(301) as f64) / 10.0)),
                     _ => ("/tone/ident".into(), flag),
                 },
+                // A bus's, aux's or mix-minus output's processing, and a
+                // bus's or aux's limiter.
+                41 => {
+                    let e = elements[next(5) as usize];
+                    let band = next(4);
+                    match next(8) {
+                        0 => (format!("/{e}/eq/enabled"), flag),
+                        1 => (
+                            format!("/{e}/eq/bands/{band}/gain"),
+                            json!(next(37) as f64 - 18.0),
+                        ),
+                        2 => (
+                            format!("/{e}/eq/bands/{band}/type"),
+                            json!(["lowShelf", "peak", "highShelf"][next(3) as usize]),
+                        ),
+                        3 => (format!("/{e}/gate/enabled"), flag),
+                        4 => (format!("/{e}/gate/threshold"), json!(-(next(80) as f64))),
+                        5 => (format!("/{e}/comp/enabled"), flag),
+                        6 => (format!("/{e}/comp/ratio"), json!(1 + next(20))),
+                        _ => (format!("/{e}/dynamicsBeforeEq"), flag),
+                    }
+                }
+                42 => {
+                    let e = elements[next(4) as usize];
+                    match next(2) {
+                        0 => (format!("/{e}/limiter/enabled"), flag),
+                        _ => (format!("/{e}/limiter/ceiling"), json!(-(next(11) as f64))),
+                    }
+                }
+                // Within pgm's and aux2's lines; any but 0 is refused on
+                // the others.
+                43 => (
+                    format!("/{}/delay", elements[next(4) as usize]),
+                    json!(next(3) * 480),
+                ),
                 _ => ("/metering/loudness/preset".into(), json!("atsc")),
             }
         };
@@ -4764,6 +4842,17 @@ mod tests {
                 );
                 assert_eq!(kept.flows, whole.flows, "{at}");
                 assert_eq!(kept.delays, whole.delays, "{at}");
+                assert_eq!(
+                    format!("{:?}", kept.output_strips),
+                    format!("{:?}", whole.output_strips),
+                    "{at}"
+                );
+                assert_eq!(kept.output_delays, whole.output_delays, "{at}");
+                assert_eq!(
+                    format!("{:?}", kept.limiters),
+                    format!("{:?}", whole.limiters),
+                    "{at}"
+                );
                 assert_eq!(kept.tones, whole.tones, "{at}");
                 assert_eq!(
                     format!("{:?}", kept.ducks),
@@ -5300,6 +5389,92 @@ mod tests {
         assert_eq!(same.targets().unwrap().delays, [960, 0, 0]);
     }
 
+    /// `wired` with a stereo and a mono output of the programme bus, its
+    /// delay line `line` samples, and an output of aux1, which has none.
+    fn bus_delayed(line: u32) -> Mixer {
+        let m = wired();
+        let mut shape = m.shape().clone();
+        let output =
+            |id: &str, source: &str, width: usize, layout: &str| crate::shape::OutputShape {
+                id: id.into(),
+                name: id.into(),
+                source: source.into(),
+                width,
+                layout: layout.into(),
+            };
+        shape.outputs.extend([
+            output("out-pgm-m", "pgm", 1, "mono"),
+            output("out-aux", "aux1", 1, "mono"),
+        ]);
+        shape.buses[0].max_delay = Some(line);
+        Mixer::configured(shape, Vec::new(), m.wiring.clone())
+    }
+
+    /// A bus's delay is the delay target of every output carrying it, 0
+    /// by default, and reaches the engine as one `OutputDelay` entry per
+    /// such output. A write is refused past the bus's line and, on an aux
+    /// without one, for anything but 0. A loaded state whose bus delay
+    /// the configured line no longer takes drops it to 0, and a recall
+    /// sets it to 0 and names the bus in its answer.
+    #[test]
+    fn a_bus_delay_is_its_outputs_delay_within_its_line() {
+        let mut m = bus_delayed(960);
+        let before = m.targets().unwrap();
+        assert_eq!(before.output_delays, [0, 0, 0]);
+        patch(&mut m, "p1", &[("/buses/pgm/delay", json!(960))]);
+        let after = m.targets().unwrap();
+        assert_eq!(after.output_delays, [960, 960, 0]);
+        let entries: Vec<String> = (before.diff(&after).iter())
+            .filter(|e| matches!(e, samplez::engine::Entry::OutputDelay { .. }))
+            .map(|e| format!("{e:?}"))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                "OutputDelay { output: 0, samples: 960 }",
+                "OutputDelay { output: 1, samples: 960 }"
+            ]
+        );
+        let refused = |m: &Mixer, path: &str, value: Value| match m.check_write(path, &value) {
+            Err(Answer::Invalid { message }) => message,
+            other => panic!("{path} {value}: {other:?}"),
+        };
+        let e = refused(&m, "/buses/pgm/delay", json!(961));
+        assert!(e.contains("bus pgm delays at most 960 samples"), "{e}");
+        let e = refused(&m, "/auxes/aux1/delay", json!(1));
+        assert!(e.contains("aux aux1 has no delay line"), "{e}");
+        let e = refused(&m, "/buses/cf/delay", json!(1));
+        assert!(e.contains("bus cf has no delay line"), "{e}");
+        m.check_write("/auxes/aux1/delay", &json!(0)).unwrap();
+
+        let scene = store(&mut m, "s1", None, "Lip sync");
+        let mut shorter = bus_delayed(480);
+        shorter.load(&m.save()).unwrap();
+        assert_eq!(shorter.state()["buses"]["pgm"]["delay"], 0);
+        assert_eq!(shorter.dropped, ["/buses/pgm/delay"]);
+        assert_eq!(shorter.targets().unwrap().output_delays, [0, 0, 0]);
+        patch(&mut shorter, "p2", &[("/buses/pgm/delay", json!(240))]);
+        rest(
+            &mut shorter,
+            Command::Recall {
+                id: "r1".into(),
+                scene,
+                at: "2026-11-21T12:01:00.000Z".into(),
+                fade: None,
+            },
+        );
+        assert_eq!(shorter.state()["buses"]["pgm"]["delay"], 0);
+        assert_eq!(
+            shorter.answer(&rest_key(), "r1"),
+            Some(&Answer::Recalled {
+                delays: vec!["pgm".into()]
+            })
+        );
+        let mut same = bus_delayed(960);
+        same.load(&m.save()).unwrap();
+        assert_eq!(same.targets().unwrap().output_delays, [960, 960, 0]);
+    }
+
     /// `wired` with st1 a tone channel starting at 440 Hz, -20 dBFS, as
     /// the configuration wires one: to no flow.
     fn toned() -> Mixer {
@@ -5807,6 +5982,96 @@ mod tests {
             assert_eq!(*at(&replayed, &format!("{pan}/frontRear")), json!(-1));
             assert_eq!(*at(&replayed, &format!("{pan}/spread")), json!(1));
             assert_eq!(*at(&replayed, &format!("{pan}/lfeSend")), json!(-90));
+        }
+    }
+
+    /// A mix-minus output's EQ and dynamics are its outputs' strip: a
+    /// write moves the strip of the output carrying it alone, a scene
+    /// recalls them under the eq and dynamics groups, recall-safe keeps
+    /// them, and a snapshot an older binary saved without them loads
+    /// with them off.
+    #[test]
+    fn a_mix_minus_output_has_eq_and_dynamics_of_its_own() {
+        let mut v = small();
+        v["outputs"] = json!([
+            { "id": "out-pgm", "name": "PGM", "source": "pgm", "width": 2, "layout": "stereo" },
+            { "id": "out-mm", "name": "N-1", "source": "mm1", "width": 2, "layout": "stereo" },
+        ]);
+        let shape = Shape::parse(&v).unwrap();
+        let wiring: Vec<Wiring> = (shape.channels.iter())
+            .map(|c| Wiring {
+                a: format!("a-{}", c.id),
+                b: c.alt_input.then(|| format!("b-{}", c.id)),
+                domain: "d".into(),
+            })
+            .collect();
+        let mut m = Mixer::configured(shape.clone(), Vec::new(), wiring.clone());
+        let off = m.targets().unwrap().output_strips;
+        assert_eq!(off.iter().map(Vec::len).collect::<Vec<_>>(), [8, 8]);
+        set(&mut m, "a", 1, "/mixMinus/mm1/eq/enabled", json!(true));
+        set(&mut m, "a", 2, "/mixMinus/mm1/comp/ratio", json!(8));
+        let t = m.targets().unwrap();
+        assert_eq!(
+            t.output_strips[0], off[0],
+            "the programme output's is the bus's"
+        );
+        assert_eq!(t.output_strips[1][0], StripParam::Eq { enabled: true });
+        assert!(matches!(t.output_strips[1][6], StripParam::Comp(c) if c.ratio == 8.0));
+        let scene = store(&mut m, "s1", None, "N-1 on");
+        set(&mut m, "a", 3, "/mixMinus/mm1/eq/enabled", json!(false));
+        set(&mut m, "a", 4, "/mixMinus/mm1/comp/ratio", json!(2));
+        let recall = |m: &mut Mixer, id: &str| {
+            rest(
+                m,
+                Command::Recall {
+                    id: id.into(),
+                    scene: scene.clone(),
+                    at: "2026-11-21T00:00:00Z".into(),
+                    fade: None,
+                },
+            )
+        };
+        recall(&mut m, "r1");
+        assert_eq!(*at(&m, "/mixMinus/mm1/eq/enabled"), json!(true));
+        assert_eq!(*at(&m, "/mixMinus/mm1/comp/ratio"), json!(8));
+        set(&mut m, "a", 5, "/mixMinus/mm1/eq/enabled", json!(false));
+        set(&mut m, "a", 6, "/mixMinus/mm1/comp/ratio", json!(2));
+        set(&mut m, "a", 7, "/recallSafe/mm1", json!(["eq"]));
+        recall(&mut m, "r2");
+        assert_eq!(
+            *at(&m, "/mixMinus/mm1/eq/enabled"),
+            json!(false),
+            "recall-safe"
+        );
+        assert_eq!(*at(&m, "/mixMinus/mm1/comp/ratio"), json!(8));
+        // A snapshot of an older binary: no processing in its mix-minus.
+        let mut old: Value = serde_json::from_slice(&m.save()).unwrap();
+        let mm = old["mixer"]["state"]["mixMinus"]["mm1"]
+            .as_object_mut()
+            .unwrap();
+        for leaf in ["eq", "gate", "comp", "dynamicsBeforeEq"] {
+            assert!(mm.remove(leaf).is_some(), "{leaf}");
+        }
+        let initial = shape.initial_state()["mixMinus"]["mm1"].clone();
+        for mut loaded in [
+            Mixer::default(),
+            Mixer::configured(shape.clone(), Vec::new(), wiring),
+        ] {
+            loaded.load(&serde_json::to_vec(&old).unwrap()).unwrap();
+            let state = &loaded.state()["mixMinus"]["mm1"];
+            for leaf in ["eq", "gate", "comp", "dynamicsBeforeEq"] {
+                assert_eq!(state[leaf], initial[leaf], "{leaf}");
+            }
+            for (o, params) in shape
+                .outputs
+                .iter()
+                .zip(strip::output_strips(&shape, loaded.state()))
+            {
+                for p in params {
+                    p.check(o.width)
+                        .unwrap_or_else(|e| panic!("{}: {p:?}: {e}", o.id));
+                }
+            }
         }
     }
 
