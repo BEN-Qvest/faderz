@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/danielclasen/faderz/compare/faderz-bridge-v0.2.1...faderz-bridge-v0.3.0) (2026-11-22)
+
+
+### Bug Fixes
+
+* **deps:** take url 2.5.9 for RUSTSEC-2026-0592 ([65e72e8](https://github.com/danielclasen/faderz/commit/65e72e88a4504dc656a30d72231c7e0f198014ae))
+
 ## [0.2.1](https://github.com/danielclasen/faderz/compare/faderz-bridge-v0.2.0...faderz-bridge-v0.2.1) (2026-11-19)
 
 
