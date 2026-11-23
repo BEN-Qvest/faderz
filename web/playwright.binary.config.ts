@@ -3,7 +3,7 @@
 // (tests/binary/proxy.mjs), and oidc against a stand-in OpenID provider
 // (tests/binary/idp.mjs). Build the UI and then the binary first.
 
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { defineConfig, devices } from '@playwright/test';
 import { configShape } from './dev/mock/shape';

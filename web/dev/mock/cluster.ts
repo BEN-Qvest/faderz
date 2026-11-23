@@ -191,10 +191,6 @@ export class CommandError extends Error {
 
 export const sessionKey = (o: Pick<Owner, 'principal' | 'handle'>) => `${o.principal}\n${o.handle}`;
 
-function sampleIndexNow(): number {
-  return Math.floor(Date.now() * SAMPLES_PER_MS) + APPLY_MARGIN_SAMPLES;
-}
-
 /** Appends to a command log, dropping its oldest entry beyond AUDIT_LIMIT. */
 function capped<T>(list: T[], entry: T): void {
   list.push(entry);

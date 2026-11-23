@@ -184,6 +184,11 @@ disabled against repeat presses, and a visible error if it fails.
   abstractions or error handling for impossible states.
 - Fail loudly. Work is not complete while anything was skipped, and tests
   do not pass while any were skipped.
+- A poisoned `std::sync` lock means a thread panicked while holding it,
+  so what it guards may be half updated. Nothing recovers it: outside
+  test code, every `lock()`, `read()` and `write()` on one is
+  `.expect("<what it guards> lock poisoned")`, which panics again and
+  names the lock. Tests may unwrap.
 
 ## Text
 
