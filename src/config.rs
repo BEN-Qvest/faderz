@@ -663,10 +663,63 @@ pub enum Command {
     Help,
 }
 
+/// Why the command line or the configuration was refused. Each variant
+/// reads as the text the operator sees at startup.
+#[derive(Debug)]
+pub enum Error {
+    /// An argument [`command`] does not know.
+    UnknownArgument(String),
+    /// A flag given last, with no value after it.
+    MissingValue(String),
+    /// No `--config <file>` among the arguments.
+    NoConfig,
+    /// The configuration file could not be read.
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// Not JSON, or JSON that is not a [`Config`].
+    Json(serde_json::Error),
+    /// A [`SETTINGS`] path that crosses a value which is not an object.
+    NotAnObject(String),
+    /// A value the configuration's own rules refuse.
+    Invalid(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::UnknownArgument(arg) => write!(f, "unknown argument {arg:?}"),
+            Error::MissingValue(flag) => write!(f, "{flag} needs a value"),
+            Error::NoConfig => f.write_str("--config <file> is required"),
+            Error::Read { path, source } => write!(f, "{}: {source}", path.display()),
+            Error::Json(e) => write!(f, "{e}"),
+            Error::NotAnObject(path) => write!(f, "{path}: not an object"),
+            Error::Invalid(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Read { source, .. } => Some(source),
+            Error::Json(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<String> for Error {
+    fn from(why: String) -> Self {
+        Error::Invalid(why)
+    }
+}
+
 /// Parses the arguments after the program name: `--config <file>` and
 /// any [`SETTINGS`] flag, each as `--flag value` or `--flag=value`, or
 /// `--version` or `--help` alone.
-pub fn command(args: &[String]) -> Result<Command, String> {
+pub fn command(args: &[String]) -> Result<Command, Error> {
     match args {
         [only] if only == "--version" => return Ok(Command::Version),
         [only] if only == "--help" || only == "-h" => return Ok(Command::Help),
@@ -682,11 +735,13 @@ pub fn command(args: &[String]) -> Result<Command, String> {
         };
         let known = flag == "--config" || SETTINGS.iter().any(|s| s.flag == flag);
         if !known {
-            return Err(format!("unknown argument {arg:?}"));
+            return Err(Error::UnknownArgument(arg.clone()));
         }
         let value = match inline {
             Some(v) => v,
-            None => args.next().ok_or(format!("{flag} needs a value"))?.clone(),
+            None => (args.next())
+                .ok_or_else(|| Error::MissingValue(flag.to_owned()))?
+                .clone(),
         };
         if flag == "--config" {
             config = Some(PathBuf::from(value));
@@ -694,7 +749,7 @@ pub fn command(args: &[String]) -> Result<Command, String> {
             flags.push((flag.to_owned(), value));
         }
     }
-    let config = config.ok_or("--config <file> is required")?;
+    let config = config.ok_or(Error::NoConfig)?;
     Ok(Command::Run { config, flags })
 }
 
@@ -768,7 +823,7 @@ pub fn apply(
     config: &mut Value,
     flags: &[(String, String)],
     env: impl Fn(&str) -> Option<String>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     for s in SETTINGS {
         let Some((given, _)) = given(s, flags, &env) else {
             continue;
@@ -786,7 +841,7 @@ pub fn apply(
         let mut at = &mut *config;
         for key in parents {
             if !at.is_object() {
-                return Err(format!("{}: not an object", s.path.join(".")));
+                return Err(Error::NotAnObject(s.path.join(".")));
             }
             at = at
                 .as_object_mut()
@@ -799,7 +854,7 @@ pub fn apply(
         }
         match at.as_object_mut() {
             Some(o) => o.insert((*last).to_owned(), value),
-            None => return Err(format!("{}: not an object", s.path.join("."))),
+            None => return Err(Error::NotAnObject(s.path.join("."))),
         };
     }
     let oidc_mode = config.pointer("/auth/mode").and_then(Value::as_str) == Some("oidc");
@@ -819,16 +874,16 @@ impl Config {
     /// the process environment on top: the shape against the contract and
     /// its own rules ([`Shape::parse`]), the replica name against model
     /// `Id`.
-    pub fn load(
-        path: &Path,
-        flags: &[(String, String)],
-    ) -> Result<(Config, Shape, String), String> {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    pub fn load(path: &Path, flags: &[(String, String)]) -> Result<(Config, Shape, String), Error> {
+        let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
+            path: path.to_owned(),
+            source,
+        })?;
         Config::parse_with(&text, flags, |k| std::env::var(k).ok(), hostname)
     }
 
     /// [`Config::parse_with`] without flags or environment.
-    pub fn parse(text: &str, host: fn() -> String) -> Result<(Config, Shape, String), String> {
+    pub fn parse(text: &str, host: fn() -> String) -> Result<(Config, Shape, String), Error> {
         Config::parse_with(text, &[], |_| None, host)
     }
 
@@ -837,36 +892,39 @@ impl Config {
         flags: &[(String, String)],
         env: impl Fn(&str) -> Option<String>,
         host: fn() -> String,
-    ) -> Result<(Config, Shape, String), String> {
-        let mut value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    ) -> Result<(Config, Shape, String), Error> {
+        let mut value: Value = serde_json::from_str(text).map_err(Error::Json)?;
         apply(&mut value, flags, &env)?;
-        let config: Config = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let config: Config = serde_json::from_value(value).map_err(Error::Json)?;
         // In proxy mode the API takes who the identity headers name, so
         // only the proxy may reach it: the proxy runs beside faderz, as a
         // sidecar in its pod, and nothing else can connect to loopback.
         if config.auth.mode == AuthMode::Proxy && !config.listeners.api.bind.is_loopback() {
-            return Err(format!(
+            return Err(Error::Invalid(format!(
                 "auth.mode proxy needs listeners.api.bind on loopback, not {}: \
                  identity headers from anything but the proxy would be taken",
                 config.listeners.api.bind
-            ));
+            )));
         }
         let mut shape = Shape::parse(&config.shape).map_err(|e| format!("shape: {e}"))?;
         for (i, c) in config.consoles.iter().enumerate() {
             check(&contract().console_status, &c.status(None, false, 0))
                 .map_err(|e| format!("consoles[{i}]: {e}"))?;
             if config.consoles[..i].iter().any(|d| d.id == c.id) {
-                return Err(format!("consoles[{i}].id {:?}: used twice", c.id));
+                return Err(Error::Invalid(format!(
+                    "consoles[{i}].id {:?}: used twice",
+                    c.id
+                )));
             }
         }
         let mut config = config;
         if !MAX_APPLY_LEAD_MS.contains(&config.replica.max_apply_lead_ms) {
-            return Err(format!(
+            return Err(Error::Invalid(format!(
                 "replica.maxApplyLeadMs {}: not in {}..={}",
                 config.replica.max_apply_lead_ms,
                 MAX_APPLY_LEAD_MS.start(),
                 MAX_APPLY_LEAD_MS.end()
-            ));
+            )));
         }
         let name = config.replica.name.clone().unwrap_or_else(host);
         check(&contract().id, &json!(name)).map_err(|e| {

@@ -13,7 +13,7 @@ fn the_replica_is_named_after_the_host_unless_configured() {
     assert_eq!(name, "r1");
 }
 
-fn set_of(replica: Value, host: fn() -> String) -> Result<Option<Set>, String> {
+fn set_of(replica: Value, host: fn() -> String) -> Result<Option<Set>, Error> {
     Config::parse(&with(replica), host).map(|(c, _, _)| c.set)
 }
 
@@ -104,7 +104,9 @@ fn replica_ids_are_unique_whatever_the_peer_addresses_are() {
 #[test]
 fn one_replica_is_a_set_of_one_and_takes_no_set_keys() {
     assert!(set_of(json!({}), || "faderz-0".into()).unwrap().is_none());
-    let e = set_of(json!({ "marker": "m" }), || "x".into()).unwrap_err();
+    let e = set_of(json!({ "marker": "m" }), || "x".into())
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("replica.marker"), "{e}");
 }
 
@@ -112,7 +114,7 @@ fn one_replica_is_a_set_of_one_and_takes_no_set_keys() {
 fn a_set_that_cannot_work_is_refused() {
     let host = || "faderz-0".to_owned();
     let refused = |v: Value, key: &str| {
-        let e = set_of(v, host).unwrap_err();
+        let e = set_of(v, host).unwrap_err().to_string();
         assert!(e.contains(key), "{key}: {e}");
     };
     let mut even = three(json!({ "replicas": 2 }));
@@ -120,7 +122,9 @@ fn a_set_that_cannot_work_is_refused() {
     refused(even, "replica.replicas");
     refused(three(json!({ "peers": ["a:1", "b:1"] })), "replica.peers");
     refused(three(json!({ "ordinal": 3 })), "replica.ordinal");
-    let e = set_of(three(json!({})), || "faderz".into()).unwrap_err();
+    let e = set_of(three(json!({})), || "faderz".into())
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("replica.ordinal"), "{e}");
     // A name every pod would read alike: the ordinal is not taken
     // from it.
@@ -241,7 +245,9 @@ fn replicas_of_a_set_share_a_compatibility_key() {
 #[test]
 fn member_flows_are_checked() {
     let refused = |output: Value, key: &str| {
-        let e = Config::parse(&set_with_mxl(output), || "faderz-0".into()).unwrap_err();
+        let e = Config::parse(&set_with_mxl(output), || "faderz-0".into())
+            .unwrap_err()
+            .to_string();
         assert!(e.starts_with(key), "{key}: {e}");
     };
     refused(json!({ "flow": id(4) }), "mxl.outputs.out-pgm.flow");
@@ -260,7 +266,9 @@ fn member_flows_are_checked() {
     let mut one: Value = serde_json::from_str(&set_with_mxl(json!({}))).unwrap();
     one["replica"] = json!({ "name": "r1" });
     one["mxl"]["outputs"]["out-pgm"] = json!({ "flows": [id(4)] });
-    let e = Config::parse(&one.to_string(), || unreachable!()).unwrap_err();
+    let e = Config::parse(&one.to_string(), || unreachable!())
+        .unwrap_err()
+        .to_string();
     assert!(e.starts_with("mxl.outputs.out-pgm.flows"), "{e}");
     one["mxl"]["outputs"]["out-pgm"] = json!({ "flow": id(4) });
     let (config, _, _) = Config::parse(&one.to_string(), || unreachable!()).unwrap();
@@ -304,7 +312,9 @@ fn proxy_mode_binds_the_api_to_loopback_only() {
         })
         .to_string()
     };
-    let e = Config::parse(&config("0.0.0.0"), || unreachable!()).unwrap_err();
+    let e = Config::parse(&config("0.0.0.0"), || unreachable!())
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("loopback"), "{e}");
     assert!(Config::parse(&config("10.0.0.5"), || unreachable!()).is_err());
     assert!(Config::parse(&config("127.0.0.1"), || unreachable!()).is_ok());
@@ -410,7 +420,9 @@ fn the_operator_role_defaults_in_oidc_mode_only() {
     };
     let (c, _, _) = Config::parse(&config("oidc"), || unreachable!()).unwrap();
     assert_eq!(c.auth.oidc.unwrap().operator_role, DEFAULT_OPERATOR_ROLE);
-    let e = Config::parse(&config("token"), || unreachable!()).unwrap_err();
+    let e = Config::parse(&config("token"), || unreachable!())
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("operatorRole"), "{e}");
     let flags = [("--auth-mode".to_owned(), "oidc".to_owned())];
     let parsed = Config::parse_with(&config("token"), &flags, |_| None, || unreachable!());
@@ -431,18 +443,20 @@ fn the_auth_mode_names_where_it_came_from() {
 #[test]
 fn the_command_line_is_checked() {
     let args = |a: &[&str]| command(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-    assert_eq!(args(&["--version"]), Ok(Command::Version));
-    assert_eq!(args(&["--help"]), Ok(Command::Help));
+    assert!(matches!(args(&["--version"]), Ok(Command::Version)));
+    assert!(matches!(args(&["--help"]), Ok(Command::Help)));
     assert!(args(&[]).is_err());
     assert!(
         args(&["--oidc-client-id", "x"])
             .unwrap_err()
+            .to_string()
             .contains("--config")
     );
     assert!(args(&["--config"]).is_err());
     assert!(
         args(&["--config", "c", "--oidc-nope", "x"])
             .unwrap_err()
+            .to_string()
             .contains("unknown")
     );
     assert!(args(&["--config", "c", "--oidc-client-id"]).is_err());
@@ -457,7 +471,9 @@ fn the_command_line_is_checked() {
 /// start rather than every message later.
 #[test]
 fn a_name_that_is_not_an_id_is_refused() {
-    let e = Config::parse(&with(json!({})), || "Host.example".into()).unwrap_err();
+    let e = Config::parse(&with(json!({})), || "Host.example".into())
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("replica.name"), "{e}");
 }
 
@@ -550,7 +566,7 @@ fn a_tone_input_reads_no_flow() {
         };
         let mut st1 = json!({ "tone": {} });
         st1[key] = value;
-        let e = parse(st1).unwrap_err();
+        let e = parse(st1).unwrap_err().to_string();
         assert_eq!(
             e,
             format!("mxl.inputs.st1.{key}: a tone input reads no flow")
@@ -562,14 +578,14 @@ fn a_tone_input_reads_no_flow() {
         (json!({ "level": 0.001 }), "level 0.001"),
         (json!({ "level": -60.001 }), "level -60.001"),
     ] {
-        let e = parse(json!({ "tone": tone })).unwrap_err();
+        let e = parse(json!({ "tone": tone })).unwrap_err().to_string();
         assert!(
             e.starts_with(&format!("mxl.inputs.st1.tone.{refused}: not in")),
             "{e}"
         );
     }
     assert!(parse(json!({ "tone": { "ident": true } })).is_err());
-    let e = parse(json!({})).unwrap_err();
+    let e = parse(json!({})).unwrap_err().to_string();
     assert!(
         e.contains("mxl.inputs.st1.flow: required without tone"),
         "{e}"
@@ -588,7 +604,9 @@ fn a_tone_input_reads_no_flow() {
             "outputs": { "out-pgm": { "flow": id(4) } },
         },
     });
-    let e = Config::parse(&alt.to_string(), || unreachable!()).unwrap_err();
+    let e = Config::parse(&alt.to_string(), || unreachable!())
+        .unwrap_err()
+        .to_string();
     assert!(
         e.contains("mxl.inputs.ch1.tone: the channel has altInput"),
         "{e}"
@@ -596,7 +614,9 @@ fn a_tone_input_reads_no_flow() {
     alt["shape"]["channels"][0]["altInput"] = json!(false);
     Config::parse(&alt.to_string(), || unreachable!()).unwrap();
     alt["shape"]["channels"][1]["tone"] = json!({ "frequency": 1000, "level": -18 });
-    let e = Config::parse(&alt.to_string(), || unreachable!()).unwrap_err();
+    let e = Config::parse(&alt.to_string(), || unreachable!())
+        .unwrap_err()
+        .to_string();
     assert!(
         e.contains("channel ch2 tone: set by mxl.inputs.ch2.tone"),
         "{e}"
@@ -619,7 +639,9 @@ fn an_alt_input_needs_an_alt_flow() {
         })
         .to_string()
     };
-    let e = Config::parse(&config(json!({ "flow": id(1) })), || unreachable!()).unwrap_err();
+    let e = Config::parse(&config(json!({ "flow": id(1) })), || unreachable!())
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("mxl.inputs.ch1.altFlow: required"), "{e}");
     let ok = config(json!({ "flow": id(1), "altFlow": id(5) }));
     Config::parse(&ok, || unreachable!()).unwrap();
@@ -709,7 +731,9 @@ fn delay_lines_are_opt_in_and_within_the_budget() {
     let fits = json!({ "delayBudgetSamples": held });
     Config::parse(&config(json!(20), json!(5000), fits), || unreachable!()).unwrap();
     let short = json!({ "delayBudgetSamples": held - 1 });
-    let e = Config::parse(&config(json!(20), json!(5000), short), || unreachable!()).unwrap_err();
+    let e = Config::parse(&config(json!(20), json!(5000), short), || unreachable!())
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("ch1 (960), st1 (480000)"), "{e}");
     assert!(
         e.contains(&format!("delayBudgetSamples {}", held - 1)),
@@ -720,13 +744,17 @@ fn delay_lines_are_opt_in_and_within_the_budget() {
         &config(json!(20), json!(5000.1), json!({})),
         || unreachable!(),
     )
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(e.contains("mxl.inputs.st1.maxDelayMs 5000.1"), "{e}");
-    let e = Config::parse(&config(json!(-1), json!(0), json!({})), || unreachable!()).unwrap_err();
+    let e = Config::parse(&config(json!(-1), json!(0), json!({})), || unreachable!())
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("mxl.inputs.ch1.maxDelayMs -1"), "{e}");
     // A line too short for one sample is refused, not taken as none.
-    let e =
-        Config::parse(&config(json!(0.01), json!(0), json!({})), || unreachable!()).unwrap_err();
+    let e = Config::parse(&config(json!(0.01), json!(0), json!({})), || unreachable!())
+        .unwrap_err()
+        .to_string();
     assert!(
         e.contains("mxl.inputs.ch1.maxDelayMs 0.01: under one sample"),
         "{e}"
@@ -734,7 +762,9 @@ fn delay_lines_are_opt_in_and_within_the_budget() {
 
     let mut set: Value = serde_json::from_str(&config(json!(0), json!(0), json!({}))).unwrap();
     set["shape"]["channels"][0]["maxDelay"] = json!(960);
-    let e = Config::parse(&set.to_string(), || unreachable!()).unwrap_err();
+    let e = Config::parse(&set.to_string(), || unreachable!())
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("set by mxl.inputs.ch1.maxDelayMs"), "{e}");
 }
 
@@ -764,8 +794,11 @@ fn consoles_are_checked_and_take_defaults() {
     assert_eq!(c.consoles[1].strips, 16);
     let (c, ..) = Config::parse(&with(json!({ "name": "r1" })), || unreachable!()).unwrap();
     assert!(c.consoles.is_empty());
-    let refused =
-        |consoles: Value| Config::parse(&config(consoles), || unreachable!()).unwrap_err();
+    let refused = |consoles: Value| {
+        Config::parse(&config(consoles), || unreachable!())
+            .unwrap_err()
+            .to_string()
+    };
     let e = refused(json!([{ "id": "a", "name": "A" }, { "id": "a", "name": "B" }]));
     assert_eq!(e, "consoles[1].id \"a\": used twice");
     let e = refused(json!([{ "id": "Bad", "name": "A" }]));
@@ -833,7 +866,9 @@ fn a_channel_selects_its_legs_from_the_flow() {
         (json!([0, 1]), "flow channel 0 is not in 1..=64"),
         (json!([1, 65]), "flow channel 65 is not in 1..=64"),
     ] {
-        let e = parse(json!({ "flow": id(3), "channels": bad }), None).unwrap_err();
+        let e = parse(json!({ "flow": id(3), "channels": bad }), None)
+            .unwrap_err()
+            .to_string();
         assert!(
             e.contains("mxl.inputs.st1.channels: ") && e.contains(why),
             "{e}"
@@ -879,7 +914,9 @@ fn more_uncarried_elements_than_engine_meters_are_refused() {
     };
     let max = samplez::config::MAX_METERS;
     Config::parse(&config(max - 3), || unreachable!()).unwrap();
-    let e = Config::parse(&config(max - 2), || unreachable!()).unwrap_err();
+    let e = Config::parse(&config(max - 2), || unreachable!())
+        .unwrap_err()
+        .to_string();
     assert!(e.contains(&format!("at most {max}")), "{e}");
 }
 
@@ -921,7 +958,9 @@ fn a_carried_monitor_output_counts_against_the_engine_meters() {
     let engine = c.audio.unwrap();
     assert_eq!(engine.meters.len(), max);
     assert_eq!(engine.meters[max - 1].name, "mon");
-    let e = Config::parse(&config(max - 2), || unreachable!()).unwrap_err();
+    let e = Config::parse(&config(max - 2), || unreachable!())
+        .unwrap_err()
+        .to_string();
     assert!(
         e.starts_with(&format!("shape: {} engine meters", max + 1)),
         "{e}"
@@ -979,9 +1018,9 @@ fn monitor_meter_columns_over_the_coefficient_budget_are_named() {
     let parse = |extra, monitor| Config::parse(&config(extra, monitor), || unreachable!());
     let named = "shape: the monitor meter columns";
     let extra = (0..60)
-        .find(|&n| parse(n, true).is_err_and(|e| e.starts_with(named)))
+        .find(|&n| parse(n, true).is_err_and(|e| e.to_string().starts_with(named)))
         .expect("a channel count at which only the monitor meter columns do not fit");
-    let e = parse(extra, true).unwrap_err();
+    let e = parse(extra, true).unwrap_err().to_string();
     assert!(e.contains("at blockSize 16"), "{e}");
     assert!(e.contains("raise engine.blockSize to at least"), "{e}");
     parse(extra, false)
@@ -992,7 +1031,7 @@ fn monitor_meter_columns_over_the_coefficient_budget_are_named() {
     let over = (extra..120)
         .find(|&n| parse(n, false).is_err())
         .expect("a channel count over the budget without the monitor");
-    let e = parse(over, true).unwrap_err();
+    let e = parse(over, true).unwrap_err().to_string();
     assert!(!e.starts_with(named), "{over} channels more: {e}");
 }
 
@@ -1036,7 +1075,7 @@ fn nmos_settings_that_cannot_work_are_refused() {
         (5, "danielclasen")
     );
     let refused = |text: String, key: &str| {
-        let e = Config::parse(&text, host).unwrap_err();
+        let e = Config::parse(&text, host).unwrap_err().to_string();
         assert!(e.contains(key), "{key}: {e}");
     };
     let no_mxl = json!({ "replica": one(), "shape": small(), "nmos": on(json!({})) });
@@ -1350,7 +1389,8 @@ fn bus_delay_lines_are_per_output_and_within_the_budget() {
         ),
         || unreachable!(),
     )
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(
         e.contains("ch1 (960), out-pgm (9600), out-pgm-m (4800), out-aux (480)"),
         "{e}"
@@ -1375,7 +1415,8 @@ fn bus_delay_lines_are_per_output_and_within_the_budget() {
             ),
             || unreachable!(),
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("mxl.outputs.out-pgm-m.maxDelayMs"), "{e}");
         assert!(e.contains("takes one line"), "{e}");
     }
@@ -1387,7 +1428,8 @@ fn bus_delay_lines_are_per_output_and_within_the_budget() {
         ),
         || unreachable!(),
     )
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(
         e.contains("mxl.outputs.out-mm.maxDelayMs: the output carries mm1"),
         "{e}"
@@ -1402,7 +1444,8 @@ fn bus_delay_lines_are_per_output_and_within_the_budget() {
         ),
         || unreachable!(),
     )
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(e.contains("aux1 maxDelay: set by mxl.outputs"), "{e}");
 }
 
@@ -1455,7 +1498,9 @@ fn outputs_carrying_a_bus_aux_or_mix_minus_have_a_strip() {
 fn the_apply_lead_cap_is_50_ms_and_bounded() {
     let config = |replica: Value| json!({ "replica": replica, "shape": small() }).to_string();
     let lead = |replica: Value| {
-        Config::parse(&config(replica), || unreachable!()).map(|c| c.0.replica.max_apply_lead_ms)
+        Config::parse(&config(replica), || unreachable!())
+            .map(|c| c.0.replica.max_apply_lead_ms)
+            .map_err(|e| e.to_string())
     };
     assert_eq!(lead(json!({ "name": "r1" })), Ok(50));
     for ms in [30, 80, 120] {
