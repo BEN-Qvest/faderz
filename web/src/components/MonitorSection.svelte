@@ -43,6 +43,14 @@
         : `Sent to ${carriers.map((o) => `${o.name} (${o.id})`).join(', ')}`,
   );
   const legs = $derived(output ? LAYOUT_LABELS[output.layout] : []);
+  /**
+   * Legs per row of speaker keys. One leg a row fits a stereo monitor's
+   * keys beside its fader; a surround monitor takes two, so its keys stay
+   * within the fader's height, and the section widens to SURROUND_W, which
+   * gives each of a row's four keys 30 px.
+   */
+  const perRow = $derived(legs.length > 4 ? 2 : 1);
+  const SURROUND_W = 210;
   const monitor = $derived(mixer.state!.monitor);
   const IMAGES: Array<{ id: StereoImage; key: string; label: string }> = [
     { id: 'leftToBoth', key: 'L>B', label: 'Monitor left to both' },
@@ -52,71 +60,50 @@
   const flag = (key: 'dim' | 'cut' | 'mono' | 'talkbackDim') => mixer.value<boolean>(monitorPath(key));
 </script>
 
-<section class="monitor" id="monitor" tabindex="-1" aria-label="Monitor output">
-  <div class="panel-title" title={shape.monitorOutputs.map((o) => `${o.name} (${o.layout})`).join(', ')}>Monitor out</div>
-  <!-- The browser plays nothing: this names the output flows the monitor
-       mix leaves on, or says there are none. -->
-  <div class="dest" class:none={carriers.length === 0} role="note" aria-label={dest} data-testid="monitor-dest" use:tip={dest}>
-    {#if !output}
-      No monitor output
-    {:else if carriers.length === 0}
-      Not on an output
-    {:else}
-      <span class="lbl">To</span> {carriers.map((o) => o.name).join(', ')}
-    {/if}
-  </div>
-  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-  <div
-    class="listen"
-    class:active={listening.length > 0}
-    class:afl={listenMode === 'AFL'}
-    aria-live="polite"
-    role="status"
-    tabindex={listening.length > 0 ? 0 : -1}
-    use:tip={listenText}
-  >
-    {#if listenMode}
-      <b>{listenMode}{pfl.length > 0 && afl.length > 0 ? ' (AFL held)' : ''}</b>
-      <span>{heard}</span>
-    {:else}
-      <span class="idle">{current?.name ?? source}</span>
-    {/if}
-  </div>
-  <div class="sources" role="radiogroup" aria-label="Monitor source">
-    {#each sources as s (s.id)}
-      <button {@attach pendingWrite(mixer, monitorPath('source'))}
-        class="key"
-        role="radio"
-        aria-disabled={mixer.locked}
-        aria-checked={s.id === source}
-        onclick={() => mixer.set(monitorPath('source'), s.id)}
-        title={s.name}>{s.name}</button
-      >
-    {/each}
-  </div>
-  <div class="speakers" role="group" aria-label="Monitor speakers" style:grid-template-columns={`repeat(${legs.length}, minmax(0, 1fr))`}>
-    {#each legs as leg, i (i)}
-      <button {@attach pendingWrite(mixer, pointer('monitor', 'speakerMute', i))} class="key mute" aria-disabled={mixer.locked} aria-pressed={monitor.speakerMute[i]} aria-label={`Mute speaker ${leg}`} title={`Mute speaker ${leg}`} onclick={() => mixer.set(pointer('monitor', 'speakerMute', i), !monitor.speakerMute[i])}>{leg}</button>
-    {/each}
-    {#each legs as leg, i (i)}
-      <button {@attach pendingWrite(mixer, pointer('monitor', 'speakerSolo', i))} class="key solo" aria-disabled={mixer.locked} aria-pressed={monitor.speakerSolo[i]} aria-label={`Solo speaker ${leg}`} title={`Solo speaker ${leg}`} onclick={() => mixer.set(pointer('monitor', 'speakerSolo', i), !monitor.speakerSolo[i])}>S</button>
-    {/each}
-  </div>
-  {#if output?.layout === 'stereo'}
-    <div class="image" role="radiogroup" aria-label="Monitor image">
-      {#each IMAGES as im (im.id)}
-        <button {@attach pendingWrite(mixer, monitorPath('image'))}
+<section class="monitor" id="monitor" tabindex="-1" aria-label="Monitor output" style:width={perRow > 1 ? `${SURROUND_W}px` : undefined}>
+  <div class="top">
+    <div class="panel-title" title={shape.monitorOutputs.map((o) => `${o.name} (${o.layout})`).join(', ')}>Monitor out</div>
+    <!-- The browser plays nothing: this names the output flows the monitor
+         mix leaves on, or says there are none. -->
+    <div class="dest" class:none={carriers.length === 0} role="note" aria-label={dest} data-testid="monitor-dest" use:tip={dest}>
+      {#if !output}
+        No monitor output
+      {:else if carriers.length === 0}
+        Not on an output
+      {:else}
+        <span class="lbl">To</span> {carriers.map((o) => o.name).join(', ')}
+      {/if}
+    </div>
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+    <div
+      class="listen"
+      class:active={listening.length > 0}
+      class:afl={listenMode === 'AFL'}
+      aria-live="polite"
+      role="status"
+      tabindex={listening.length > 0 ? 0 : -1}
+      use:tip={listenText}
+    >
+      {#if listenMode}
+        <b>{listenMode}{pfl.length > 0 && afl.length > 0 ? ' (AFL held)' : ''}</b>
+        <span>{heard}</span>
+      {:else}
+        <span class="idle">{current?.name ?? source}</span>
+      {/if}
+    </div>
+    <div class="sources" role="radiogroup" aria-label="Monitor source">
+      {#each sources as s (s.id)}
+        <button {@attach pendingWrite(mixer, monitorPath('source'))}
           class="key"
           role="radio"
           aria-disabled={mixer.locked}
-          aria-checked={monitor.image === im.id}
-          aria-label={im.label}
-          title={im.label}
-          onclick={() => mixer.set(monitorPath('image'), monitor.image === im.id ? 'normal' : im.id)}>{im.key}</button
+          aria-checked={s.id === source}
+          onclick={() => mixer.set(monitorPath('source'), s.id)}
+          title={s.name}>{s.name}</button
         >
       {/each}
     </div>
-  {/if}
+  </div>
   <div class="body">
     <div class="f"><Fader path={monitorPath('level')} label="Monitor level" /></div>
     <!-- What the monitor plays: the listen sum while anyone listens, else the source. -->
@@ -130,33 +117,70 @@
         />
       {/if}
     </div>
-    <div class="flags">
-      <button {@attach pendingWrite(mixer, monitorPath('dim'))} class="key" aria-disabled={mixer.locked} aria-pressed={flag('dim')} onclick={() => mixer.set(monitorPath('dim'), !flag('dim'))}>DIM</button>
-      <button {@attach pendingWrite(mixer, monitorPath('cut'))} class="key mute" aria-disabled={mixer.locked} aria-pressed={flag('cut')} onclick={() => mixer.set(monitorPath('cut'), !flag('cut'))}>CUT</button>
-      <button {@attach pendingWrite(mixer, monitorPath('mono'))} class="key" aria-disabled={mixer.locked} aria-pressed={flag('mono')} onclick={() => mixer.set(monitorPath('mono'), !flag('mono'))}>MONO</button>
-      <button {@attach pendingWrite(mixer, monitorPath('talkbackDim'))}
-        class="key"
-        aria-disabled={mixer.locked}
-        aria-pressed={flag('talkbackDim')}
-        aria-label="Dim the monitor while talkback is active"
-        title="Dim the monitor while talkback is active"
-        onclick={() => mixer.set(monitorPath('talkbackDim'), !flag('talkbackDim'))}>TB DIM</button
-      >
+    <!-- Beside the fader, not above it: above it they would make the
+         monitor's head the tallest of the masters, and every master's
+         fader shorter. -->
+    <div class="side">
+      <!-- Each leg's mute with its solo beside it. -->
+      <div class="speakers" role="group" aria-label="Monitor speakers" style:grid-template-columns={`repeat(${2 * perRow}, minmax(0, 1fr))`}>
+        {#each legs as leg, i (i)}
+          <button {@attach pendingWrite(mixer, pointer('monitor', 'speakerMute', i))} style:grid-area={`${Math.floor(i / perRow) + 1} / ${(i % perRow) * 2 + 1}`} class="key mute" aria-disabled={mixer.locked} aria-pressed={monitor.speakerMute[i]} aria-label={`Mute speaker ${leg}`} title={`Mute speaker ${leg}`} onclick={() => mixer.set(pointer('monitor', 'speakerMute', i), !monitor.speakerMute[i])}>{leg}</button>
+        {/each}
+        {#each legs as leg, i (i)}
+          <button {@attach pendingWrite(mixer, pointer('monitor', 'speakerSolo', i))} style:grid-area={`${Math.floor(i / perRow) + 1} / ${(i % perRow) * 2 + 2}`} class="key solo" aria-disabled={mixer.locked} aria-pressed={monitor.speakerSolo[i]} aria-label={`Solo speaker ${leg}`} title={`Solo speaker ${leg}`} onclick={() => mixer.set(pointer('monitor', 'speakerSolo', i), !monitor.speakerSolo[i])}>S</button>
+        {/each}
+      </div>
+      {#if output?.layout === 'stereo'}
+        <div class="image" role="radiogroup" aria-label="Monitor image">
+          {#each IMAGES as im (im.id)}
+            <button {@attach pendingWrite(mixer, monitorPath('image'))}
+              class="key"
+              role="radio"
+              aria-disabled={mixer.locked}
+              aria-checked={monitor.image === im.id}
+              aria-label={im.label}
+              title={im.label}
+              onclick={() => mixer.set(monitorPath('image'), monitor.image === im.id ? 'normal' : im.id)}>{im.key}</button
+            >
+          {/each}
+        </div>
+      {/if}
+      <div class="flags">
+        <button {@attach pendingWrite(mixer, monitorPath('dim'))} class="key" aria-disabled={mixer.locked} aria-pressed={flag('dim')} onclick={() => mixer.set(monitorPath('dim'), !flag('dim'))}>DIM</button>
+        <button {@attach pendingWrite(mixer, monitorPath('cut'))} class="key mute" aria-disabled={mixer.locked} aria-pressed={flag('cut')} onclick={() => mixer.set(monitorPath('cut'), !flag('cut'))}>CUT</button>
+        <button {@attach pendingWrite(mixer, monitorPath('mono'))} class="key" aria-disabled={mixer.locked} aria-pressed={flag('mono')} onclick={() => mixer.set(monitorPath('mono'), !flag('mono'))}>MONO</button>
+        <button {@attach pendingWrite(mixer, monitorPath('talkbackDim'))}
+          class="key"
+          aria-disabled={mixer.locked}
+          aria-pressed={flag('talkbackDim')}
+          aria-label="Dim the monitor while talkback is active"
+          title="Dim the monitor while talkback is active"
+          onclick={() => mixer.set(monitorPath('talkbackDim'), !flag('talkbackDim'))}>TB DIM</button
+        >
+      </div>
     </div>
   </div>
 </section>
 
 <style>
+  /* Rows: the source keys above the fader, and the fader with its meter
+     and, beside them, the speaker, image and flag keys. */
   .monitor {
     width: 150px;
     flex: none;
-    display: flex;
-    flex-direction: column;
-    gap: 5px;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 4px;
     padding: 6px;
     background: var(--panel-2);
     border-left: 1px solid var(--line-strong);
     min-height: 0;
+  }
+  .top {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
   }
   .dest {
     font-size: 10px;
@@ -209,13 +233,16 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .side {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    min-width: 0;
+  }
   .speakers,
   .image {
     display: grid;
     gap: 2px;
-  }
-  .image {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
   .speakers .key,
   .image .key {
@@ -228,7 +255,6 @@
     color: #1a1200;
   }
   .body {
-    flex: 1;
     min-height: 150px;
     display: grid;
     grid-template-columns: auto 14px 1fr;
@@ -238,10 +264,10 @@
     padding: 17px 0;
   }
   .flags {
+    margin-top: auto;
     display: flex;
     flex-direction: column;
     gap: 4px;
-    justify-content: flex-end;
   }
   .flags .key {
     height: 30px;
