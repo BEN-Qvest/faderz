@@ -1079,7 +1079,7 @@ describe('replica faults', () => {
     expect((await control('POST', '/replicas/r2/freeze')).status).toBe(200);
     const messages = c.messages.length;
     const frames = c.frames.length;
-    const id = c.set('/channels/ch12/trim', 3);
+    c.set('/channels/ch12/trim', 3);
     await sleep(3 * HEARTBEAT_MS);
     expect(c.messages.length).toBe(messages);
     expect(c.frames.length).toBe(frames);

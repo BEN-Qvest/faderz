@@ -911,7 +911,7 @@ test('a latched talk stopped while writes are locked never shows as unlatched wh
   await patch(request, '/mixMinus/mm1/interrupt/source', null);
 });
 
-test('reads loudness in LU relative to the target on request', { tag: '@meters' }, async ({ page, request }) => {
+test('reads loudness in LU relative to the target on request', { tag: '@meters' }, async ({ page }) => {
   await live(page);
   const integrated = page.getByTestId('loudness-i-pgm20');
   await expect(integrated).not.toHaveText(/--\.-/, { timeout: 10_000 });
