@@ -347,7 +347,10 @@ async fn until_lease(app: &App, session: &SessionKey, leased: bool) {
 }
 
 pub(crate) fn selected(app: &App, session: &SessionKey) -> bool {
-    app.selections.lock().unwrap().contains_key(session)
+    app.selections
+        .lock()
+        .expect("selections lock poisoned")
+        .contains_key(session)
 }
 
 /// A session that has not held a lease keeps its selection for one
@@ -360,7 +363,7 @@ async fn a_selection_without_a_lease_lapses_after_one_lease() {
     app.lapse_selections();
     assert!(selected(&app, &s), "kept within the lease");
     {
-        let mut selections = app.selections.lock().unwrap();
+        let mut selections = app.selections.lock().expect("selections lock poisoned");
         let at = &mut selections.get_mut(&s).unwrap().at;
         *at = at.checked_sub(SELECTION_GRACE).unwrap();
     }

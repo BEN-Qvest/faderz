@@ -131,7 +131,7 @@ fn start(path: &std::path::Path) -> Result<(), String> {
                     .and_then(|p| p.link.clone())
                     .map(|link| show_on_connect(link, shown.clone(), lcd.clone()));
                 let show = move |code: &auth::DeviceCode| {
-                    *shown.lock().expect("not poisoned") = Some(code.clone());
+                    *shown.lock().expect("shown lock poisoned") = Some(code.clone());
                     show_code(code, lcd.as_ref());
                 };
                 let tokens = sign_in.sign_in(&show).await;
@@ -200,7 +200,7 @@ fn show_on_connect(
         let mut was = link.borrow_and_update().connected;
         while link.changed().await.is_ok() {
             let connected = link.borrow_and_update().connected;
-            let code = shown.lock().expect("not poisoned").clone();
+            let code = shown.lock().expect("shown lock poisoned").clone();
             if let (false, true, Some(code)) = (was, connected, code) {
                 show_lcd(&code, lcd.as_ref());
             }
@@ -245,7 +245,7 @@ mod tests {
                  "verification_uri": "https://idp.example/device", "expires_in": 600 }"#,
         )
         .unwrap();
-        *shown.lock().unwrap() = Some(code);
+        *shown.lock().expect("shown lock poisoned") = Some(code);
         // Going away shows nothing; coming back shows both lines.
         link.send_modify(|l| l.connected = false);
         wait().await;
