@@ -767,7 +767,7 @@ fn consoles_are_checked_and_take_defaults() {
     let refused =
         |consoles: Value| Config::parse(&config(consoles), || unreachable!()).unwrap_err();
     let e = refused(json!([{ "id": "a", "name": "A" }, { "id": "a", "name": "B" }]));
-    assert!(e.contains("consoles[1].id \"a\": used twice"), "{e}");
+    assert_eq!(e, "consoles[1].id \"a\": used twice");
     let e = refused(json!([{ "id": "Bad", "name": "A" }]));
     assert!(e.contains("consoles[0]"), "{e}");
     let e = refused(json!([{ "id": "a", "name": "" }]));
@@ -1465,4 +1465,53 @@ fn the_apply_lead_cap_is_50_ms_and_bounded() {
         let e = lead(json!({ "name": "r1", "maxApplyLeadMs": ms })).unwrap_err();
         assert!(e.starts_with("replica.maxApplyLeadMs"), "{e}");
     }
+}
+
+#[test]
+fn the_configuration_errors_read_as_they_always_have() {
+    let args = |a: &[&str]| {
+        command(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .unwrap_err()
+            .to_string()
+    };
+    assert_eq!(
+        args(&["--config", "c", "--oidc-nope", "x"]),
+        r#"unknown argument "--oidc-nope""#
+    );
+    assert_eq!(
+        args(&["--config", "c", "--oidc-client-id"]),
+        "--oidc-client-id needs a value"
+    );
+    assert_eq!(
+        args(&["--oidc-client-id", "x"]),
+        "--config <file> is required"
+    );
+    let missing = std::path::Path::new("/nonexistent/faderz.json");
+    assert_eq!(
+        Config::load(missing, &[]).unwrap_err().to_string(),
+        "/nonexistent/faderz.json: No such file or directory (os error 2)"
+    );
+    let flag = [("--oidc-scopes".to_owned(), "a".to_owned())];
+    assert_eq!(
+        apply(&mut json!({ "auth": 5 }), &flag, |_| None)
+            .unwrap_err()
+            .to_string(),
+        "auth.oidc.scopes: not an object"
+    );
+    let syntax = serde_json::from_str::<Value>("{").unwrap_err().to_string();
+    assert_eq!(
+        Config::parse("{", || unreachable!())
+            .unwrap_err()
+            .to_string(),
+        syntax
+    );
+    let shape = serde_json::from_value::<Config>(json!([]))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        Config::parse("[]", || unreachable!())
+            .unwrap_err()
+            .to_string(),
+        shape
+    );
 }
