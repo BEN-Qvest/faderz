@@ -2,8 +2,19 @@
 
 Rules for working in this repository. Read them before opening a PR or
 running an automated assistant against this tree. `README.md` is the
-human-facing document and wins for anything about using faderz; this
-file is about changing it.
+overview; `docs/USAGE.md` describes how the mixer behaves,
+and its REST, WebSocket, ops and NMOS interfaces,
+`docs/CONFIGURATION.md` the configuration file, `docs/CONSOLE.md` the web console,
+`docs/SURFACES.md` the bridge, `docs/ARCHITECTURE.md` how faderz is
+built on samplez, and `docs/BUILDING.md` how it is built, tested and
+released. The docs win for anything about using faderz; this file is
+about changing it.
+
+A change to behaviour updates the docs file that describes it, a change
+to how the parts fit together `docs/ARCHITECTURE.md`, and a change to
+the build, tests, CI or releases `docs/BUILDING.md`, in the same PR.
+Engine behaviour is samplez's and documented there; the docs here link
+to it rather than restate it.
 
 ## Use a git worktree
 
@@ -13,26 +24,7 @@ parallel sessions on one clone do not share an index.
 
 ## Architecture
 
-- `src/`: the server, in Rust.
-  - `state.rs`: the replicated mixer state, the `Product` faderz hands
-    samplez. Every command applies here, deterministically.
-  - `mix.rs` and `strip.rs`: derive engine targets (gains, strips, ducks)
-    from the state.
-  - `audio.rs`: drives the samplez engine with those targets, and reads
-    its meters and counters.
-  - `api.rs` and `ws.rs`: the REST routes and the WebSocket.
-  - `app.rs`: what both share: commands in flight, fan-out, the replicas
-    listing.
-  - `nmos.rs`: IS-04 registration and IS-05 connections over MXL.
-  - `meters.rs`: the binary meter frame.
-- `api/`: the contract. `openapi.yaml` for REST and `api/ws/*.schema.json`
-  for the WebSocket and the state model. The server, the web console's
-  types and its mock all follow it.
-- `web/`: the console in Svelte, with a mock server under `web/dev/mock`
-  that implements the same contract.
-- `bridge/`: the control-surface bridge, a crate of its own.
-- `tests/`: integration tests. `audio.rs` runs one server on real MXL
-  flows; `set*.rs` run a set of three replicas.
+`docs/ARCHITECTURE.md` maps the parts and the seam to samplez.
 
 The audio engine, replication and NMOS stack are
 [samplez](https://github.com/danielclasen/samplez), taken only at a
@@ -139,7 +131,7 @@ Its roll is a hand-over.
 ## Build and test
 
 `.github/workflows/ci.yml` holds the exact commands; run them as CI does.
-In short:
+`docs/BUILDING.md` describes them. In short:
 
 - The server builds in the samplez builder image
   (`ghcr.io/danielclasen/samplez-builder`), with the cargo registry and
