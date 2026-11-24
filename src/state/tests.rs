@@ -696,6 +696,78 @@ fn a_saved_state_loads_back_whole() {
     );
 }
 
+/// A shape's duck seeds start a fresh state only: a saved state loaded
+/// under a configuration that seeds the group keeps its own triggers,
+/// targets, depths and detector.
+#[test]
+fn duck_seeds_never_overwrite_a_loaded_state() {
+    let mut m = mixer();
+    set(
+        &mut m,
+        "a",
+        1,
+        "/ducks/comm/channels/ch1/trigger",
+        json!(true),
+    );
+    let mut v = small();
+    v["ducks"][0] = json!({
+        "id": "comm", "name": "Commentary", "triggers": ["ch2"], "targets": ["ch1"],
+        "depth": 15, "threshold": -40, "attackMs": 5, "releaseMs": 2000,
+    });
+    let fresh = Mixer::new(Shape::parse(&v).unwrap());
+    let seeded = &fresh.state()["ducks"]["comm"];
+    assert_eq!(seeded["channels"]["ch2"]["trigger"], json!(true));
+    assert_eq!(seeded["channels"]["ch1"]["target"], json!(true));
+    let mut back = Mixer::new(Shape::parse(&v).unwrap());
+    back.load(&m.save()).unwrap();
+    assert_eq!(back.state()["ducks"], m.state()["ducks"]);
+    assert!(back.dropped().is_empty());
+}
+
+/// A seed reaches a channel the saved state lacks, but never past a
+/// group's rules: with 8 saved triggers, a new channel seeded as a
+/// trigger loses its seed and the load reports it, while a new channel
+/// seeded as a target keeps its seed.
+#[test]
+fn a_duck_seed_never_takes_a_loaded_group_past_its_triggers() {
+    let channel = |n: u32| json!({ "id": format!("ch{n}"), "name": "C", "width": 1, "layout": "mono", "altInput": false });
+    let mut v = small();
+    v["channels"]
+        .as_array_mut()
+        .unwrap()
+        .extend((4..=8).map(channel));
+    let mut m = Mixer::new(Shape::parse(&v).unwrap());
+    let ids = ["ch1", "ch2", "st1", "ch4", "ch5", "ch6", "ch7", "ch8"];
+    for (seq, id) in (1..).zip(ids) {
+        let path = format!("/ducks/comm/channels/{id}/trigger");
+        assert!(matches!(
+            set(&mut m, "a", seq, &path, json!(true)),
+            Effect::Changed(_)
+        ));
+    }
+    v["channels"]
+        .as_array_mut()
+        .unwrap()
+        .extend([channel(9), channel(10)]);
+    v["ducks"][0] = json!({
+        "id": "comm", "name": "Commentary", "triggers": ["ch9"], "targets": ["ch10"],
+    });
+    let mut back = Mixer::new(Shape::parse(&v).unwrap());
+    back.load(&m.save()).unwrap();
+    let ducks = &back.state()["ducks"];
+    assert_eq!(duck::check(ducks, "comm"), Ok(()));
+    assert_eq!(back.dropped(), ["/ducks/comm/channels/ch9/trigger"]);
+    for id in ids {
+        assert_eq!(
+            ducks["comm"]["channels"][id]["trigger"],
+            json!(true),
+            "{id}"
+        );
+    }
+    assert_eq!(ducks["comm"]["channels"]["ch9"]["trigger"], json!(false));
+    assert_eq!(ducks["comm"]["channels"]["ch10"]["target"], json!(true));
+}
+
 /// The configured shape wins: leaves of a channel it lost, a leg it
 /// lost and ids it no longer has are dropped and reported.
 #[test]

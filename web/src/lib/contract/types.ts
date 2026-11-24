@@ -104,6 +104,13 @@ export interface VcaShape {
 export interface DuckShape {
   id: Id;
   name: string;
+  /** Seeds of a group or channel a loaded state lacks, never of a saved leaf; absent when not configured; at most MAX_TRIGGERS (8) triggers. */
+  triggers?: Id[];
+  targets?: Id[];
+  depth?: number;
+  threshold?: number;
+  attackMs?: number;
+  releaseMs?: number;
 }
 export interface FrameRate {
   numerator: number;
