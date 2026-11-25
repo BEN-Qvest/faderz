@@ -204,6 +204,30 @@ pub fn led(key: Key, state: Led) -> Vec<u8> {
     vec![0x90, key.note(), velocity]
 }
 
+/// The X-Touch display colour of a channel's `ScribbleColor`: bit 0 red,
+/// bit 1 green, bit 2 blue. An X-Touch has 7; orange shows as yellow, its
+/// nearest, and `none` or an unknown colour as white (7).
+pub fn colour(name: &str) -> u8 {
+    match name {
+        "red" => 1,
+        "green" => 2,
+        "orange" | "yellow" => 3,
+        "blue" => 4,
+        "purple" => 5,
+        "cyan" => 6,
+        _ => 7,
+    }
+}
+
+/// Sets the display colours of a unit's 8 scribble strips: an X-Touch
+/// SysEx outside the Mackie Control protocol, one [`colour`] per strip.
+pub fn colours(device: Device, codes: [u8; 8]) -> Vec<u8> {
+    let mut out = vec![0xf0, 0x00, 0x00, 0x66, device.id(), 0x72];
+    out.extend_from_slice(&codes);
+    out.push(0xf7);
+    out
+}
+
 /// Writes `text` into the scribble strip buffer at `offset` (0..112; the
 /// second line starts at 56). Characters outside printable ASCII are
 /// shown as `?`.
@@ -376,6 +400,24 @@ mod tests {
         assert_eq!(ring_value(Some(-0.01)), 0x15);
         assert_eq!(ring_value(Some(0.3)), 0x18);
         assert_eq!(ring(0, 0x11), vec![0xb0, 48, 0x11]);
+    }
+
+    #[test]
+    fn scribble_strip_colours_are_rgb_bits_in_one_x_touch_sysex() {
+        let names = [
+            "none", "red", "orange", "yellow", "green", "cyan", "blue", "purple",
+        ];
+        let codes: Vec<u8> = names.iter().map(|n| colour(n)).collect();
+        assert_eq!(codes, vec![7, 1, 3, 3, 2, 6, 4, 5]);
+        assert_eq!(
+            colour("pink"),
+            7,
+            "a colour faderz may add later shows white"
+        );
+        assert_eq!(
+            colours(Device::Extender, [1, 2, 3, 4, 5, 6, 7, 7]),
+            vec![0xf0, 0, 0, 0x66, 0x15, 0x72, 1, 2, 3, 4, 5, 6, 7, 7, 0xf7]
+        );
         assert_eq!(ring(7, 0), vec![0xb0, 55, 0]);
     }
 }

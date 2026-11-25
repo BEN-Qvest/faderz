@@ -197,11 +197,11 @@ fn a_new_session_lets_go_of_held_faders_and_gets_everything_again() {
     let mut e = live(1);
     let mut s = Surface::new(units(2), None);
     let first = s.render(&e, 0);
-    // Faders, LEDs, rings and both lines of every strip per unit, and the
-    // X-Touch's function key LEDs.
+    // Faders, LEDs, rings and both lines of every strip, the colours per
+    // unit, and the X-Touch's function key LEDs.
     let on = |out: &[(usize, Vec<u8>)], unit| out.iter().filter(|(u, _)| *u == unit).count();
-    assert_eq!(on(&first, 0), 9 + 8 * 5 + 16 + 8);
-    assert_eq!(on(&first, 1), 8 + 8 * 5 + 16);
+    assert_eq!(on(&first, 0), 9 + 8 * 5 + 16 + 1 + 8);
+    assert_eq!(on(&first, 1), 8 + 8 * 5 + 16 + 1);
     assert!(s.render(&e, 100).is_empty(), "only what changed");
 
     s.resend(1);
@@ -266,7 +266,7 @@ fn after_missed_messages_a_touch_that_does_not_move_is_let_go() {
     s.link_changed(0, lost(2), resend, &mut e, 8000);
     s.tick(&mut e, 20_000);
     assert_eq!(s.touching(), held());
-    assert_eq!(s.render(&e, 20_000).len(), 9 + 8 * 5 + 16 + 8 - 1);
+    assert_eq!(s.render(&e, 20_000).len(), 9 + 8 * 5 + 16 + 1 + 8 - 1);
     // The session ending lets go of everything.
     let down = Link {
         connected: false,
@@ -1071,4 +1071,31 @@ fn alt_is_let_go_with_its_session() {
     e.take_actions();
     key(&mut s, &mut e, 32, true, 200);
     assert!(values(&e.take_actions()).is_empty());
+}
+
+#[test]
+fn the_scribble_strips_take_the_channels_colours_white_past_the_last() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    let sysex = |out: Vec<(usize, Vec<u8>)>| -> Vec<Vec<u8>> {
+        (out.into_iter())
+            .map(|(_, m)| m)
+            .filter(|m| m.get(5) == Some(&0x72))
+            .collect()
+    };
+    assert_eq!(
+        sysex(s.render(&e, 0)),
+        vec![mcu::colours(Device::Main, [7; 8])]
+    );
+    delta(
+        &mut e,
+        6,
+        json!([{ "path": "/channels/ch1/color", "value": "blue" }]),
+        json!([]),
+    );
+    assert_eq!(
+        sysex(s.render(&e, 1)),
+        vec![mcu::colours(Device::Main, [4, 7, 7, 7, 7, 7, 7, 7])]
+    );
+    assert!(sysex(s.render(&e, 2)).is_empty(), "only on a change");
 }

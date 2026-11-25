@@ -247,6 +247,7 @@ console shows the bridge's controls as `<console> (<user>)`.
 | CHANNEL left/right | Moves by one channel |
 | Master fader (X-Touch) | `master`, or the program bus's fader |
 | Scribble strip | Line 1: the channel name, 7 characters. Line 2: the fader in dB, or the holder's name while another session holds it |
+| Scribble strip colour (X-Touch) | The channel's `color`: red, green, yellow, blue, purple (magenta) and cyan as they are, orange as yellow, `none` and strips past the last channel white |
 
 A touch refused because another session holds the fader shows the
 holder; held for a second, it asks the holder to give the control up.
@@ -295,7 +296,9 @@ an X-Touch or X-Touch Extender:
   across a router and a NAT, and the rate a surface takes;
 - an RTP-MIDI session from macOS, and the scribble strip SysEx through
   its live routings;
-- ALT on note 73.
+- ALT on note 73;
+- the scribble strip colour SysEx `F0 00 00 66 14|15 72`, one byte per
+  strip with bit 0 red, bit 1 green and bit 2 blue.
 
 The V-Pots were tried on an X-Touch in MC mode over RTP-MIDI: turns on
 CC 16-23 with bit 6 anticlockwise, the push on notes 32-39, and the

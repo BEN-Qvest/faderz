@@ -134,6 +134,7 @@ struct Shown {
     rings: [Option<u8>; 8],
     /// 16 cells: 8 per line.
     cells: [Option<String>; 16],
+    colours: Option<[u8; 8]>,
 }
 
 struct Unit {
@@ -784,6 +785,14 @@ impl Surface {
                     }
                 }
             }
+            let mut colours = [0; 8];
+            for (c, v) in colours.iter_mut().zip(&view) {
+                *c = v.colour;
+            }
+            if u.shown.colours != Some(colours) {
+                out.push((i, mcu::colours(u.spec.device, colours)));
+                u.shown.colours = Some(colours);
+            }
             for (note, led) in duck_leds {
                 if u.shown.leds.get(&note) != Some(&led) {
                     out.push((i, mcu::led(Key::from_note(note), led)));
@@ -833,6 +842,7 @@ impl Surface {
             mute: Led::Off,
             solo: Led::Off,
             select: Led::Off,
+            colour: 7,
             ring: 0,
             name: mcu::cell(""),
             value: mcu::cell(""),
@@ -875,6 +885,12 @@ impl Surface {
                 on(self.selected.as_deref() == Some(channel.as_str()))
             },
             ring: mcu::ring_value(Some(at("pan/lr").and_then(|p| p.as_f64()).unwrap_or(0.0))),
+            colour: mcu::colour(
+                at("color")
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .unwrap_or("none"),
+            ),
             name: mcu::cell(&Self::channel_name(engine, &channel)),
             value: mcu::cell(&holder.unwrap_or_else(|| taper::format_db(db))),
         }
@@ -901,6 +917,8 @@ fn duck_led(engine: &Engine, duck: &str, now: u64) -> Led {
 }
 
 struct StripView {
+    /// The scribble strip's [`mcu::colour`]; white past the last channel.
+    colour: u8,
     fader: u16,
     mute: Led,
     solo: Led,
