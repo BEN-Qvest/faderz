@@ -1,6 +1,6 @@
 //! Paces what goes to a network surface: a byte rate with bursts of one
-//! packet, and a queue in which a newer motor position, LED or meter
-//! level replaces the queued one it supersedes, and a scribble strip
+//! packet, and a queue in which a newer motor position, LED, V-Pot ring
+//! or meter level replaces the queued one it supersedes, and a scribble strip
 //! write drops the queued ones it overwrites whole.
 
 use std::collections::VecDeque;
@@ -17,6 +17,8 @@ enum Key {
     Fader(u8),
     /// A key LED: note per channel.
     Led(u8, u8),
+    /// A V-Pot ring: control change 48 to 55 per channel.
+    Ring(u8, u8),
     /// A meter level: channel pressure carries the strip in its high
     /// nibble.
     Meter(u8, u8),
@@ -28,6 +30,7 @@ fn key(m: &[u8]) -> Option<Key> {
     match m {
         [s, _, _] if s & 0xf0 == 0xe0 => Some(Key::Fader(*s)),
         [s, note, _] if s & 0xf0 == 0x90 => Some(Key::Led(*s, *note)),
+        [s, cc @ 48..=55, _] if s & 0xf0 == 0xb0 => Some(Key::Ring(*s, *cc)),
         [s, level] if s & 0xf0 == 0xd0 => Some(Key::Meter(*s, level >> 4)),
         [0xf0, 0, 0, 0x66, device, 0x12, offset, text @ .., 0xf7] if !text.is_empty() => {
             let first = usize::from(*offset);
@@ -138,13 +141,14 @@ mod tests {
     use crate::mcu::{self, Device, Key as McuKey, Led};
 
     #[test]
-    fn newer_faders_leds_meters_and_cells_replace_queued_ones_in_place() {
+    fn newer_faders_leds_rings_meters_and_cells_replace_queued_ones_in_place() {
         let mut p = Pacer::new(1_000_000);
         p.push(mcu::fader(0, 100));
         p.push(mcu::led(McuKey::Mute(0), Led::On));
         p.push(vec![0xd0, 0x05]);
         p.push(mcu::lcd(Device::Main, 0, "Chan 1 "));
         p.push(vec![0xb0, 0x10, 0x41]);
+        p.push(mcu::ring(2, 0x16));
         p.push(mcu::fader(1, 7));
         p.push(mcu::fader(0, 200));
         p.push(mcu::led(McuKey::Mute(0), Led::Off));
@@ -153,6 +157,7 @@ mod tests {
         p.push(mcu::lcd(Device::Main, 0, "Chan 9 "));
         p.push(mcu::lcd(Device::Main, 7, "Chan 2 "));
         p.push(vec![0xb0, 0x10, 0x41]);
+        p.push(mcu::ring(2, 0x18));
         let packet = p.take(0).unwrap();
         assert_eq!(
             packet,
@@ -161,6 +166,7 @@ mod tests {
                 mcu::led(McuKey::Mute(0), Led::Off),
                 vec![0xd0, 0x0c],
                 vec![0xb0, 0x10, 0x41],
+                mcu::ring(2, 0x18),
                 mcu::fader(1, 7),
                 vec![0xd0, 0x13],
                 mcu::lcd(Device::Main, 0, "Chan 9 "),
@@ -199,7 +205,7 @@ mod tests {
         // 10 kB/s: 10 octets per millisecond.
         let mut p = Pacer::new(10_000);
         for i in 0..200 {
-            p.push(vec![0xb0, i as u8 & 0x7f, 0]);
+            p.push(vec![0xa0, i as u8 & 0x7f, 0]);
         }
         // The first packet is a full burst: 128 messages of 3 octets and
         // 127 delta times make 511.

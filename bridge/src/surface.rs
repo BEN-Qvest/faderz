@@ -2,7 +2,8 @@
 //! units side by side (an X-Touch and its Extenders) over the channels,
 //! banked together; faders write while touched, motors follow the state
 //! while not; mute, solo and select keys; V-Pots on the pan; duck keys;
-//! names and values on the scribble strips. Every unit is a console of its own on the server.
+//! names and values on the scribble strips. Every unit is a console of
+//! its own on the server.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -133,7 +134,7 @@ struct Shown {
     faders: [Option<u16>; 9],
     moved_at: [Option<u64>; 9],
     leds: HashMap<u8, Led>,
-    rings: [Option<Option<f64>>; 8],
+    rings: [Option<u8>; 8],
     /// 16 cells: 8 per line.
     cells: [Option<String>; 16],
 }
@@ -307,9 +308,7 @@ impl Surface {
 
     /// The pan of the channel on strip `strip` of unit `unit`.
     fn pan_path(&self, engine: &Engine, unit: usize, strip: u8) -> Option<String> {
-        (strip < mcu::STRIPS)
-            .then(|| self.channel(engine, unit, strip))
-            .flatten()
+        self.channel(engine, unit, strip)
             .map(|c| format!("/channels/{c}/pan/lr"))
     }
 
@@ -391,6 +390,7 @@ impl Surface {
         while let Some((_, p)) = self.units[unit].presses.pop_first() {
             self.let_go(p, engine, now);
         }
+        self.units[unit].pushed = [None; 8];
         self.resend(unit);
     }
 
@@ -584,7 +584,7 @@ impl Surface {
                 }
             }
             Key::Pot(s) => {
-                let last = &mut self.units[unit].pushed[usize::from(s & 0x07)];
+                let last = &mut self.units[unit].pushed[usize::from(s)];
                 if last.is_some_and(|at| now < at + DOUBLE_PUSH_MS) {
                     *last = None;
                     self.pan(unit, s, |_| 0.0, engine, now);
@@ -610,6 +610,10 @@ impl Surface {
         let bank = self.bank.saturating_add_signed(by).min(last);
         if bank != self.bank {
             self.bank = bank;
+            // A push before the move was on another channel.
+            for u in &mut self.units {
+                u.pushed = [None; 8];
+            }
             self.register(engine, now);
         }
     }
@@ -756,9 +760,9 @@ impl Surface {
                     continue;
                 }
                 let s8 = s as u8;
-                if u.shown.rings[s] != Some(v.pan) {
-                    out.push((i, mcu::ring(s8, v.pan)));
-                    u.shown.rings[s] = Some(v.pan);
+                if u.shown.rings[s] != Some(v.ring) {
+                    out.push((i, mcu::ring(s8, v.ring)));
+                    u.shown.rings[s] = Some(v.ring);
                 }
                 for (key, led) in [
                     (Key::Rec(s8), Led::Off),
@@ -837,7 +841,7 @@ impl Surface {
             mute: Led::Off,
             solo: Led::Off,
             select: Led::Off,
-            pan: None,
+            ring: 0,
             name: mcu::cell(""),
             value: mcu::cell(""),
         };
@@ -878,7 +882,7 @@ impl Surface {
             } else {
                 on(self.selected.as_deref() == Some(channel.as_str()))
             },
-            pan: Some(at("pan/lr").and_then(|p| p.as_f64()).unwrap_or(0.0)),
+            ring: mcu::ring_value(Some(at("pan/lr").and_then(|p| p.as_f64()).unwrap_or(0.0))),
             name: mcu::cell(&Self::channel_name(engine, &channel)),
             value: mcu::cell(&holder.unwrap_or_else(|| taper::format_db(db))),
         }
@@ -909,8 +913,8 @@ struct StripView {
     mute: Led,
     solo: Led,
     select: Led,
-    /// The ring's pan; `None` is a dark ring.
-    pan: Option<f64>,
+    /// The V-Pot ring's [`mcu::ring_value`].
+    ring: u8,
     name: String,
     value: String,
 }

@@ -1027,13 +1027,46 @@ fn the_ring_shows_the_pan_at_once_and_is_dark_past_the_last_channel() {
     let mut e = live(1);
     let mut s = Surface::new(units(1), None);
     let out = s.render(&e, 0);
-    assert!(out.contains(&(0, mcu::ring(0, Some(0.0)))));
-    assert!(out.contains(&(0, mcu::ring(1, None))));
+    assert!(out.contains(&(0, mcu::ring(0, 0x16))));
+    assert!(out.contains(&(0, mcu::ring(1, 0))));
     // The value written is shown before the server answers, so a turn
     // never sees the ring jump back.
     pot(&mut s, &mut e, 0x45, 1);
     let rings: Vec<_> = (s.render(&e, 2).into_iter())
         .filter(|(_, m)| m[0] == 0xb0)
         .collect();
-    assert_eq!(rings, vec![(0, mcu::ring(0, Some(-0.1)))]);
+    assert_eq!(rings, vec![(0, mcu::ring(0, 0x15))]);
+    // A move within one LED's step sends nothing.
+    pot(&mut s, &mut e, 0x41, 100);
+    assert!(!s.render(&e, 101).iter().any(|(_, m)| m[0] == 0xb0));
+}
+
+#[test]
+fn detents_within_one_write_interval_add_up() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    pot(&mut s, &mut e, 1, 0);
+    pot(&mut s, &mut e, 1, 5);
+    pot(&mut s, &mut e, 1, 10);
+    assert_eq!(
+        values(&e.take_actions()),
+        vec![cmd("set", PAN, json!(0.02))]
+    );
+    e.tick(20);
+    assert_eq!(
+        values(&e.take_actions()),
+        vec![cmd("set", PAN, json!(0.06))]
+    );
+}
+
+#[test]
+fn a_push_before_a_new_session_is_no_half_of_a_pair() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    pot(&mut s, &mut e, 5, 0);
+    key(&mut s, &mut e, 32, true, 100);
+    s.reconnected(0, &mut e, 150);
+    e.take_actions();
+    key(&mut s, &mut e, 32, true, 200);
+    assert!(values(&e.take_actions()).is_empty());
 }

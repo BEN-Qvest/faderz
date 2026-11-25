@@ -139,7 +139,8 @@ pub fn parse(message: &[u8]) -> Option<Input> {
             }
         }
         // A V-Pot turn: bit 6 sets anticlockwise, the low six bits count.
-        (0xb0, &[cc @ 16..=23, value]) => {
+        // A turn of no detent says nothing.
+        (0xb0, &[cc @ 16..=23, value]) if value & 0x3f != 0 => {
             let ticks = (value & 0x3f) as i8;
             Some(Input::Pot {
                 strip: cc - 16,
@@ -150,13 +151,18 @@ pub fn parse(message: &[u8]) -> Option<Input> {
     }
 }
 
-/// Lights V-Pot ring `strip` for a pan of -1 to 1 from the centre out:
-/// mode 1 (boost/cut) and LED 1 to 11, 6 the centre. `None` turns it off.
-pub fn ring(strip: u8, pan: Option<f64>) -> Vec<u8> {
-    let value = pan.map_or(0, |p| {
-        0x10 | (1 + ((p.clamp(-1.0, 1.0) + 1.0) * 5.0).round() as u8)
-    });
-    vec![0xb0, 0x30 + (strip & 0x07), value]
+/// The V-Pot ring value for a pan of -1 to 1 from the centre out: mode 1
+/// (boost/cut) and LED 1 to 11, 6 the centre, as far left as right of it.
+/// `None` is a dark ring.
+pub fn ring_value(pan: Option<f64>) -> u8 {
+    pan.map_or(0, |p| {
+        0x10 | (6 + (p.clamp(-1.0, 1.0) * 5.0).round() as i8) as u8
+    })
+}
+
+/// Sets V-Pot ring `strip` to a [`ring_value`].
+pub fn ring(strip: u8, value: u8) -> Vec<u8> {
+    vec![0xb0, 0x30 + strip, value]
 }
 
 /// Moves a motor fader to a 14-bit value.
@@ -342,10 +348,20 @@ mod tests {
             None,
             "the ring is written, never read"
         );
-        assert_eq!(ring(0, Some(-1.0)), vec![0xb0, 48, 0x11]);
-        assert_eq!(ring(3, Some(0.0)), vec![0xb0, 51, 0x16]);
-        assert_eq!(ring(7, Some(1.0)), vec![0xb0, 55, 0x1b]);
-        assert_eq!(ring(7, Some(2.0)), vec![0xb0, 55, 0x1b], "clamped");
-        assert_eq!(ring(1, None), vec![0xb0, 49, 0]);
+        assert_eq!(parse(&[0xb0, 16, 0x00]), None, "no detent");
+        assert_eq!(parse(&[0xb0, 16, 0x40]), None, "no detent");
+        assert_eq!(ring_value(Some(-1.0)), 0x11);
+        assert_eq!(ring_value(Some(0.0)), 0x16);
+        assert_eq!(ring_value(Some(1.0)), 0x1b);
+        assert_eq!(ring_value(Some(2.0)), 0x1b, "clamped");
+        assert_eq!(ring_value(None), 0);
+        // The same distance from the centre lights the same step either
+        // way.
+        assert_eq!(ring_value(Some(0.1)), 0x17);
+        assert_eq!(ring_value(Some(-0.1)), 0x15);
+        assert_eq!(ring_value(Some(0.09)), 0x16);
+        assert_eq!(ring_value(Some(-0.09)), 0x16);
+        assert_eq!(ring(0, 0x11), vec![0xb0, 48, 0x11]);
+        assert_eq!(ring(7, 0), vec![0xb0, 55, 0]);
     }
 }
