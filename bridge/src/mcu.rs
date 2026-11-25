@@ -156,11 +156,18 @@ pub fn parse(message: &[u8]) -> Option<Input> {
 }
 
 /// The V-Pot ring value for a pan of -1 to 1 from the centre out: mode 1
-/// (boost/cut) and LED 1 to 11, 6 the centre, as far left as right of it.
-/// `None` is a dark ring.
+/// (boost/cut) and LED 1 to 11, as far left as right of the centre.
+/// LED 6, the centre alone, is the exact centre only, so an operator
+/// can tell a pan just off it. `None` is a dark ring.
 pub fn ring_value(pan: Option<f64>) -> u8 {
     pan.map_or(0, |p| {
-        0x10 | (6 + (p.clamp(-1.0, 1.0) * 5.0).round() as i8) as u8
+        let steps = (p.clamp(-1.0, 1.0).abs() * 5.0).round().max(1.0) as i8;
+        let led = match p {
+            0.0 => 6,
+            p if p > 0.0 => 6 + steps,
+            _ => 6 - steps,
+        };
+        0x10 | led as u8
     })
 }
 
@@ -364,8 +371,10 @@ mod tests {
         // way.
         assert_eq!(ring_value(Some(0.1)), 0x17);
         assert_eq!(ring_value(Some(-0.1)), 0x15);
-        assert_eq!(ring_value(Some(0.09)), 0x16);
-        assert_eq!(ring_value(Some(-0.09)), 0x16);
+        // Only the exact centre lights the centre alone.
+        assert_eq!(ring_value(Some(0.01)), 0x17);
+        assert_eq!(ring_value(Some(-0.01)), 0x15);
+        assert_eq!(ring_value(Some(0.3)), 0x18);
         assert_eq!(ring(0, 0x11), vec![0xb0, 48, 0x11]);
         assert_eq!(ring(7, 0), vec![0xb0, 55, 0]);
     }

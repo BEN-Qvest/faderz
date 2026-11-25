@@ -239,7 +239,7 @@ console shows the bridge's controls as `<console> (<user>)`.
 | SELECT | Selects the strip's channel; the LED shows the selection, and blinks while another session holds the strip's fader |
 | V-Pot turn | Sets `/channels/<id>/pan/lr` by 0.02 per detent, clockwise to the right, within -1 to 1 and at most 50 per second; nothing while another session holds it |
 | V-Pot push | With ALT held, centres `/channels/<id>/pan/lr`, as Alt+0 on a screen; alone it does nothing |
-| V-Pot ring | The pan from the centre out, 11 LEDs |
+| V-Pot ring | The pan from the centre out, 11 LEDs; the centre LED alone only at the exact centre |
 | REC | No action, unless `keys` binds it to a duck group |
 | F1 to F8 (X-Touch) | The shape's duck groups in order, or what `keys` binds (below) |
 | F1 to F8 LEDs | On while the group is held or its mode is `on`, blinking while it is bypassed and not held, on while it ducks its targets, else off |
