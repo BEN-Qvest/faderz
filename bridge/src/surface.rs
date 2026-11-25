@@ -1,8 +1,9 @@
 //! The mapping between MCU surfaces and the faderz state: one or more
 //! units side by side (an X-Touch and its Extenders) over the channels,
 //! banked together; faders write while touched, motors follow the state
-//! while not; mute, solo and select keys; duck keys; names and values on
-//! the scribble strips. Every unit is a console of its own on the server.
+//! while not; mute, solo and select keys; V-Pots on the pan; duck keys;
+//! names and values on the scribble strips. Every unit is a console of
+//! its own on the server.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -28,6 +29,9 @@ pub const LATCH_MS: u64 = 300;
 /// A duck reading older than this, 3 meter periods of 40 ms, no longer
 /// lights a duck key.
 pub const DUCK_STALE_MS: u64 = 120;
+/// The pan one V-Pot detent moves: 100 detents from full left to full
+/// right.
+pub const POT_STEP: f64 = 0.02;
 
 /// What a duck key does with its group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -127,6 +131,7 @@ struct Shown {
     faders: [Option<u16>; 9],
     moved_at: [Option<u64>; 9],
     leds: HashMap<u8, Led>,
+    rings: [Option<u8>; 8],
     /// 16 cells: 8 per line.
     cells: [Option<String>; 16],
 }
@@ -138,6 +143,8 @@ struct Unit {
     touches: [Option<Touch>; 9],
     /// Duck keys held down, by note.
     presses: BTreeMap<u8, Press>,
+    /// Whether ALT is down: a V-Pot pushed with it centres the pan.
+    alt: bool,
     shown: Shown,
 }
 
@@ -175,6 +182,7 @@ impl Surface {
                 offset: i * usize::from(mcu::STRIPS),
                 touches: Default::default(),
                 presses: BTreeMap::new(),
+                alt: false,
                 shown: Shown::default(),
             })
             .collect();
@@ -295,6 +303,35 @@ impl Surface {
             .map(|id| format!("/buses/{id}/fader"))
     }
 
+    /// The pan of the channel on strip `strip` of unit `unit`.
+    fn pan_path(&self, engine: &Engine, unit: usize, strip: u8) -> Option<String> {
+        self.channel(engine, unit, strip)
+            .map(|c| format!("/channels/{c}/pan/lr"))
+    }
+
+    /// Sets the pan of strip `strip` to what `to` makes of it, rounded to
+    /// 0.01 within -1 to 1, unless another session holds it.
+    fn pan(
+        &self,
+        unit: usize,
+        strip: u8,
+        to: impl FnOnce(f64) -> f64,
+        engine: &mut Engine,
+        now: u64,
+    ) {
+        let Some(path) = self.pan_path(engine, unit, strip) else {
+            return;
+        };
+        if engine.owner(&path).is_some_and(|o| !engine.mine(o)) {
+            return;
+        }
+        let pan = engine.display(&path).and_then(Value::as_f64).unwrap_or(0.0);
+        let next = (to(pan).clamp(-1.0, 1.0) * 100.0).round() / 100.0;
+        if next != pan {
+            engine.set(&path, json!(next), now);
+        }
+    }
+
     fn fader_path(&self, engine: &Engine, unit: usize, strip: u8) -> Option<String> {
         if strip == mcu::MASTER {
             return (self.units[unit].spec.device == Device::Main)
@@ -350,6 +387,7 @@ impl Surface {
         while let Some((_, p)) = self.units[unit].presses.pop_first() {
             self.let_go(p, engine, now);
         }
+        self.units[unit].alt = false;
         self.resend(unit);
     }
 
@@ -442,7 +480,17 @@ impl Surface {
                 Some(k) => self.duck_down(unit, key.note(), k, engine, now),
                 None => self.key(unit, key, engine, now),
             },
+            Input::Pot { strip, ticks } => self.pan(
+                unit,
+                strip,
+                |p| p + f64::from(ticks) * POT_STEP,
+                engine,
+                now,
+            ),
             Input::Key { key, down: false } => {
+                if key == Key::Alt {
+                    self.units[unit].alt = false;
+                }
                 if let Some(p) = self.units[unit].presses.remove(&key.note()) {
                     self.duck_up(p, engine, now);
                 }
@@ -535,6 +583,11 @@ impl Surface {
                     engine.select(self.selected.as_deref());
                 }
             }
+            // Only with ALT, as Alt+0 on a screen: a push alone, easily
+            // made while turning, would move a pan on air.
+            Key::Pot(s) if self.units[unit].alt => self.pan(unit, s, |_| 0.0, engine, now),
+            Key::Pot(_) => {}
+            Key::Alt => self.units[unit].alt = true,
             // Mapped, and left without an action until recording exists.
             Key::Rec(_) => {}
             Key::BankLeft => self.move_bank(-(self.strips() as isize), engine, now),
@@ -699,6 +752,10 @@ impl Surface {
                     continue;
                 }
                 let s8 = s as u8;
+                if u.shown.rings[s] != Some(v.ring) {
+                    out.push((i, mcu::ring(s8, v.ring)));
+                    u.shown.rings[s] = Some(v.ring);
+                }
                 for (key, led) in [
                     (Key::Rec(s8), Led::Off),
                     (Key::Solo(s8), v.solo),
@@ -776,6 +833,7 @@ impl Surface {
             mute: Led::Off,
             solo: Led::Off,
             select: Led::Off,
+            ring: 0,
             name: mcu::cell(""),
             value: mcu::cell(""),
         };
@@ -816,6 +874,7 @@ impl Surface {
             } else {
                 on(self.selected.as_deref() == Some(channel.as_str()))
             },
+            ring: mcu::ring_value(Some(at("pan/lr").and_then(|p| p.as_f64()).unwrap_or(0.0))),
             name: mcu::cell(&Self::channel_name(engine, &channel)),
             value: mcu::cell(&holder.unwrap_or_else(|| taper::format_db(db))),
         }
@@ -846,6 +905,8 @@ struct StripView {
     mute: Led,
     solo: Led,
     select: Led,
+    /// The V-Pot ring's [`mcu::ring_value`].
+    ring: u8,
     name: String,
     value: String,
 }

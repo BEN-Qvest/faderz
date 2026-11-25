@@ -1,6 +1,7 @@
 //! The Mackie Control (MCU) messages the bridge reads from and writes to a
 //! surface: 14-bit faders as pitch bend, fader touch, the strip and bank
-//! keys as notes, their LEDs, and the scribble strip text as SysEx.
+//! keys as notes, their LEDs, the V-Pots and their LED rings as control
+//! changes, and the scribble strip text as SysEx.
 //!
 //! The values follow the published reverse-engineered MCU reference; they
 //! are not checked against a unit here. The function keys F1 to F8 at
@@ -41,10 +42,14 @@ pub enum Key {
     Solo(u8),
     Mute(u8),
     Select(u8),
+    /// A V-Pot pushed.
+    Pot(u8),
     BankLeft,
     BankRight,
     ChannelLeft,
     ChannelRight,
+    /// ALT, a modifier.
+    Alt,
     /// F1 to F8 as 0 to 7.
     Function(u8),
     /// Any other note: not mapped.
@@ -58,11 +63,13 @@ impl Key {
             8..=15 => Key::Solo(note - 8),
             16..=23 => Key::Mute(note - 16),
             24..=31 => Key::Select(note - 24),
+            32..=39 => Key::Pot(note - 32),
             46 => Key::BankLeft,
             47 => Key::BankRight,
             48 => Key::ChannelLeft,
             49 => Key::ChannelRight,
             54..=61 => Key::Function(note - 54),
+            73 => Key::Alt,
             n => Key::Other(n),
         }
     }
@@ -74,11 +81,13 @@ impl Key {
             Key::Solo(s) => 8 + s,
             Key::Mute(s) => 16 + s,
             Key::Select(s) => 24 + s,
+            Key::Pot(s) => 32 + s,
             Key::BankLeft => 46,
             Key::BankRight => 47,
             Key::ChannelLeft => 48,
             Key::ChannelRight => 49,
             Key::Function(f) => 54 + f,
+            Key::Alt => 73,
             Key::Other(n) => n,
         }
     }
@@ -100,6 +109,11 @@ pub enum Input {
     Key {
         key: Key,
         down: bool,
+    },
+    /// A V-Pot turned by `ticks` detents, clockwise above 0.
+    Pot {
+        strip: u8,
+        ticks: i8,
     },
 }
 
@@ -128,8 +142,38 @@ pub fn parse(message: &[u8]) -> Option<Input> {
                 }),
             }
         }
+        // A V-Pot turn: bit 6 sets anticlockwise, the low six bits count.
+        // A turn of no detent says nothing.
+        (0xb0, &[cc @ 16..=23, value]) if value & 0x3f != 0 => {
+            let ticks = (value & 0x3f) as i8;
+            Some(Input::Pot {
+                strip: cc - 16,
+                ticks: if value & 0x40 != 0 { -ticks } else { ticks },
+            })
+        }
         _ => None,
     }
+}
+
+/// The V-Pot ring value for a pan of -1 to 1 from the centre out: mode 1
+/// (boost/cut) and LED 1 to 11, as far left as right of the centre.
+/// LED 6, the centre alone, is the exact centre only, so an operator
+/// can tell a pan just off it. `None` is a dark ring.
+pub fn ring_value(pan: Option<f64>) -> u8 {
+    pan.map_or(0, |p| {
+        let steps = (p.clamp(-1.0, 1.0).abs() * 5.0).round().max(1.0) as i8;
+        let led = match p {
+            0.0 => 6,
+            p if p > 0.0 => 6 + steps,
+            _ => 6 - steps,
+        };
+        0x10 | led as u8
+    })
+}
+
+/// Sets V-Pot ring `strip` to a [`ring_value`].
+pub fn ring(strip: u8, value: u8) -> Vec<u8> {
+    vec![0xb0, 0x30 + strip, value]
 }
 
 /// Moves a motor fader to a 14-bit value.
@@ -256,6 +300,8 @@ mod tests {
         assert_eq!(key(9), Key::Solo(1));
         assert_eq!(key(23), Key::Mute(7));
         assert_eq!(key(24), Key::Select(0));
+        assert_eq!(key(32), Key::Pot(0));
+        assert_eq!(key(39), Key::Pot(7));
         assert_eq!(key(46), Key::BankLeft);
         assert_eq!(key(49), Key::ChannelRight);
         assert_eq!(key(50), Key::Other(50));
@@ -271,6 +317,7 @@ mod tests {
             );
         }
         assert_eq!(key(62), Key::Other(62));
+        assert_eq!(key(73), Key::Alt);
         for note in 0..=103 {
             assert_eq!(Key::from_note(note).note(), note);
         }
@@ -292,5 +339,43 @@ mod tests {
         assert_eq!(parse_lcd(&m), Some((Device::Extender, 63, "Vox  ?".into())));
         assert_eq!(cell("Presenter 1"), "Present");
         assert_eq!(cell("Mic"), "Mic    ");
+    }
+
+    #[test]
+    fn v_pots_turn_as_relative_control_changes_and_light_their_rings() {
+        assert_eq!(
+            parse(&[0xb0, 16, 1]),
+            Some(Input::Pot { strip: 0, ticks: 1 })
+        );
+        assert_eq!(
+            parse(&[0xb0, 23, 0x43]),
+            Some(Input::Pot {
+                strip: 7,
+                ticks: -3
+            })
+        );
+        assert_eq!(parse(&[0xb0, 24, 1]), None, "CC 24 is no V-Pot");
+        assert_eq!(
+            parse(&[0xb0, 48, 1]),
+            None,
+            "the ring is written, never read"
+        );
+        assert_eq!(parse(&[0xb0, 16, 0x00]), None, "no detent");
+        assert_eq!(parse(&[0xb0, 16, 0x40]), None, "no detent");
+        assert_eq!(ring_value(Some(-1.0)), 0x11);
+        assert_eq!(ring_value(Some(0.0)), 0x16);
+        assert_eq!(ring_value(Some(1.0)), 0x1b);
+        assert_eq!(ring_value(Some(2.0)), 0x1b, "clamped");
+        assert_eq!(ring_value(None), 0);
+        // The same distance from the centre lights the same step either
+        // way.
+        assert_eq!(ring_value(Some(0.1)), 0x17);
+        assert_eq!(ring_value(Some(-0.1)), 0x15);
+        // Only the exact centre lights the centre alone.
+        assert_eq!(ring_value(Some(0.01)), 0x17);
+        assert_eq!(ring_value(Some(-0.01)), 0x15);
+        assert_eq!(ring_value(Some(0.3)), 0x18);
+        assert_eq!(ring(0, 0x11), vec![0xb0, 48, 0x11]);
+        assert_eq!(ring(7, 0), vec![0xb0, 55, 0]);
     }
 }

@@ -3,8 +3,8 @@
 `faderz-bridge` drives Mackie Control (MCU) surfaces, an X-Touch and
 X-Touch Extenders, over USB-MIDI or over the network by RTP-MIDI, and
 connects to faderz as a WebSocket client of kind `console`: fader touch
-and moves, motors, mute, solo, select, bank, duck keys and the scribble
-strips. Every unit is a console of its own in `/consoles`, all of them
+and moves, motors, mute, solo, select, bank, the V-Pots and their rings,
+duck keys and the scribble strips. Every unit is a console of its own in `/consoles`, all of them
 over one session. Its source is in `bridge/`, a crate of its own,
 released with its own version.
 
@@ -64,7 +64,7 @@ power-on to choose it).
 | `auth` | `{"mode": "none"}` (default); `{"mode": "token", "token": ...}` or `{"mode": "token", "tokenFile": ...}` for a bearer token, faderz's `auth.token` or an access token of its OIDC provider; `{"mode": "device", ...}` to sign in at the OIDC provider ([Signing in](#signing-in)). |
 | `units` | Left to right. `id` is the console id (`^[a-z][a-z0-9-]{0,31}$`), `name` its display name, `model` `x-touch` (default) or `x-touch-extender`, `transport` `midi` (default) or `rtp-midi`. With `midi`, `midiIn` and `midiOut` are parts of the port names (`midiOut` defaults to `midiIn`). |
 | `master` | The control the X-Touch master fader drives. Default: the fader of the shape's program bus. |
-| `keys` | The X-Touch's duck keys by MIDI note, replacing F1 to F8: `{"0": {"duck": "comm", "action": "hold"}}`. `duck` is a duck group's id; `action` is `holdOrLatch` (default), `hold` or `latch`. A note is a REC key (0 to 7), a function key (54 to 61) or another note below 104 the bridge does not map, each named once; `{}` leaves the X-Touch without duck keys. The bridge warns of keys without an X-Touch unit and of a key whose group the shape lacks. |
+| `keys` | The X-Touch's duck keys by MIDI note, replacing F1 to F8: `{"0": {"duck": "comm", "action": "hold"}}`. `duck` is a duck group's id; `action` is `holdOrLatch` (default), `hold` or `latch`. A note is a REC key (0 to 7), a V-Pot push (32 to 39), a function key (54 to 61), ALT (73) or another note below 104 the bridge does not map, each named once; a bound note does what `keys` says instead of its mapping; `{}` leaves the X-Touch without duck keys. The bridge warns of keys without an X-Touch unit and of a key whose group the shape lacks. |
 
 ## Network surfaces (RTP-MIDI)
 
@@ -112,8 +112,8 @@ again until it is touched anew. A session that ends lets go of the
 faders it held.
 
 What goes to the surface is limited to `maxBytesPerSecond` and 512
-octets per packet; a newer motor position, LED or meter level replaces
-the queued one it supersedes. faderz shows a console connected while
+octets per packet; a newer motor position, LED, V-Pot ring or meter
+level replaces the queued one it supersedes. faderz shows a console connected while
 the bridge's session holds it, not while its network surface is, so a
 unit whose peer left still shows as connected.
 
@@ -237,6 +237,9 @@ console shows the bridge's controls as `<console> (<user>)`.
 | MUTE | Toggles `/channels/<id>/mute`; the LED shows the state |
 | SOLO | Toggles `/channels/<id>/solo` between `off` and `pfl`; the LED is on while it is not `off` |
 | SELECT | Selects the strip's channel; the LED shows the selection, and blinks while another session holds the strip's fader |
+| V-Pot turn | Sets `/channels/<id>/pan/lr` by 0.02 per detent, clockwise to the right, within -1 to 1 and at most 50 per second; nothing while another session holds it |
+| V-Pot push | With ALT held, centres `/channels/<id>/pan/lr`, as Alt+0 on a screen; alone it does nothing |
+| V-Pot ring | The pan from the centre out, 11 LEDs; the centre LED alone only at the exact centre |
 | REC | No action, unless `keys` binds it to a duck group |
 | F1 to F8 (X-Touch) | The shape's duck groups in order, or what `keys` binds (below) |
 | F1 to F8 LEDs | On while the group is held or its mode is `on`, blinking while it is bypassed and not held, on while it ducks its targets, else off |
@@ -291,4 +294,9 @@ an X-Touch or X-Touch Extender:
 - RTP-MIDI with a surface's own network port, in role MASTER and SLAVE,
   across a router and a NAT, and the rate a surface takes;
 - an RTP-MIDI session from macOS, and the scribble strip SysEx through
-  its live routings.
+  its live routings;
+- ALT on note 73.
+
+The V-Pots were tried on an X-Touch in MC mode over RTP-MIDI: turns on
+CC 16-23 with bit 6 anticlockwise, the push on notes 32-39, and the
+ring on CC 48-55 in mode 1 with LEDs 1 to 11.

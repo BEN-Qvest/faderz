@@ -294,14 +294,15 @@ impl Config {
             }
         }
         for (note, key) in config.keys.iter().flatten() {
-            // REC, the function keys and notes the surface does not map.
+            // REC, the function keys, the V-Pot pushes, ALT and notes the
+            // surface does not map. A bound key wins over its mapping.
             let free = matches!(
                 Key::from_note(*note),
-                Key::Rec(_) | Key::Function(_) | Key::Other(_)
+                Key::Rec(_) | Key::Function(_) | Key::Pot(_) | Key::Alt | Key::Other(_)
             ) && *note < 104;
             if !free {
                 return Err(format!(
-                    "keys.{note}: not a REC, function or other unmapped key below note 104"
+                    "keys.{note}: not a REC, V-Pot push, function, ALT or other unmapped key below note 104"
                 ));
             }
             if !id_ok(&key.duck) {
@@ -436,6 +437,17 @@ mod tests {
         .unwrap();
         assert_eq!(c.warnings().len(), 1, "{:?}", c.warnings());
         assert!(c.warnings()[0].contains("x-touch"));
+        // A V-Pot push and ALT can be duck keys, as before they were
+        // mapped.
+        let c = Config::parse(
+            r#"{ "endpoints": ["ws://x"],
+                 "units": [{ "id": "xt", "name": "X", "model": "x-touch", "midiIn": "X" }],
+                 "keys": { "32": { "duck": "comm" }, "73": { "duck": "comm-b" } } }"#,
+        )
+        .unwrap();
+        let keys = c.keys.unwrap();
+        assert_eq!(keys[&32].duck, "comm");
+        assert_eq!(keys[&73].duck, "comm-b");
     }
 
     #[test]

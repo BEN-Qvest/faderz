@@ -228,6 +228,11 @@ fn duck_keys_and_their_leds() {
 }
 
 #[test]
+fn v_pots_on_the_pan_and_their_rings() {
+    replay("v-pot.mcu", include_str!("../tests/fixtures/v-pot.mcu"));
+}
+
+#[test]
 fn banking_and_the_scribble_strip() {
     replay("bank.mcu", include_str!("../tests/fixtures/bank.mcu"));
 }

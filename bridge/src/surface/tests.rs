@@ -197,11 +197,11 @@ fn a_new_session_lets_go_of_held_faders_and_gets_everything_again() {
     let mut e = live(1);
     let mut s = Surface::new(units(2), None);
     let first = s.render(&e, 0);
-    // Faders, LEDs and both lines of every strip per unit, and the
+    // Faders, LEDs, rings and both lines of every strip per unit, and the
     // X-Touch's function key LEDs.
     let on = |out: &[(usize, Vec<u8>)], unit| out.iter().filter(|(u, _)| *u == unit).count();
-    assert_eq!(on(&first, 0), 9 + 8 * 4 + 16 + 8);
-    assert_eq!(on(&first, 1), 8 + 8 * 4 + 16);
+    assert_eq!(on(&first, 0), 9 + 8 * 5 + 16 + 8);
+    assert_eq!(on(&first, 1), 8 + 8 * 5 + 16);
     assert!(s.render(&e, 100).is_empty(), "only what changed");
 
     s.resend(1);
@@ -266,7 +266,7 @@ fn after_missed_messages_a_touch_that_does_not_move_is_let_go() {
     s.link_changed(0, lost(2), resend, &mut e, 8000);
     s.tick(&mut e, 20_000);
     assert_eq!(s.touching(), held());
-    assert_eq!(s.render(&e, 20_000).len(), 9 + 8 * 4 + 16 + 8 - 1);
+    assert_eq!(s.render(&e, 20_000).len(), 9 + 8 * 5 + 16 + 8 - 1);
     // The session ending lets go of everything.
     let down = Link {
         connected: false,
@@ -953,4 +953,122 @@ fn keys_bound_to_groups_the_shape_lacks_are_named() {
         vec!["keys.1: the shape has no duck group gone"]
     );
     assert!(Surface::new(units(1), None).unbound_keys(&e).is_empty());
+}
+
+const PAN: &str = "/channels/ch1/pan/lr";
+
+fn pot(s: &mut Surface, e: &mut Engine, value: u8, now: u64) {
+    s.input(0, &[0xb0, 16, value], e, now);
+}
+
+#[test]
+fn a_v_pot_turns_its_channels_pan_by_detents_within_full_left_and_right() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    pot(&mut s, &mut e, 2, 0);
+    pot(&mut s, &mut e, 0x41, 100);
+    pot(&mut s, &mut e, 0x7f, 200);
+    pot(&mut s, &mut e, 0x41, 300);
+    assert_eq!(
+        values(&e.take_actions()),
+        vec![
+            cmd("set", PAN, json!(0.04)),
+            cmd("set", PAN, json!(0.02)),
+            cmd("set", PAN, json!(-1.0)),
+        ],
+        "clockwise is right, and a turn past full left writes nothing"
+    );
+    // Turns on a strip past the last channel do nothing.
+    s.input(0, &[0xb0, 17, 1], &mut e, 400);
+    assert!(values(&e.take_actions()).is_empty());
+}
+
+const ALT: u8 = 73;
+
+#[test]
+fn a_v_pot_pushed_with_alt_centres_the_pan_and_alone_does_nothing() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    pot(&mut s, &mut e, 5, 0);
+    e.take_actions();
+    key(&mut s, &mut e, 32, true, 100);
+    key(&mut s, &mut e, 32, false, 150);
+    key(&mut s, &mut e, 32, true, 200);
+    assert!(values(&e.take_actions()).is_empty(), "pushes alone");
+    key(&mut s, &mut e, ALT, true, 300);
+    key(&mut s, &mut e, 32, true, 350);
+    assert_eq!(values(&e.take_actions()), vec![cmd("set", PAN, json!(0.0))]);
+    // ALT let go, a push is a push again.
+    pot(&mut s, &mut e, 5, 400);
+    key(&mut s, &mut e, ALT, false, 450);
+    e.take_actions();
+    key(&mut s, &mut e, 32, true, 500);
+    assert!(values(&e.take_actions()).is_empty());
+}
+
+#[test]
+fn a_v_pot_leaves_a_pan_another_session_holds() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    let other = json!({ "principal": "ana", "handle": "aaaaaaaaaaaaaaaaaaaaaa", "kind": "ui", "connection": "c" });
+    delta(
+        &mut e,
+        6,
+        json!([]),
+        json!([{ "path": PAN, "owner": other }]),
+    );
+    pot(&mut s, &mut e, 1, 0);
+    key(&mut s, &mut e, ALT, true, 1);
+    key(&mut s, &mut e, 32, true, 2);
+    assert!(values(&e.take_actions()).is_empty());
+}
+
+#[test]
+fn the_ring_shows_the_pan_at_once_and_is_dark_past_the_last_channel() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    let out = s.render(&e, 0);
+    assert!(out.contains(&(0, mcu::ring(0, 0x16))));
+    assert!(out.contains(&(0, mcu::ring(1, 0))));
+    // The value written is shown before the server answers, so a turn
+    // never sees the ring jump back.
+    pot(&mut s, &mut e, 0x45, 1);
+    let rings: Vec<_> = (s.render(&e, 2).into_iter())
+        .filter(|(_, m)| m[0] == 0xb0)
+        .collect();
+    assert_eq!(rings, vec![(0, mcu::ring(0, 0x15))]);
+    // A move within one LED's step sends nothing.
+    pot(&mut s, &mut e, 0x41, 100);
+    assert!(!s.render(&e, 101).iter().any(|(_, m)| m[0] == 0xb0));
+}
+
+#[test]
+fn detents_within_one_write_interval_add_up() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    pot(&mut s, &mut e, 1, 0);
+    pot(&mut s, &mut e, 1, 5);
+    pot(&mut s, &mut e, 1, 10);
+    assert_eq!(
+        values(&e.take_actions()),
+        vec![cmd("set", PAN, json!(0.02))]
+    );
+    e.tick(20);
+    assert_eq!(
+        values(&e.take_actions()),
+        vec![cmd("set", PAN, json!(0.06))]
+    );
+}
+
+#[test]
+fn alt_is_let_go_with_its_session() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    pot(&mut s, &mut e, 5, 0);
+    key(&mut s, &mut e, ALT, true, 100);
+    // Its release may be among what went missing.
+    s.reconnected(0, &mut e, 150);
+    e.take_actions();
+    key(&mut s, &mut e, 32, true, 200);
+    assert!(values(&e.take_actions()).is_empty());
 }
