@@ -4,10 +4,11 @@
   import type { ChannelShape, ChannelState, Solo, Tap } from '../lib/contract/types';
   import { getMixer } from '../lib/state/mixer.svelte';
   import { channelPath } from '../lib/state/paths';
-  import { effectiveGainDb, formatDb, formatFreq } from '../lib/audio/db';
+  import { FADER_OFF_DB, effectiveGainDb, formatDb, formatFreq } from '../lib/audio/db';
   import LayoutBadge from './LayoutBadge.svelte';
   import Fader from './Fader.svelte';
   import FaderValue from './FaderValue.svelte';
+  import MinusInfinity from './MinusInfinity.svelte';
   import Meter from './Meter.svelte';
   import Pan from './Pan.svelte';
   import EqCurve from './EqCurve.svelte';
@@ -296,7 +297,9 @@
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <div class="vca" role="note" tabindex="0" aria-label={vcaText} use:tip={vcaText}>
         <span class="names">{vcas.map((v) => v.name).join(' ')}</span>
-        <span class="eff" class:shown={effective !== fader}><span class="fixed">{fit(formatDb(effective), 5)}</span></span>
+        <span class="eff" class:shown={effective !== fader}
+          >{#if effective <= FADER_OFF_DB}<span class="floor"><MinusInfinity /></span>{:else}<span class="fixed">{fit(formatDb(effective), 5)}</span>{/if}</span
+        >
       </div>
     {:else}
       <div class="vca" aria-hidden="true"></div>
@@ -730,6 +733,11 @@
   }
   .vca .eff.shown {
     visibility: visible;
+  }
+  .vca .eff .floor {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
   }
   @media (pointer: coarse) {
     .ctl .key {
