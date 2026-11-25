@@ -236,7 +236,7 @@ console shows the bridge's controls as `<console> (<user>)`.
 | Motor | The strip's fader value whenever the fader is not touched; a held fader is never moved, and goes to the state's value when let go |
 | MUTE | Toggles `/channels/<id>/mute`; the LED shows the state |
 | SOLO | Toggles `/channels/<id>/solo` between `off` and `pfl`; the LED is on while it is not `off` |
-| SELECT | Selects the strip's channel, or drops the selection when it is the selected one; the LED shows the selection, and blinks while another session holds the strip's fader. The selection is shared with the screens signed in as the bridge's principal: their panels follow SELECT, and SELECT follows the strip or master a screen selects, every LED dark while that is on no strip or a screen's panel closes. With `auth.mode` none every session is `anonymous`, so every screen shares it |
+| SELECT | Selects the strip's channel for the screens (below), or lets go of the selection when pressed again; the LED shows the selection, and blinks while another session holds the strip's fader |
 | V-Pot turn | Sets `/channels/<id>/pan/lr` by 0.02 per detent, clockwise to the right, within -1 to 1 and at most 50 per second; nothing while another session holds it |
 | V-Pot push | With ALT held, centres `/channels/<id>/pan/lr`, as Alt+0 on a screen; alone it does nothing |
 | V-Pot ring | The pan from the centre out, 11 LEDs; the centre LED alone only at the exact centre |
@@ -264,6 +264,17 @@ the mode. While a key of a bypassed group is down, line 2 reads
 `<group name> bypassed`. After messages from a network surface went
 missing, a held duck key is let go after 1.5 seconds, as a fader is. A key also lights while its group ducks, from the last meter
 frame, if it is no older than 120 ms.
+
+SELECT is shared with the screens signed in as the bridge's principal.
+A SELECT press opens or switches the panel on each of them; letting go
+of it, or the bridge leaving, closes no panel. The SELECT LEDs show
+what such a screen selected last, and all are dark while that is on no
+strip or no screen of the principal has a selection. Following a
+screen publishes nothing, so one screen never moves another through
+the surface. With `auth.mode` none or token every session is
+`anonymous`, so every screen shares it. Selections are kept per
+replica and not replicated: a screen and the bridge share them only
+while both are connected to the same replica.
 
 ## Connection
 

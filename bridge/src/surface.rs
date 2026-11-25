@@ -581,9 +581,11 @@ impl Surface {
                     engine.set(&path, json!(if off { "pfl" } else { "off" }), now);
                 }
             }
+            // Selects the strip's channel for the screens to follow; again on
+            // the channel it published, it lets that go.
             Key::Select(s) => {
                 if let Some(c) = strip_channel(s) {
-                    self.selected = (self.selected.as_deref() != Some(c.as_str())).then_some(c);
+                    self.selected = (engine.selection() != Some(c.as_str())).then_some(c);
                     engine.select(self.selected.as_deref());
                 }
             }
@@ -655,18 +657,13 @@ impl Surface {
         }
     }
 
-    /// Takes the selection of a screen signed in as this bridge's
-    /// principal whenever one changes, a screen closing its panel
-    /// included: the SELECT LEDs show what that screen shows, and the
-    /// screen follows a SELECT key in turn.
+    /// Shows on the SELECT LEDs what a screen signed in as this bridge's
+    /// principal selected last, dark once that screen's selection is gone,
+    /// its panel closed or the screen left.
     fn follow(&mut self, list: &Value, engine: &mut Engine) {
         let Some(me) = engine.principal() else { return };
         let screens: BTreeMap<String, String> = (list.as_array().into_iter().flatten())
-            .filter(|s| {
-                s["session"]["kind"] == "ui"
-                    && s["session"]["principal"] == me
-                    && s["session"]["handle"] != engine.handle()
-            })
+            .filter(|s| s["session"]["kind"] == "ui" && s["session"]["principal"] == me)
             .filter_map(|s| {
                 Some((
                     s["session"]["handle"].as_str()?.to_owned(),
@@ -685,7 +682,12 @@ impl Surface {
         self.screens = screens;
         if let Some(element) = changed {
             self.selected = element;
-            engine.select(self.selected.as_deref());
+            // The LEDs follow; the surface publishes a selection of its own
+            // only on a SELECT press, so no screen drives another through
+            // it, and one it published before no longer stands.
+            if engine.selection().is_some() {
+                engine.select(None);
+            }
         }
     }
 

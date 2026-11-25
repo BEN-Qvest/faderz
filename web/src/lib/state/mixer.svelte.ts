@@ -79,11 +79,12 @@ export class MixerStore {
   /** What every session has selected, this one included. */
   selections = $state.raw<Selection[]>([]);
   /**
-   * The latest change of what a control surface signed in as this
-   * screen's principal has selected, a selection it dropped included
-   * (element null): the screen follows it. A new object per change.
+   * The latest element a control surface signed in as this screen's
+   * principal selected with its SELECT key: the screen opens its panel.
+   * A new object per selection; a surface dropping or leaving its
+   * selection closes nothing.
    */
-  surfaceSelect = $state.raw<{ element: string | null } | null>(null);
+  surfaceSelect = $state.raw<{ element: string } | null>(null);
   /** What each such surface had selected, by handle, at the last selections. */
   private surfaces = new Map<string, string>();
   /** The sessions connected to the primary's replica, this one included. */
@@ -238,9 +239,9 @@ export class MixerStore {
     const you = this.status.you;
     if (!you) return;
     const now = new Map(list.filter((s) => s.session.kind === 'console' && s.session.principal === you.principal).map((s) => [s.session.handle, s.element]));
-    const changed = [...now.keys(), ...this.surfaces.keys()].find((h) => now.get(h) !== this.surfaces.get(h));
+    const changed = [...now].find(([h, element]) => this.surfaces.get(h) !== element);
     this.surfaces = now;
-    if (changed !== undefined) this.surfaceSelect = { element: now.get(changed) ?? null };
+    if (changed) this.surfaceSelect = { element: changed[1] };
   }
 
   /** Tells other screens what this one has selected; not a write, so sent while locked too. */

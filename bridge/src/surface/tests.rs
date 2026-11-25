@@ -1115,7 +1115,7 @@ fn select_led(s: &mut Surface, e: &Engine) -> Option<Led> {
 }
 
 #[test]
-fn select_follows_a_screen_of_the_same_principal_and_goes_dark_when_it_closes() {
+fn select_leds_follow_a_screen_of_the_same_principal_and_publish_nothing() {
     let mut e = signed_in();
     let mut s = Surface::new(units(1), None);
     assert_eq!(select_led(&mut s, &e), Some(Led::Off));
@@ -1125,11 +1125,9 @@ fn select_follows_a_screen_of_the_same_principal_and_goes_dark_when_it_closes() 
         &mut e,
         json!([{ "session": mine, "element": "ch1" }]),
     );
-    assert_eq!(selects(&e.take_actions()), vec![json!("ch1")]);
     assert_eq!(select_led(&mut s, &e), Some(Led::On));
-    // The screen's panel closed: its selection is gone from the list.
+    // Gone from the list, its panel closed or the screen left: dark.
     selections(&mut s, &mut e, json!([]));
-    assert_eq!(selects(&e.take_actions()), vec![Value::Null]);
     assert_eq!(select_led(&mut s, &e), Some(Led::Off));
     // A bus is on no strip: every SELECT LED stays dark.
     selections(
@@ -1137,26 +1135,27 @@ fn select_follows_a_screen_of_the_same_principal_and_goes_dark_when_it_closes() 
         &mut e,
         json!([{ "session": mine, "element": "pgm" }]),
     );
-    assert_eq!(selects(&e.take_actions()), vec![json!("pgm")]);
     assert_eq!(
         select_led(&mut s, &e),
         None,
         "nothing changed on the surface"
     );
+    // Following publishes nothing, so no other screen follows through it.
+    assert!(selects(&e.take_actions()).is_empty());
+    // Other principals and other surfaces are not followed.
+    let list = json!([
+        { "session": screen("ana", "bbbbbbbbbbbbbbbbbbbbbb", "ui"), "element": "ch1" },
+        { "session": screen("ben", "cccccccccccccccccccccc", "console"), "element": "ch1" },
+        { "session": mine, "element": "pgm" },
+    ]);
+    selections(&mut s, &mut e, list);
+    assert_eq!(select_led(&mut s, &e), None);
 }
 
 #[test]
-fn select_ignores_other_principals_surfaces_and_its_own_echo() {
+fn select_publishes_a_press_and_a_screen_following_it_changes_nothing() {
     let mut e = signed_in();
     let mut s = Surface::new(units(1), None);
-    let list = json!([
-        { "session": screen("ana", "aaaaaaaaaaaaaaaaaaaaaa", "ui"), "element": "ch1" },
-        { "session": screen("ben", "cccccccccccccccccccccc", "console"), "element": "ch1" },
-        { "session": screen("ben", e.handle(), "ui"), "element": "ch1" },
-    ]);
-    selections(&mut s, &mut e, list);
-    assert!(selects(&e.take_actions()).is_empty());
-    // The SELECT key selects; the screen that follows it changes nothing.
     key(&mut s, &mut e, 24, true, 0);
     assert_eq!(selects(&e.take_actions()), vec![json!("ch1")]);
     let mine = screen("ben", "aaaaaaaaaaaaaaaaaaaaaa", "ui");
@@ -1167,6 +1166,28 @@ fn select_ignores_other_principals_surfaces_and_its_own_echo() {
     );
     assert!(selects(&e.take_actions()).is_empty());
     assert_eq!(select_led(&mut s, &e), Some(Led::On));
+    // Again on the channel it published: it lets it go.
+    key(&mut s, &mut e, 24, true, 1);
+    assert_eq!(selects(&e.take_actions()), vec![Value::Null]);
+    // A screen moves on: the LEDs follow, and the press it published
+    // before no longer stands. A press on the strip the screen lit
+    // publishes it rather than letting go.
+    key(&mut s, &mut e, 24, true, 2);
+    e.take_actions();
+    selections(
+        &mut s,
+        &mut e,
+        json!([{ "session": mine, "element": "pgm" }]),
+    );
+    assert_eq!(selects(&e.take_actions()), vec![Value::Null]);
+    selections(
+        &mut s,
+        &mut e,
+        json!([{ "session": mine, "element": "ch1" }]),
+    );
+    assert!(selects(&e.take_actions()).is_empty());
+    key(&mut s, &mut e, 24, true, 3);
+    assert_eq!(selects(&e.take_actions()), vec![json!("ch1")]);
 }
 
 #[test]
@@ -1176,23 +1197,23 @@ fn select_takes_the_screen_that_moved_not_one_that_follows_late() {
     // b sorts first, so its change is met first.
     let a = screen("ben", "cccccccccccccccccccccc", "ui");
     let b = screen("ben", "aaaaaaaaaaaaaaaaaaaaaa", "ui");
-    selections(&mut s, &mut e, json!([{ "session": a, "element": "ch1" }]));
-    assert_eq!(selects(&e.take_actions()), vec![json!("ch1")]);
-    // In one message: screen a moved to pgm, and screen b, before it
-    // had seen that, followed the surface to ch1.
+    key(&mut s, &mut e, 24, true, 0);
+    assert_eq!(select_led(&mut s, &e), Some(Led::On));
+    // In one message: screen a moved to pgm, and screen b, before it had
+    // seen that, followed the surface's press to ch1. The surface takes
+    // a: pgm is on no strip, so strip 1 goes dark.
     selections(
         &mut s,
         &mut e,
         json!([{ "session": a, "element": "pgm" }, { "session": b, "element": "ch1" }]),
     );
-    assert_eq!(selects(&e.take_actions()), vec![json!("pgm")]);
-    // Screen b follows to pgm: nothing more goes out.
+    assert_eq!(select_led(&mut s, &e), Some(Led::Off));
     selections(
         &mut s,
         &mut e,
         json!([{ "session": a, "element": "pgm" }, { "session": b, "element": "pgm" }]),
     );
-    assert!(selects(&e.take_actions()).is_empty());
+    assert_eq!(select_led(&mut s, &e), None, "b following changes nothing");
 }
 
 #[test]

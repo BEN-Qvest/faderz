@@ -1471,6 +1471,32 @@ test('shows the source under the channel name and colours the scribble strip fro
   await expect.poll(async () => (await serverState(request)).state.channels['ch3']!.color).toBe('none');
 });
 
+test('SELECT on a surface of the same user opens the panel on every screen, and no screen moves another', { tag: '@mock' }, async ({ page, baseURL }) => {
+  await live(page);
+  const second = await page.context().newPage();
+  await live(second);
+  const guest1 = (p: Page) => p.getByRole('radiogroup', { name: 'Guest 1 strip colour' });
+  const guest2 = (p: Page) => p.getByRole('radiogroup', { name: 'Guest 2 strip colour' });
+  const desk = await RawClient.open(baseURL!, 'console');
+  try {
+    desk.send({ type: 'select', element: 'ch3' });
+    await expect(guest1(page)).toBeVisible();
+    await expect(guest1(second)).toBeVisible();
+    // A screen selecting on its own moves only itself.
+    await page.locator('[data-channel="ch4"] .head').click();
+    await expect(guest2(page)).toBeVisible();
+    await page.waitForTimeout(500);
+    await expect(guest1(second)).toBeVisible();
+  } finally {
+    desk.close();
+  }
+  // The surface leaving closes no panel.
+  await page.waitForTimeout(500);
+  await expect(guest1(second)).toBeVisible();
+  await expect(guest2(page)).toBeVisible();
+  await second.close();
+});
+
 test('opens the engine counters above the lamp, inside the viewport, at desktop and phone widths', async ({ page }) => {
   await live(page);
   const lamp = page.getByTestId('engine');

@@ -168,7 +168,7 @@ describe('mixer store: a surface of the same principal', () => {
     return s;
   };
 
-  it('is followed when its selection changes, a dropped one closing', () => {
+  it('is followed when it selects, and its selection dropped or gone closes nothing', () => {
     const s = signedIn();
     s.apply(patch(0, { selections: [{ session: desk('ben'), element: 'ch2' }] }));
     expect(s.surfaceSelect).toEqual({ element: 'ch2' });
@@ -176,8 +176,13 @@ describe('mixer store: a surface of the same principal', () => {
     // The same selections again, as after this screen follows: no change.
     s.apply(patch(0, { selections: [{ session: desk('ben'), element: 'ch2' }, { session: BEN, element: 'ch2' }] }));
     expect(s.surfaceSelect).toBe(first);
+    // The surface let go of it, or left: the panel stays.
     s.apply(patch(0, { selections: [{ session: BEN, element: 'ch2' }] }));
-    expect(s.surfaceSelect).toEqual({ element: null });
+    expect(s.surfaceSelect).toBe(first);
+    // It selects again, the same element: the screen follows anew.
+    s.apply(patch(0, { selections: [{ session: desk('ben'), element: 'ch2' }] }));
+    expect(s.surfaceSelect).toEqual({ element: 'ch2' });
+    expect(s.surfaceSelect).not.toBe(first);
   });
 
   it('is the only kind followed: screens and other principals are not', () => {
