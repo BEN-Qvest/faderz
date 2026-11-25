@@ -176,6 +176,35 @@ pub fn ring(strip: u8, value: u8) -> Vec<u8> {
     vec![0xb0, 0x30 + strip, value]
 }
 
+/// The meter level lighting 0 to 7 of an X-Touch's 7 meter LEDs, which
+/// lights one LED per two of the levels 0 to 12.
+const LED_LEVELS: [u8; 8] = [0, 1, 3, 5, 7, 9, 11, 12];
+
+/// The meter level of a strip for a height of 0 to 1 on the console's
+/// meter scale, lighting as many of 7 LEDs; 14, the overload, while
+/// `over`.
+pub fn meter_level(height: f64, over: bool) -> u8 {
+    if over {
+        return 14;
+    }
+    LED_LEVELS[(height * 7.0).floor().clamp(0.0, 7.0) as usize]
+}
+
+/// Sets meter `strip` to a [`meter_level`]: channel pressure, the strip
+/// in the high nibble. An X-Touch lets the LEDs fall by themselves, so a
+/// level is sent again while the signal lasts.
+pub fn meter(strip: u8, level: u8) -> Vec<u8> {
+    vec![0xd0, strip << 4 | level]
+}
+
+/// Sets the overload LED (CLIP) of meter `strip`: level 14 on, 15 off,
+/// as the MCU reference has it. An X-Touch lights CLIP at 14 and 15
+/// alike and lets it fall by itself; it takes 15 as a level and shows the
+/// level sent right after it in its place.
+pub fn meter_clip(strip: u8, on: bool) -> Vec<u8> {
+    meter(strip, if on { 14 } else { 15 })
+}
+
 /// Moves a motor fader to a 14-bit value.
 pub fn fader(strip: u8, value: u16) -> Vec<u8> {
     let value = value.min(crate::taper::FADER_MAX);
@@ -400,6 +429,23 @@ mod tests {
         assert_eq!(ring_value(Some(-0.01)), 0x15);
         assert_eq!(ring_value(Some(0.3)), 0x18);
         assert_eq!(ring(0, 0x11), vec![0xb0, 48, 0x11]);
+        assert_eq!(ring(7, 0), vec![0xb0, 55, 0]);
+    }
+
+    #[test]
+    fn meters_light_one_x_touch_led_per_two_levels_and_14_is_the_overload() {
+        // As tried on an X-Touch: 0 to 7 LEDs at levels 0, 1, 3, 5, 7, 9,
+        // 11 and 12.
+        assert_eq!(meter_level(0.0, false), 0);
+        assert_eq!(meter_level(0.14, false), 0);
+        assert_eq!(meter_level(1.0 / 7.0, false), 1);
+        assert_eq!(meter_level(0.5, false), 5);
+        assert_eq!(meter_level(0.99, false), 11);
+        assert_eq!(meter_level(1.0, false), 12);
+        assert_eq!(meter_level(0.5, true), 14);
+        assert_eq!(meter(3, 9), vec![0xd0, 0x39]);
+        assert_eq!(meter_clip(3, true), vec![0xd0, 0x3e]);
+        assert_eq!(meter_clip(7, false), vec![0xd0, 0x7f]);
     }
 
     #[test]
@@ -418,6 +464,5 @@ mod tests {
             colours(Device::Extender, [1, 2, 3, 4, 5, 6, 7, 7]),
             vec![0xf0, 0, 0, 0x66, 0x15, 0x72, 1, 2, 3, 4, 5, 6, 7, 7, 0xf7]
         );
-        assert_eq!(ring(7, 0), vec![0xb0, 55, 0]);
     }
 }
