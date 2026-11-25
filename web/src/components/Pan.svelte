@@ -2,6 +2,7 @@
   import { getMixer } from '../lib/state/mixer.svelte';
   import { formatPan } from '../lib/audio/db';
   import { fit } from '../lib/format';
+  import { isAltZero } from '../lib/keys';
 
   interface Props {
     path: string;
@@ -77,7 +78,7 @@
     // Jumps need Alt, as on a fader: a stray key never swings a source.
     else if (e.key === 'Home' && e.altKey) v = -1;
     else if (e.key === 'End' && e.altKey) v = 1;
-    else if (e.key === '0' && e.altKey) v = 0;
+    else if (isAltZero(e)) v = 0;
     if (v === null) return;
     e.preventDefault();
     if (mixer.refuseIfHeld(path)) return;
