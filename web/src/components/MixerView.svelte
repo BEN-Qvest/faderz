@@ -108,10 +108,9 @@
   const sofAux = $derived(sof ? shape.auxes.find((a) => a.id === sof) : undefined);
 
   // FOLLOW: the strip area follows the first connected surface's bank.
-  let follow = $state(false);
   const followed = $derived(surfaces[0]?.bankOffset ?? null);
   $effect(() => {
-    if (!follow || followed === null) return;
+    if (!mixer.follow || followed === null) return;
     // During a spill: the first member at or after the surface's bank.
     const at = shown.findIndex((c) => shape.channels.indexOf(c) >= followed);
     if (at >= 0) goto(at);
@@ -162,10 +161,10 @@
       />
       <button
         class="key follow"
-        aria-pressed={follow}
+        aria-pressed={mixer.follow}
         disabled={surfaces.length === 0}
-        onclick={() => (follow = !follow)}
-        title={surfaces[0] ? `Follow the bank of ${surfaces[0].name}` : 'No control surface connected'}>FOLLOW</button
+        onclick={() => (mixer.follow = !mixer.follow)}
+        title={surfaces[0] ? `Follow the bank of ${surfaces[0].name}, and SELECT on a surface` : 'No control surface connected'}>FOLLOW</button
       >
       <button
         class="key overs"

@@ -266,7 +266,8 @@ missing, a held duck key is let go after 1.5 seconds, as a fader is. A key also 
 frame, if it is no older than 120 ms.
 
 SELECT is shared with the screens signed in as the bridge's principal.
-A SELECT press opens or switches the panel on each of them; letting go
+A SELECT press opens or switches the panel on each of them, on a screen
+of an anonymous session only while its FOLLOW is on; letting go
 of it, or the bridge leaving, closes no panel. The SELECT LEDs show
 what such a screen selected last, and all are dark while that is on no
 strip or no screen of the principal has a selection. Following a

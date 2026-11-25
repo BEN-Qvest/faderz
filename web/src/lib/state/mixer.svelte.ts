@@ -85,6 +85,12 @@ export class MixerStore {
    * selection closes nothing.
    */
   surfaceSelect = $state.raw<{ element: string } | null>(null);
+  /**
+   * FOLLOW on this screen: its strips follow the first surface's bank and,
+   * while every session is anonymous, its panel follows surfaces' SELECT.
+   * Off by default.
+   */
+  follow = $state(false);
   /** What each such surface had selected, by handle, at the last selections. */
   private surfaces = new Map<string, string>();
   /** The sessions connected to the primary's replica, this one included. */
