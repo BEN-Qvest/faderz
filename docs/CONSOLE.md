@@ -18,6 +18,10 @@ and IDENT in place of an input select. Below 1400 px of width
 the strips take the full width and the MASTERS key shows the masters
 over them.
 
+A channel's strip colour shows as the band on its scribble strip, a
+tint of the strip's dark background and a tint of its fader cap; the
+cap's edge still shows who holds the fader.
+
 ![The mixer on a tablet in the light theme](screenshots/tablet-light.png)
 
 ## Status bar and connection

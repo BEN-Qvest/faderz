@@ -113,7 +113,7 @@
   }
 </script>
 
-<section class="strip" class:sof={sendsTo !== null} class:selected class:alt={index % 2 === 1} aria-label={`Channel ${index + 1} ${channel.name}`} data-channel={channel.id}>
+<section class="strip" class:sof={sendsTo !== null} class:selected class:alt={index % 2 === 1} aria-label={`Channel ${index + 1} ${channel.name}`} data-channel={channel.id} data-color={st.color}>
   <button
     class="head"
     data-color={st.color}
@@ -256,7 +256,7 @@
   </div>
 
   <div class="fm">
-    <Fader path={levelPath} label={sendsTo ? `${channel.name} send to ${sendsTo.name}` : `${channel.name} fader`} />
+    <Fader path={levelPath} label={sendsTo ? `${channel.name} send to ${sendsTo.name}` : `${channel.name} fader`} tint={st.color === 'none' ? undefined : 'var(--strip-color)'} />
     <div class="meter">
       <Meter group="channels" id={channel.id} legs={channel.width} scale="right" label={`${channel.name} meter, ${TAP_LABEL[meterTap]}`} />
       <!-- The meter tap, in the meter's bottom padding, and over it a key
@@ -347,17 +347,19 @@
     cursor: pointer;
     padding: 2px 4px 3px;
     border-radius: 3px;
-    border-top: 3px solid transparent;
-    background: var(--well);
+    /* The strip's colour: the band, and a tint of the dark scribble strip
+       that leaves it dark in both themes. Without one, the plain well. */
+    border-top: 3px solid var(--strip-color, transparent);
+    background: color-mix(in srgb, var(--strip-color, var(--well)) 18%, var(--well));
     color: #e6edf3;
   }
-  .head[data-color='red'] { border-top-color: #ff5a5f; }
-  .head[data-color='orange'] { border-top-color: #ff9d3a; }
-  .head[data-color='yellow'] { border-top-color: #f2d53c; }
-  .head[data-color='green'] { border-top-color: #3ccf75; }
-  .head[data-color='cyan'] { border-top-color: #3fd0e0; }
-  .head[data-color='blue'] { border-top-color: #4d8dff; }
-  .head[data-color='purple'] { border-top-color: #b07cff; }
+  .strip[data-color='red'] { --strip-color: #ff5a5f; }
+  .strip[data-color='orange'] { --strip-color: #ff9d3a; }
+  .strip[data-color='yellow'] { --strip-color: #f2d53c; }
+  .strip[data-color='green'] { --strip-color: #3ccf75; }
+  .strip[data-color='cyan'] { --strip-color: #3fd0e0; }
+  .strip[data-color='blue'] { --strip-color: #4d8dff; }
+  .strip[data-color='purple'] { --strip-color: #b07cff; }
   .head:focus-visible {
     outline: 2px solid var(--focus);
   }

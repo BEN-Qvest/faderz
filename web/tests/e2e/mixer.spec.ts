@@ -1471,6 +1471,54 @@ test('shows the source under the channel name and colours the scribble strip fro
   await expect.poll(async () => (await serverState(request)).state.channels['ch3']!.color).toBe('none');
 });
 
+test('tints the scribble strip and fader cap of a coloured channel, and the cap still shows who holds it', { tag: '@mock' }, async ({ page, baseURL }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await live(page);
+  // ch1 is blue in the mock, ch4 has no colour.
+  const blue = page.locator('[data-channel="ch1"]');
+  const plain = page.locator('[data-channel="ch4"]');
+  const style = (l: ReturnType<Page['locator']>, prop: 'backgroundColor' | 'backgroundImage' | 'borderTopColor' | 'boxShadow') =>
+    l.evaluate((e, p) => getComputedStyle(e)[p], prop);
+  /** A theme token as the page computes it. */
+  const token = (name: string) =>
+    page.evaluate((n) => {
+      const probe = document.createElement('i');
+      probe.style.color = `var(${n})`;
+      document.body.append(probe);
+      const c = getComputedStyle(probe).color;
+      probe.remove();
+      return c;
+    }, name);
+  expect(await style(blue.locator('.head'), 'backgroundColor')).not.toBe(await style(plain.locator('.head'), 'backgroundColor'));
+  expect(await style(blue.locator('.cap'), 'backgroundImage')).not.toBe(await style(plain.locator('.cap'), 'backgroundImage'));
+  const cap = blue.locator('.cap');
+  const other = await RawClient.open(baseURL!);
+  try {
+    // Held by another session: the --owned edge, as on a plain cap.
+    expect((await other.command({ type: 'touch', path: '/channels/ch1/fader' })).type).toBe('delta');
+    await expect(cap).toHaveClass(/foreign/);
+    const owned = await token('--owned');
+    await expect.poll(() => style(cap, 'borderTopColor')).toBe(owned);
+    // A refused gesture flashes the --err ring over the tint.
+    await dragFader(page, '/channels/ch1/fader', -40);
+    await expect.poll(() => style(cap, 'boxShadow')).toContain(await token('--err'));
+    expect((await other.command({ type: 'release', path: '/channels/ch1/fader' })).type).toBe('delta');
+  } finally {
+    other.close();
+  }
+  // Held here: the --on edge.
+  const at = await faderCenter(page, '/channels/ch1/fader');
+  await page.mouse.move(at.x, at.y);
+  await page.mouse.down();
+  try {
+    await expect(cap).toHaveClass(/mine/);
+    const on = await token('--on');
+    await expect.poll(() => style(cap, 'borderTopColor')).toBe(on);
+  } finally {
+    await page.mouse.up();
+  }
+});
+
 test('opens the engine counters above the lamp, inside the viewport, at desktop and phone widths', async ({ page }) => {
   await live(page);
   const lamp = page.getByTestId('engine');

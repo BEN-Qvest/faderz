@@ -92,3 +92,41 @@ describe.each([
 it('separates alternate strips in the light theme', () => {
   expect(contrast(light['strip']!, light['strip-alt']!)).toBeGreaterThanOrEqual(1.1);
 });
+
+/** color-mix(in srgb, a p%, b) as browsers compute it: per channel, gamma encoded. */
+function mix(a: string, p: number, b: string): string {
+  const ch = (hex: string, i: number) => parseInt(hex.slice(i, i + 2), 16);
+  return `#${[1, 3, 5].map((i) => Math.round(ch(a, i) * (p / 100) + ch(b, i) * (1 - p / 100)).toString(16).padStart(2, '0')).join('')}`;
+}
+
+describe('channel colours', () => {
+  const strip = readFileSync(new URL('../../src/components/ChannelStrip.svelte', import.meta.url), 'utf8');
+  const fader = readFileSync(new URL('../../src/components/Fader.svelte', import.meta.url), 'utf8');
+  const colours = [...strip.matchAll(/\.strip\[data-color='([a-z]+)'\] \{ --strip-color: (#[0-9a-f]{6}); \}/g)].map((m) => [m[1]!, m[2]!] as const);
+  const headInk = /\n  \.head \{[^}]*\n    color: (#[0-9a-f]{6});/.exec(strip)![1]!;
+  const headMix = Number(/var\(--strip-color, var\(--well\)\) (\d+)%, var\(--well\)/.exec(strip)![1]);
+  const capMix = Number(/color-mix\(in srgb, var\(--cap\) (\d+)%, \$\{tint\}\)/.exec(fader)![1]);
+  const capLine = /\n  \.cap span \{[^}]*background: (#[0-9a-f]{6});/.exec(fader)![1]!;
+
+  it('has the seven colours of the strip colour picker', () => {
+    expect(colours.map(([name]) => name)).toEqual(['red', 'orange', 'yellow', 'green', 'cyan', 'blue', 'purple']);
+  });
+
+  describe.each([
+    ['dark', dark],
+    ['light', light],
+  ])('%s theme', (_, t) => {
+    it.each(colours)('a %s scribble strip stays dark: its text reads, selected or not', (_name, colour) => {
+      const head = mix(colour, headMix, t['well']!);
+      expect(contrast(headInk, head)).toBeGreaterThanOrEqual(4.5);
+      // Selected, the --on ring around it shows against the selected strip
+      // outside it or against the head inside it: in the light theme the
+      // strip, as for a plain head.
+      expect(Math.max(contrast(t['on']!, head), contrast(t['on']!, t['strip-sel']!))).toBeGreaterThanOrEqual(3);
+    });
+    it.each(colours)('a %s fader cap keeps its centre line as clear as a plain one', (_name, colour) => {
+      const face = mix(t['cap']!, capMix, colour);
+      expect(contrast(capLine, face)).toBeGreaterThanOrEqual(Math.min(3, contrast(capLine, t['cap']!)));
+    });
+  });
+});
