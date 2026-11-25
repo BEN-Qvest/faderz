@@ -197,11 +197,11 @@ fn a_new_session_lets_go_of_held_faders_and_gets_everything_again() {
     let mut e = live(1);
     let mut s = Surface::new(units(2), None);
     let first = s.render(&e, 0);
-    // Faders, LEDs, rings and both lines of every strip per unit, and the
-    // X-Touch's function key LEDs.
+    // Faders, LEDs, rings, meters with their overload and both lines of
+    // every strip per unit, and the X-Touch's function key LEDs.
     let on = |out: &[(usize, Vec<u8>)], unit| out.iter().filter(|(u, _)| *u == unit).count();
-    assert_eq!(on(&first, 0), 9 + 8 * 5 + 16 + 8);
-    assert_eq!(on(&first, 1), 8 + 8 * 5 + 16);
+    assert_eq!(on(&first, 0), 9 + 8 * 7 + 16 + 8);
+    assert_eq!(on(&first, 1), 8 + 8 * 7 + 16);
     assert!(s.render(&e, 100).is_empty(), "only what changed");
 
     s.resend(1);
@@ -266,7 +266,7 @@ fn after_missed_messages_a_touch_that_does_not_move_is_let_go() {
     s.link_changed(0, lost(2), resend, &mut e, 8000);
     s.tick(&mut e, 20_000);
     assert_eq!(s.touching(), held());
-    assert_eq!(s.render(&e, 20_000).len(), 9 + 8 * 5 + 16 + 8 - 1);
+    assert_eq!(s.render(&e, 20_000).len(), 9 + 8 * 7 + 16 + 8 - 1);
     // The session ending lets go of everything.
     let down = Link {
         connected: false,
@@ -1071,4 +1071,70 @@ fn alt_is_let_go_with_its_session() {
     e.take_actions();
     key(&mut s, &mut e, 32, true, 200);
     assert!(values(&e.take_actions()).is_empty());
+}
+
+/// A meter frame in which channel ch1 peaks at `dbfs`.
+fn peak(e: &mut Engine, dbfs: f64, now: u64) {
+    let layout = Layout::of(&e.mirror().shape).expect("a layout");
+    let frame = layout.frame_with(&[(dbfs * 100.0) as i16], &[]);
+    e.binary(1, &frame, now);
+}
+
+/// The meter messages of strip `strip` in `out`, in order.
+fn meter_of(out: &[(usize, Vec<u8>)], strip: u8) -> Vec<u8> {
+    (out.iter())
+        .filter(|(_, m)| m[0] == 0xd0 && m[1] >> 4 == strip)
+        .map(|(_, m)| m[1] & 0x0f)
+        .collect()
+}
+
+#[test]
+fn a_strip_meter_shows_the_peak_on_7_leds_again_on_every_frame() {
+    let mut e = ducking();
+    let mut s = Surface::new(units(1), None);
+    // -20 dBFS is 0.48 of the console's scale: 3 of 7 LEDs, level 5.
+    peak(&mut e, -20.0, 0);
+    let out = s.render(&e, 0);
+    assert_eq!(
+        meter_of(&out, 0),
+        vec![15, 5],
+        "the overload off, then the level"
+    );
+    // Strips past the last channel: off once.
+    assert_eq!(meter_of(&out, 1), vec![15, 0]);
+    assert!(meter_of(&s.render(&e, 10), 0).is_empty(), "no new frame");
+    peak(&mut e, -20.0, 40);
+    assert_eq!(
+        meter_of(&s.render(&e, 40), 0),
+        vec![5],
+        "the X-Touch lets it fall"
+    );
+    assert!(
+        meter_of(&s.render(&e, 40), 1).is_empty(),
+        "silence goes out once"
+    );
+    // A frame older than 3 meter periods: silence, once.
+    assert_eq!(meter_of(&s.render(&e, 160), 0), vec![0]);
+    assert!(meter_of(&s.render(&e, 200), 0).is_empty());
+}
+
+#[test]
+fn the_overload_lights_in_the_top_db_only_and_goes_before_the_level() {
+    let mut e = ducking();
+    let mut s = Surface::new(units(1), None);
+    peak(&mut e, -20.0, 0);
+    s.render(&e, 0);
+    // Loud, as high as the console's red zone, and not clipping: no CLIP.
+    peak(&mut e, -1.0, 40);
+    assert_eq!(meter_of(&s.render(&e, 40), 0), vec![11]);
+    peak(&mut e, -0.5, 80);
+    assert_eq!(meter_of(&s.render(&e, 80), 0), vec![14, 14]);
+    peak(&mut e, -0.5, 120);
+    assert_eq!(
+        meter_of(&s.render(&e, 120), 0),
+        vec![14],
+        "the overload goes out once"
+    );
+    peak(&mut e, -20.0, 160);
+    assert_eq!(meter_of(&s.render(&e, 160), 0), vec![15, 5]);
 }

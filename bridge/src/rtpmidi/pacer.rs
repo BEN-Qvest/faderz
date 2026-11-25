@@ -20,8 +20,9 @@ enum Key {
     /// A V-Pot ring: control change 48 to 55 per channel.
     Ring(u8, u8),
     /// A meter level: channel pressure carries the strip in its high
-    /// nibble.
-    Meter(u8, u8),
+    /// nibble. The overload (14 and 15 in the low nibble) is a key of its
+    /// own, so a level sent after it never takes its place.
+    Meter(u8, u8, bool),
     /// A scribble strip write: device, first and last position.
     Lcd(u8, usize, usize),
 }
@@ -31,7 +32,7 @@ fn key(m: &[u8]) -> Option<Key> {
         [s, _, _] if s & 0xf0 == 0xe0 => Some(Key::Fader(*s)),
         [s, note, _] if s & 0xf0 == 0x90 => Some(Key::Led(*s, *note)),
         [s, cc @ 48..=55, _] if s & 0xf0 == 0xb0 => Some(Key::Ring(*s, *cc)),
-        [s, level] if s & 0xf0 == 0xd0 => Some(Key::Meter(*s, level >> 4)),
+        [s, level] if s & 0xf0 == 0xd0 => Some(Key::Meter(*s, level >> 4, level & 0x0f >= 14)),
         [0xf0, 0, 0, 0x66, device, 0x12, offset, text @ .., 0xf7] if !text.is_empty() => {
             let first = usize::from(*offset);
             Some(Key::Lcd(*device, first, first + text.len() - 1))
@@ -175,6 +176,19 @@ mod tests {
             ]
         );
         assert_eq!(p.take(0), None);
+    }
+
+    #[test]
+    fn a_meter_level_never_takes_the_place_of_the_overload_before_it() {
+        let mut p = Pacer::new(1_000_000);
+        p.push(mcu::meter_clip(2, true));
+        p.push(mcu::meter(2, 14));
+        p.push(mcu::meter_clip(2, false));
+        p.push(mcu::meter(2, 5));
+        assert_eq!(
+            p.take(0).unwrap(),
+            vec![mcu::meter_clip(2, false), mcu::meter(2, 5)]
+        );
     }
 
     #[test]

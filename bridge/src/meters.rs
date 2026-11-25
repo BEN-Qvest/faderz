@@ -1,5 +1,5 @@
 //! Meter frames (server-message.schema.json `MeterFrame`), of which the
-//! bridge reads the duck section only.
+//! bridge reads the channels' peaks and the duck section.
 
 use serde_json::Value;
 
@@ -14,6 +14,8 @@ pub struct Layout {
     pub fingerprint: u32,
     /// Values in a frame.
     values: usize,
+    /// Each channel's first value and width, in shape order.
+    channels: Vec<(usize, usize)>,
     /// Index of the first duck group's first value.
     ducks_at: usize,
     /// The duck group ids, in shape order.
@@ -45,6 +47,7 @@ impl Layout {
     pub fn of(shape: &Value) -> Option<Layout> {
         let mut text = String::new();
         let mut values = 0;
+        let mut channels = Vec::new();
         // Section, field, values per leg and values per element.
         for (section, field, per_leg, per_element) in [
             ("c", "channels", 2, 1),
@@ -57,6 +60,9 @@ impl Layout {
                 let id = e["id"].as_str()?;
                 let width = usize::try_from(e["width"].as_u64()?).ok()?;
                 text.push_str(&format!("{section}/{id}/{width};"));
+                if section == "c" {
+                    channels.push((values, width));
+                }
                 values += per_leg * width + per_element;
             }
         }
@@ -71,13 +77,47 @@ impl Layout {
         Some(Layout {
             fingerprint: fnv1a(&text),
             values,
+            channels,
             ducks_at,
             ducks,
         })
     }
 
+    /// Each channel's highest peak leg in `frame`, dBFS from -120, in
+    /// shape order.
+    pub fn channel_peaks(&self, frame: &[u8]) -> Result<Vec<f64>, Mismatch> {
+        let value = self.values(frame)?;
+        Ok((self.channels.iter())
+            .map(|&(at, width)| {
+                let peak = (0..width).map(|leg| value(at + leg)).max().unwrap_or(NULL);
+                if peak == NULL {
+                    -120.0
+                } else {
+                    (f64::from(peak) / 100.0).clamp(-120.0, 30.0)
+                }
+            })
+            .collect())
+    }
+
     /// The duck section of `frame`, one reading per group in shape order.
     pub fn ducks(&self, frame: &[u8]) -> Result<Vec<DuckMeter>, Mismatch> {
+        let value = self.values(frame)?;
+        Ok((0..self.ducks.len())
+            .map(|g| {
+                let key = value(self.ducks_at + 3 * g);
+                DuckMeter {
+                    key: (key != NULL).then(|| (f64::from(key) / 100.0).clamp(-120.0, 30.0)),
+                    envelope: (f64::from(value(self.ducks_at + 3 * g + 1)) / 10_000.0)
+                        .clamp(0.0, 1.0),
+                    engaged: value(self.ducks_at + 3 * g + 2) & 1 == 1,
+                }
+            })
+            .collect())
+    }
+
+    /// The value at an index of `frame`, once its header, layout and
+    /// length match.
+    fn values<'a>(&self, frame: &'a [u8]) -> Result<impl Fn(usize) -> i16 + 'a, Mismatch> {
         if frame.len() < 12 || frame[0] != MAGIC || frame[1] != VERSION {
             return Err(Mismatch::Header);
         }
@@ -92,20 +132,10 @@ impl Layout {
         if frame.len() != start + 2 * self.values {
             return Err(Mismatch::Length);
         }
-        let value = |i: usize| {
-            let at = start + 2 * (self.ducks_at + i);
+        Ok(move |i: usize| {
+            let at = start + 2 * i;
             i16::from_le_bytes([frame[at], frame[at + 1]])
-        };
-        Ok((0..self.ducks.len())
-            .map(|g| {
-                let key = value(3 * g);
-                DuckMeter {
-                    key: (key != NULL).then(|| (f64::from(key) / 100.0).clamp(-120.0, 30.0)),
-                    envelope: (f64::from(value(3 * g + 1)) / 10_000.0).clamp(0.0, 1.0),
-                    engaged: value(3 * g + 2) & 1 == 1,
-                }
-            })
-            .collect())
+        })
     }
 }
 
@@ -120,11 +150,20 @@ impl Layout {
     /// A frame of this layout from replica `r1` whose duck groups read
     /// `ducks` (key, envelope and flags as sent), every other value 0.
     pub(crate) fn frame(&self, ducks: &[[i16; 3]]) -> Vec<u8> {
+        self.frame_with(&[], ducks)
+    }
+
+    /// A frame whose channels' peak legs read `peaks` in centi-dBFS, the
+    /// first channels first, and whose duck groups read `ducks`.
+    pub(crate) fn frame_with(&self, peaks: &[i16], ducks: &[[i16; 3]]) -> Vec<u8> {
         let mut b = vec![MAGIC, VERSION, 2, 0];
         b.extend_from_slice(&1u32.to_le_bytes());
         b.extend_from_slice(&self.fingerprint.to_le_bytes());
         b.extend_from_slice(b"r1");
         let mut values = vec![0i16; self.values];
+        for (&(at, width), &p) in self.channels.iter().zip(peaks) {
+            values[at..at + width].fill(p);
+        }
         for (g, d) in ducks.iter().enumerate() {
             values[self.ducks_at + 3 * g..][..3].copy_from_slice(d);
         }
@@ -173,6 +212,21 @@ pub(crate) mod tests {
                 engaged: true
             }])
         );
+    }
+
+    #[test]
+    fn the_contracts_example_frame_reads_its_channels_peak() {
+        let layout = Layout::of(&shape()).expect("a layout");
+        assert_eq!(layout.channel_peaks(&example()), Ok(vec![-6.5]));
+        // The highest leg of a wider channel, and silence at the floor.
+        let mut shape = shape();
+        shape["channels"] = json!([{ "id": "st", "width": 2 }, { "id": "m", "width": 1 }]);
+        let two = Layout::of(&shape).expect("a layout");
+        let mut frame = two.frame_with(&[-1200, NULL], &[[0, 0, 0]]);
+        // The header, the replica id, then leg 1 of the first channel.
+        let first = 12 + 2 + 2;
+        frame[first..first + 2].copy_from_slice(&(-300i16).to_le_bytes());
+        assert_eq!(two.channel_peaks(&frame), Ok(vec![-3.0, -120.0]));
     }
 
     #[test]
