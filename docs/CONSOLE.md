@@ -18,6 +18,12 @@ and IDENT in place of an input select. Below 1400 px of width
 the strips take the full width and the MASTERS key shows the masters
 over them.
 
+SELECT on a control surface signed in as the same user opens that
+strip's panel too ([SURFACES.md](SURFACES.md#mapping)). While every
+session is anonymous, with auth mode none or token, it does so only on
+a screen with FOLLOW on: FOLLOW then covers both the surface's bank and
+its SELECT.
+
 ![The mixer on a tablet in the light theme](screenshots/tablet-light.png)
 
 ## Status bar and connection
@@ -175,7 +181,8 @@ nothing commits, TALK starts no talk.
 - Escape closes the channel processing panel.
 - In the mixer, `[` and `]` step to the previous and next bank, the Jump
   field takes a strip number or the start of a channel name, FOLLOW
-  keeps the strips on the first connected surface's bank, and a press
+  keeps the strips on the first connected surface's bank (and, while
+  every session is anonymous, the panel on its SELECT), and a press
   on a VCA master's name shows only its members until EXIT. "Sends on
   faders" puts one aux's send levels on the channel faders until EXIT.
 - A strip has five tab stops: its head (select), PFL, AFL, MUTE and the

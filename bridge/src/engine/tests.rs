@@ -347,7 +347,7 @@ fn a_handover_moves_the_session_to_a_new_connection_on_the_same_replica() {
 }
 
 #[test]
-fn consoles_and_the_selection_go_out_after_every_sync_and_on_change() {
+fn consoles_go_out_after_every_sync_and_a_selection_lapses_with_its_connection() {
     let mut e = live(1);
     let console = |bank: u64| {
         json!({ "type": "console", "id": "xt", "name": "X-Touch",
@@ -366,7 +366,7 @@ fn consoles_and_the_selection_go_out_after_every_sync_and_on_change() {
         .filter(|m| m["type"] == "console")
         .collect();
     assert_eq!(out, vec![console(16)]);
-    // A new connection gets both again.
+    // A new connection gets the consoles again, never the selection.
     e.closed(1, 200);
     e.tick(1000);
     let link = e.primary().unwrap().id;
@@ -376,10 +376,8 @@ fn consoles_and_the_selection_go_out_after_every_sync_and_on_change() {
         .into_iter()
         .map(|m| m["type"].clone())
         .collect();
-    assert_eq!(
-        types,
-        vec![json!("hello"), json!("select"), json!("console")]
-    );
+    assert_eq!(types, vec![json!("hello"), json!("console")]);
+    assert_eq!(e.selection(), None);
 }
 
 #[test]
