@@ -462,6 +462,25 @@ test('operates a pan from the keyboard, with no jump from a lone key or a double
   await expect(pan).toHaveAttribute('aria-valuenow', '0');
 });
 
+test('centres a pan on a double-click on its cap, and on no other double-click', { tag: '@mock' }, async ({ page, request }) => {
+  await live(page);
+  const path = '/channels/ch21/pan/lr';
+  await patch(request, path, 0.5);
+  const pan = page.locator(`[role="slider"][data-path="${path}"]`);
+  await expect(pan).toHaveAttribute('aria-valuenow', '0.5');
+  const bar = (await pan.locator('.bar').boundingBox())!;
+  const y = bar.y + bar.height / 2;
+  // At 0.5 the cap sits three quarters along the bar; its other end is no cap.
+  await page.mouse.dblclick(bar.x + bar.width * 0.1, y);
+  await page.waitForTimeout(300);
+  await settled(page);
+  expect((await serverState(request)).state.channels['ch21']!.pan.lr).toBe(0.5);
+  await page.mouse.dblclick(bar.x + bar.width * 0.75, y);
+  await settled(page);
+  await expect(pan).toHaveAttribute('aria-valuenow', '0');
+  expect((await serverState(request)).state.channels['ch21']!.pan.lr).toBe(0);
+});
+
 test('sets the loudness target from the setup view and judges integrated loudness against it', async ({ page, request }) => {
   await live(page);
   await page.getByRole('button', { name: 'Setup' }).click();

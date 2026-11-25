@@ -97,6 +97,21 @@
       mixer.release(path);
     }
   }
+  /** How far from the cap's centre a double-click still takes it, in px. */
+  const CAP_HIT_PX = 6;
+  /**
+   * A double-click on the cap centres the pan. Anywhere else on the bar it
+   * does nothing: a double-click aimed past the pan never swings a source.
+   */
+  function dblclick(e: MouseEvent): void {
+    const bar = (e.currentTarget as HTMLElement).querySelector('.bar')!.getBoundingClientRect();
+    const cap = bar.left + (value / 2 + 0.5) * bar.width;
+    if (Math.abs(e.clientX - cap) > CAP_HIT_PX || value === 0) return;
+    if (mixer.refuseIfHeld(path)) return;
+    mixer.touch(path);
+    mixer.set(path, 0);
+    mixer.release(path);
+  }
 </script>
 
 <div
@@ -110,8 +125,9 @@
   aria-valuenow={value}
   aria-valuetext={formatPan(value, left, right)}
   class:arming
-  title="Drag; on touch, rest the finger a moment first; Shift for fine; arrows step, Alt+0 centres, Alt+Home/End for full left/right"
+  title="Drag; on touch, rest the finger a moment first; Shift for fine; arrows step, Alt+0 or a double-click on the cap centres, Alt+Home/End for full left/right"
   onpointerdown={down}
+  ondblclick={dblclick}
   onpointermove={move}
   onpointerup={up}
   onpointercancel={up}

@@ -165,7 +165,8 @@ nothing commits, TALK starts no talk.
   0 dB and Alt+End closes the fader. No single key jumps a fader, and a
   double-click does nothing to it.
 - Pans step with the arrows (Shift for fine); Alt+Home and Alt+End go
-  to the ends and Alt+0 centres.
+  to the ends and Alt+0 centres. A double-click on a pan's cap centres
+  it; anywhere else on the pan a double-click does nothing.
 - Dragging a fader with Shift or Ctrl held is fine travel; the FINE key
   in the bank bar latches fine travel for faders and pans on touch
   screens.
