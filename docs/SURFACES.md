@@ -237,6 +237,9 @@ console shows the bridge's controls as `<console> (<user>)`.
 | MUTE | Toggles `/channels/<id>/mute`; the LED shows the state |
 | SOLO | Toggles `/channels/<id>/solo` between `off` and `pfl`; the LED is on while it is not `off` |
 | SELECT | Selects the strip's channel; the LED shows the selection, and blinks while another session holds the strip's fader |
+| V-Pot turn | Sets `/channels/<id>/pan/lr` by 0.02 per detent, clockwise to the right, within -1 to 1 and at most 50 per second; nothing while another session holds it |
+| V-Pot push | Pushed twice within 400 ms, centres `/channels/<id>/pan/lr`; a single push does nothing |
+| V-Pot ring | The pan from the centre out, 11 LEDs; dark past the last channel |
 | REC | No action, unless `keys` binds it to a duck group |
 | F1 to F8 (X-Touch) | The shape's duck groups in order, or what `keys` binds (below) |
 | F1 to F8 LEDs | On while the group is held or its mode is `on`, blinking while it is bypassed and not held, on while it ducks its targets, else off |
@@ -287,6 +290,9 @@ an X-Touch or X-Touch Extender:
 - motor behaviour: that a motor moved every 20 ms at most neither hunts
   nor fights a hand;
 - the LED states, the blink value 1 included;
+- the V-Pot messages: relative turns on CC 16-23 (bit 6 anticlockwise),
+  the push on notes 32-39, the ring on CC 48-55 in mode 1 (from the
+  centre) with LEDs 1 to 11;
 - port names as ALSA reports them, which `midiIn` and `midiOut` match;
 - RTP-MIDI with a surface's own network port, in role MASTER and SLAVE,
   across a router and a NAT, and the rate a surface takes;

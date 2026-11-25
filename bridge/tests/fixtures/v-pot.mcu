@@ -1,0 +1,33 @@
+# The V-Pot of strip 1 of an X-Touch in MC mode on the channel's pan, as
+# the MCU reference describes the messages: CC 16 a relative turn, note
+# 32 the push, CC 48 the ring, 0x10 its mode from the centre out plus
+# LED 1 to 11, 6 the centre.
+
+# Five detents clockwise; the ring follows at once, and the first frame
+# shows the others centred.
+> b0 10 05
+! set /channels/ch1/pan/lr 0.1
+< b0 30 17, b0 37 16
++ 25
+# Two anticlockwise, bit 6 set.
+> b0 10 42
+! set /channels/ch1/pan/lr 0.06
+# One push does nothing; a second within 400 ms centres the pan.
++ 25
+> 90 20 7f
+> 90 20 00
+! none
++ 200
+> 90 20 7f
+! set /channels/ch1/pan/lr 0
+< b0 30 16
+> 90 20 00
+! none
+# The ring follows the pan another session writes.
+@ {"changes": [{"path": "/channels/ch2/pan/lr", "value": -1}]}
+< b0 31 11
+# Banked by a channel, ring 1 shows channel 2.
+> 90 31 7f
++ 100
+! console xt 1
+< b0 30 11
