@@ -104,4 +104,10 @@
   input:disabled {
     cursor: default;
   }
+  /* A finger's target on touch screens (WCAG 2.5.8), as the pan's. */
+  @media (pointer: coarse) {
+    input {
+      height: 24px;
+    }
+  }
 </style>
