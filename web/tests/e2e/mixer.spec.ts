@@ -15,6 +15,7 @@ import {
   formatDb,
   live,
   patch,
+  patchAll,
   resetMock,
   serverState,
   settled,
@@ -140,41 +141,48 @@ test("applies another client's change as a delta", async ({ page, request }) => 
 
 test('sets a fader from a value typed under it, and never clamps one outside its range', async ({ page, request }) => {
   await live(page);
-  await patch(request, '/channels/ch3/fader', -20);
-  const field = page.getByTestId('fader-value-ch3');
-  await expect(field).toHaveValue(formatDb(-20));
+  const before = await fader(request, 'ch3');
+  try {
+    await patch(request, '/channels/ch3/fader', -20);
+    const field = page.getByTestId('fader-value-ch3');
+    await expect(field).toHaveValue(formatDb(-20));
 
-  await field.click();
-  await field.fill('-6.54');
-  await field.press('Enter');
-  await expect.poll(() => fader(request, 'ch3')).toBe(-6.5);
-  await expect(field).toHaveValue(formatDb(-6.5));
+    await field.click();
+    await field.fill('-6.54');
+    await field.press('Enter');
+    await expect.poll(() => fader(request, 'ch3')).toBe(-6.5);
+    await expect(field).toHaveValue(formatDb(-6.5));
 
-  // Out of range: refused, not clamped to +10.
-  await field.fill('12');
-  await field.press('Enter');
-  await expect(page.getByTestId('notice')).toContainText('Guest 1 fader takes -90 to +10 dB');
-  await expect(field).toHaveValue(formatDb(-6.5));
-  expect(await fader(request, 'ch3')).toBe(-6.5);
+    // Out of range: refused, not clamped to +10.
+    await field.fill('12');
+    await field.press('Enter');
+    await expect(page.getByTestId('notice')).toContainText('Guest 1 fader takes -90 to +10 dB');
+    await expect(field).toHaveValue(formatDb(-6.5));
+    expect(await fader(request, 'ch3')).toBe(-6.5);
 
-  await field.fill('-inf');
-  await field.press('Enter');
-  await expect.poll(() => fader(request, 'ch3')).toBe(-90);
+    await field.fill('-inf');
+    await field.press('Enter');
+    await expect.poll(() => fader(request, 'ch3')).toBe(-90);
 
-  // A move from elsewhere does not overwrite what is being typed; Escape
-  // then shows the fader as it is.
-  await field.fill('-1');
-  await patch(request, '/channels/ch3/fader', -30);
-  await expect(page.getByRole('slider', { name: 'Guest 1 fader' })).toHaveAttribute('aria-valuenow', '-30');
-  await expect(field).toHaveValue('-1');
-  await field.press('Escape');
-  await expect(field).toHaveValue(formatDb(-30));
-  expect(await fader(request, 'ch3')).toBe(-30);
+    // A move from elsewhere does not overwrite what is being typed; Escape
+    // then shows the fader as it is.
+    await field.fill('-1');
+    await patch(request, '/channels/ch3/fader', -30);
+    await expect(page.getByRole('slider', { name: 'Guest 1 fader' })).toHaveAttribute('aria-valuenow', '-30');
+    await expect(field).toHaveValue('-1');
+    await field.press('Escape');
+    await expect(field).toHaveValue(formatDb(-30));
+    expect(await fader(request, 'ch3')).toBe(-30);
+  } finally {
+    // Later tests read this channel's level.
+    await patchAll(request, [{ path: '/channels/ch3/fader', value: before }]);
+  }
 });
 
 test('refuses a typed value for a fader another client holds', async ({ page, request, baseURL }) => {
   await live(page);
   const path = '/channels/ch4/fader';
+  const before = await fader(request, 'ch4');
   await patch(request, path, -20);
   const other = await RawClient.open(baseURL!);
   try {
@@ -188,6 +196,7 @@ test('refuses a typed value for a fader another client holds', async ({ page, re
     expect(await fader(request, 'ch4')).toBe(-20);
   } finally {
     other.close();
+    await patchAll(request, [{ path, value: before }]);
   }
 });
 
