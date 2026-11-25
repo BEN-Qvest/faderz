@@ -20,7 +20,7 @@ function field(path = FADER) {
   s.apply({ type: 'patch', input: 0, snapshot: { shape, state: initialState(shape), owners: {} }, changes: [[FADER, -10], [SEND, -20]], owners: [], status: LIVE });
   const target = document.createElement('div');
   document.body.append(target);
-  const c = mount(FaderValue, { target, props: { path, label: 'Pres 1 fader' }, context: mixerContext(s) });
+  const c = mount(FaderValue, { target, props: { path, label: 'Pres 1 fader', testid: 'fv' }, context: mixerContext(s) });
   flushSync();
   const input = target.querySelector('input')!;
   const type = (text: string) => {
@@ -34,7 +34,8 @@ function field(path = FADER) {
     flushSync();
   };
   const sets = () => posted.filter((m) => m.type === 'set');
-  return { s, c, input, type, enter, sets };
+  const sign = () => target.querySelector('[data-testid="fv-inf"]');
+  return { s, c, input, type, enter, sets, sign };
 }
 
 describe('fader value field', () => {
@@ -125,6 +126,19 @@ describe('fader value field', () => {
     input.focus();
     enter();
     expect(sets()).toEqual([]);
+    unmount(c);
+  });
+
+  it('draws the floor as a sign over its text, which stays -inf and shows while the field has focus', () => {
+    const { s, c, input, sign } = field();
+    expect(sign()).toBeNull();
+    s.apply({ type: 'patch', input: 0, changes: [[FADER, -90]], owners: [] });
+    flushSync();
+    expect(sign()).not.toBeNull();
+    expect(input.value).toBe('-inf');
+    input.focus();
+    flushSync();
+    expect(sign()).toBeNull();
     unmount(c);
   });
 });

@@ -67,3 +67,19 @@ describe('channel strip meter tap key', () => {
     unmount(c);
   });
 });
+
+describe('channel strip effective gain', () => {
+  it('draws the floor of a VCA-lowered gain as the minus-infinity sign, and other levels as text', () => {
+    const { s, c, target } = strip();
+    const eff = () => target.querySelector('.vca .eff')!;
+    s.apply({ type: 'patch', input: 0, changes: [['/channels/ch1/fader', -10], ['/vcas/vca1/offset', -3]], owners: [] });
+    flushSync();
+    expect(eff().querySelector('svg')).toBeNull();
+    expect(eff().textContent!.trim()).toBe('-13.0');
+    s.apply({ type: 'patch', input: 0, changes: [['/vcas/vca1/offset', -90]], owners: [] });
+    flushSync();
+    expect(eff().querySelector('svg')).not.toBeNull();
+    expect(eff().textContent!.trim()).toBe('');
+    unmount(c);
+  });
+});

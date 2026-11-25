@@ -164,6 +164,15 @@ test('sets a fader from a value typed under it, and never clamps one outside its
     await field.press('Enter');
     await expect.poll(() => fader(request, 'ch3')).toBe(-90);
 
+    // At the floor a drawn sign stands in for the text, except while the field is edited.
+    const sign = page.getByTestId('fader-value-ch3-inf');
+    await expect(sign).toHaveCount(0);
+    await field.blur();
+    await expect(sign).toBeVisible();
+    await expect(field).toHaveValue('-inf');
+    await field.click();
+    await expect(sign).toHaveCount(0);
+
     // A move from elsewhere does not overwrite what is being typed; Escape
     // then shows the fader as it is.
     await field.fill('-1');

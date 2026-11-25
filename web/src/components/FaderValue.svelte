@@ -3,6 +3,7 @@
   import { getMixer } from '../lib/state/mixer.svelte';
   import { FADER_MAX_DB, FADER_OFF_DB, formatDb, roundDb } from '../lib/audio/db';
   import { parseEntry } from '../lib/audio/entry';
+  import MinusInfinity from './MinusInfinity.svelte';
 
   interface Props {
     path: string;
@@ -19,6 +20,9 @@
   let input: HTMLInputElement | undefined = $state();
   // Set by typing: until then the field follows the fader, focused or not.
   let dirty = $state(false);
+  let focused = $state(false);
+  // At the floor a drawn sign stands in for the text, which stays "-inf" for assistive technology and editing.
+  const infinity = $derived(value <= FADER_OFF_DB && !focused);
 
   $effect(() => {
     if (input && !dirty) input.value = shown;
@@ -58,12 +62,17 @@
 <div class="num value">
   <input
     bind:this={input}
+    class:infinity
     type="text"
     tabindex="-1"
     disabled={mixer.locked}
     oninput={() => (dirty = true)}
-    onfocus={() => input?.select()}
+    onfocus={() => {
+      focused = true;
+      input?.select();
+    }}
     onblur={() => {
+      focused = false;
       // change fires first when the text changed; a dirty field left unchanged follows the fader again.
       if (dirty) restore();
     }}
@@ -74,10 +83,14 @@
     data-path={path}
     data-testid={testid}
   />
+  {#if infinity}
+    <span class="sign"><MinusInfinity testid={testid ? `${testid}-inf` : undefined} /></span>
+  {/if}
 </div>
 
 <style>
   .value {
+    position: relative;
     font-size: 11.5px;
     background: var(--well);
     border-radius: 2px;
@@ -107,6 +120,27 @@
   }
   input:disabled {
     cursor: default;
+  }
+  input.infinity {
+    color: transparent;
+  }
+  /* Centred over the field; clicks go through to it. */
+  .sign {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+  }
+  /* Forced colours repaint the hidden text: show it and leave the sign out. */
+  @media (forced-colors: active) {
+    input.infinity {
+      color: inherit;
+    }
+    .sign {
+      display: none;
+    }
   }
   /* A finger's target on touch screens (WCAG 2.5.8), as the pan's. */
   @media (pointer: coarse) {
