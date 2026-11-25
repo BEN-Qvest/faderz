@@ -1,17 +1,15 @@
 <script lang="ts">
   import { pendingWrite } from '../lib/pending';
-  import { fit } from '../lib/format';
   import type { Solo, VcaShape } from '../lib/contract/types';
   import { getMixer } from '../lib/state/mixer.svelte';
   import { vcaPath } from '../lib/state/paths';
-  import { formatDb } from '../lib/audio/db';
   import Fader from './Fader.svelte';
+  import FaderValue from './FaderValue.svelte';
   import { tip } from '../lib/tip';
 
   let { vca }: { vca: VcaShape } = $props();
   const mixer = getMixer();
   const mute = $derived(mixer.value<boolean>(vcaPath(vca.id, 'mute')));
-  const offset = $derived(mixer.value<number>(vcaPath(vca.id, 'offset')));
   const members = $derived(mixer.state!.vcas[vca.id]!.members);
   const memberNames = $derived(members.map((m) => mixer.shape?.channels.find((c) => c.id === m)?.name ?? m).join(', '));
   const solo = $derived(mixer.value<Solo>(vcaPath(vca.id, 'solo')));
@@ -42,7 +40,7 @@
     <button {@attach pendingWrite(mixer, vcaPath(vca.id, 'mute'))} class="key mute" aria-disabled={mixer.locked} aria-pressed={mute} onclick={() => mixer.set(vcaPath(vca.id, 'mute'), !mute)} aria-label={`VCA ${vca.name} mute`}>MUTE</button>
   </div>
   <div class="f"><Fader path={vcaPath(vca.id, 'offset')} label={`VCA ${vca.name} offset`} /></div>
-  <output class="num value"><span class="fixed">{fit(formatDb(offset), 5)}</span></output>
+  <div class="num value"><FaderValue path={vcaPath(vca.id, 'offset')} label={`VCA ${vca.name} offset`} /></div>
 </section>
 
 <style>
@@ -111,13 +109,5 @@
     border-radius: 2px;
     color: #e6edf3;
     line-height: 18px;
-  }
-  /* The text changes with every update. A flex item is never a relayout
-     boundary, so the text sits in a block child of fixed size with strict
-     containment, which lays out nothing outside it. */
-  .value span {
-    display: block;
-    height: 18px;
-    contain: strict;
   }
 </style>

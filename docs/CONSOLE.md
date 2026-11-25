@@ -188,6 +188,11 @@ nothing commits, TALK starts no talk.
   selected unit (ms, frames at the shape's frame rate, or samples) or
   with a suffix, `40ms`, `2f`, `1.5s`, `1920smp`. A value outside the
   range is never clamped: the field is restored and the range shown.
+- The value under a channel, master or VCA fader is such a field: a
+  click takes a level in dB, rounded to 0.1, with `-inf` or `off` for
+  the floor. It is no tab stop. A fader another session holds refuses
+  it as it refuses a drag, and while the field has focus the fader's
+  moves do not overwrite what is being typed.
 - A parameter or send slider moves by the distance dragged and never
   jumps to the touch point; its arrows step a hundredth of its travel,
   Page Up and Page Down a tenth.

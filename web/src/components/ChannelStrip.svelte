@@ -7,6 +7,7 @@
   import { effectiveGainDb, formatDb, formatFreq } from '../lib/audio/db';
   import LayoutBadge from './LayoutBadge.svelte';
   import Fader from './Fader.svelte';
+  import FaderValue from './FaderValue.svelte';
   import Meter from './Meter.svelte';
   import Pan from './Pan.svelte';
   import EqCurve from './EqCurve.svelte';
@@ -45,7 +46,6 @@
   const tapPath = $derived(channelPath(channel.id, 'meterTap'));
   const meterTap = $derived(mixer.value<Tap>(tapPath));
   const nextTap = $derived<Tap>(meterTap === 'postFader' ? 'preFader' : 'postFader');
-  const level = $derived(mixer.value<number>(levelPath));
   const holder = $derived(mixer.ownerOf(levelPath));
   const holderMine = $derived(mixer.isMine(holder));
   /**
@@ -277,7 +277,9 @@
   </div>
 
   <div class="foot">
-    <output class="num value" data-testid={`fader-value-${channel.id}`}><span class="fixed">{fit(formatDb(level), 5)}</span></output>
+    <div class="num value">
+      <FaderValue path={levelPath} label={sendsTo ? `${channel.name} send to ${sendsTo.name}` : `${channel.name} fader`} testid={`fader-value-${channel.id}`} />
+    </div>
     <!-- Who holds the fader, in words; the slot is there whether held or
          not. It is no tab stop: the held fader's tooltip and value text
          give the keyboard the full label. -->
@@ -667,14 +669,6 @@
     border-radius: 2px;
     color: #e6edf3;
     line-height: 18px;
-  }
-  /* The text changes with every update. A flex item is never a relayout
-     boundary, so the text sits in a block child of fixed size with strict
-     containment, which lays out nothing outside it. */
-  .value span {
-    display: block;
-    height: 18px;
-    contain: strict;
   }
   .holder {
     height: 14px;
