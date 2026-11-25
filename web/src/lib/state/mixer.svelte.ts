@@ -78,6 +78,14 @@ export class MixerStore {
   notices = $state<Notice[]>([]);
   /** What every session has selected, this one included. */
   selections = $state.raw<Selection[]>([]);
+  /**
+   * The latest change of what a control surface signed in as this
+   * screen's principal has selected, a selection it dropped included
+   * (element null): the screen follows it. A new object per change.
+   */
+  surfaceSelect = $state.raw<{ element: string | null } | null>(null);
+  /** What each such surface had selected, by handle, at the last selections. */
+  private surfaces = new Map<string, string>();
   /** The sessions connected to the primary's replica, this one included. */
   presence = $state.raw<PresentSession[]>([]);
   /** Page time (Date.now()) when the worker last reported a failover. */
@@ -225,6 +233,16 @@ export class MixerStore {
     return true;
   }
 
+  /** Notes the change of a surface's selection that `surfaceSelect` carries. */
+  private followSurfaces(list: Selection[]): void {
+    const you = this.status.you;
+    if (!you) return;
+    const now = new Map(list.filter((s) => s.session.kind === 'console' && s.session.principal === you.principal).map((s) => [s.session.handle, s.element]));
+    const changed = [...now.keys(), ...this.surfaces.keys()].find((h) => now.get(h) !== this.surfaces.get(h));
+    this.surfaces = now;
+    if (changed !== undefined) this.surfaceSelect = { element: now.get(changed) ?? null };
+  }
+
   /** Tells other screens what this one has selected; not a write, so sent while locked too. */
   select(element: string | null): void {
     this.post({ type: 'select', element });
@@ -335,7 +353,10 @@ export class MixerStore {
       this.loudnessHealth = Object.fromEntries((p.counters.loudness ?? []).map((l) => [l.id, l]));
       this.countersReplica = p.counters.replica;
     }
-    if (p.selections) this.selections = p.selections;
+    if (p.selections) {
+      this.selections = p.selections;
+      this.followSurfaces(p.selections);
+    }
     if (p.presence) this.presence = p.presence;
     for (const n of p.notices ?? []) {
       if (n.kind === 'request') {

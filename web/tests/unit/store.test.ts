@@ -158,3 +158,31 @@ describe('notices', () => {
     expect(s.notices[0]).toMatchObject({ kind: 'info', text: 'Not confirmed in time, not sent again: Pres 1 fader, Pres 1 mute' });
   });
 });
+
+describe('mixer store: a surface of the same principal', () => {
+  const BEN: Owner = { ...ME, principal: 'ben' };
+  const desk = (principal: string, handle = 'x-touch-handle-000000'): Owner => ({ principal, handle, kind: 'console', connection: 'c7' });
+  const signedIn = () => {
+    const { s } = store();
+    s.apply(patch(0, { status: { ...LIVE, session: SESSION, handle: BEN.handle, you: BEN } }));
+    return s;
+  };
+
+  it('is followed when its selection changes, a dropped one closing', () => {
+    const s = signedIn();
+    s.apply(patch(0, { selections: [{ session: desk('ben'), element: 'ch2' }] }));
+    expect(s.surfaceSelect).toEqual({ element: 'ch2' });
+    const first = s.surfaceSelect;
+    // The same selections again, as after this screen follows: no change.
+    s.apply(patch(0, { selections: [{ session: desk('ben'), element: 'ch2' }, { session: BEN, element: 'ch2' }] }));
+    expect(s.surfaceSelect).toBe(first);
+    s.apply(patch(0, { selections: [{ session: BEN, element: 'ch2' }] }));
+    expect(s.surfaceSelect).toEqual({ element: null });
+  });
+
+  it('is the only kind followed: screens and other principals are not', () => {
+    const s = signedIn();
+    s.apply(patch(0, { selections: [{ session: desk('ana'), element: 'ch2' }, { session: { ...BEN, handle: 'other-screen-handle-00', kind: 'ui' }, element: 'ch3' }] }));
+    expect(s.surfaceSelect).toBeNull();
+  });
+});

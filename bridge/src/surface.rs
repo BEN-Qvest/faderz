@@ -155,6 +155,9 @@ pub struct Surface {
     /// The master fader's control; else the program bus's fader.
     master: Option<String>,
     selected: Option<String>,
+    /// What each screen of this bridge's principal has selected, by
+    /// handle, as the last `selections` said.
+    screens: BTreeMap<String, String>,
     /// Duck keys of their own; else F1 to F8.
     keys: Option<DuckKeys>,
 }
@@ -191,6 +194,7 @@ impl Surface {
             bank: 0,
             master,
             selected: None,
+            screens: BTreeMap::new(),
             keys: None,
         }
     }
@@ -646,7 +650,42 @@ impl Surface {
             Event::Requested { path, from } => {
                 tracing::info!(path, from = %short_name(from), "asked to give up a control");
             }
+            Event::Selections(list) => self.follow(list, engine),
             Event::Error(e) => tracing::warn!("{e}"),
+        }
+    }
+
+    /// Takes the selection of a screen signed in as this bridge's
+    /// principal whenever one changes, a screen closing its panel
+    /// included: the SELECT LEDs show what that screen shows, and the
+    /// screen follows a SELECT key in turn.
+    fn follow(&mut self, list: &Value, engine: &mut Engine) {
+        let Some(me) = engine.principal() else { return };
+        let screens: BTreeMap<String, String> = (list.as_array().into_iter().flatten())
+            .filter(|s| {
+                s["session"]["kind"] == "ui"
+                    && s["session"]["principal"] == me
+                    && s["session"]["handle"] != engine.handle()
+            })
+            .filter_map(|s| {
+                Some((
+                    s["session"]["handle"].as_str()?.to_owned(),
+                    s["element"].as_str()?.to_owned(),
+                ))
+            })
+            .collect();
+        // A screen that changed to what this surface shows only followed
+        // it. Taking such a change, a screen that has not followed yet
+        // (selections come at most every 100 ms) would pull the surface
+        // back, and the screens and the surface would chase each other.
+        let changed = (screens.keys().chain(self.screens.keys())).find_map(|h| {
+            let now = screens.get(h).cloned();
+            (now != self.screens.get(h).cloned() && now != self.selected).then_some(now)
+        });
+        self.screens = screens;
+        if let Some(element) = changed {
+            self.selected = element;
+            engine.select(self.selected.as_deref());
         }
     }
 

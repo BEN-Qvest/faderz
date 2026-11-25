@@ -8,15 +8,17 @@ in [USAGE.md](USAGE.md).
 
 ![The mixer view: channel strips with tally, processing chips, faders and meters, VCA masters, programme, M&E and clean-feed masters with loudness readouts, and the monitor section](screenshots/console.png)
 
-Selecting a strip opens its processing panel: input colour, trim,
-polarity, high-pass, delay, meter and direct-out taps, pan, the EQ with
-its curve, gate and compressor, and the sends. A channel without a delay
-line shows its delay greyed out, marked "No delay line". A tone
-channel's head shows TONE and its frequency, with ID while its ident is
-on, in place of a source, and its panel sets the frequency, the level
-and IDENT in place of an input select. Below 1400 px of width
-the strips take the full width and the MASTERS key shows the masters
-over them.
+Selecting a strip opens its processing panel, and so does SELECT on a
+control surface signed in as the same user (SURFACES.md); the surface's
+SELECT LEDs follow the strip selected here. The panel shows input
+colour, trim, polarity, high-pass, delay, meter and direct-out taps,
+pan, the EQ with its curve, gate and compressor, and the sends. A
+channel without a delay line shows its delay greyed out, marked "No
+delay line". A tone channel's head shows TONE and its frequency, with ID
+while its ident is on, in place of a source, and its panel sets the
+frequency, the level and IDENT in place of an input select. Below 1400
+px of width the strips take the full width and the MASTERS key shows the
+masters over them.
 
 ![The mixer on a tablet in the light theme](screenshots/tablet-light.png)
 

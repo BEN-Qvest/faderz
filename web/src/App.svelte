@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import { MediaQuery } from 'svelte/reactivity';
   import { getMixer } from './lib/state/mixer.svelte';
   import MixerView from './components/MixerView.svelte';
@@ -57,6 +58,11 @@
   let section = $state<string | null>(null);
   // Other screens mark what this one has selected.
   $effect(() => mixer.select(selected));
+  // A surface signed in as the same user selects for this screen too: its SELECT key opens the panel, and dropping its selection closes it.
+  $effect(() => {
+    const s = mixer.surfaceSelect;
+    if (s) untrack(() => (s.element === null ? (selected = null) : select(s.element)));
+  });
 
   /** Moves focus to a region; on a narrow screen the masters open first. */
   function skip(e: MouseEvent, id: string): void {
