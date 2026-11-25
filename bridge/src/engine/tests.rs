@@ -531,14 +531,14 @@ fn meter_credits_go_to_the_primary_topped_up_once_half_are_used() {
         credits(&e.take_actions(), sb),
         vec![json!(METER_CREDIT_CAP)]
     );
-    // A shape without duck groups: the bridge reads no meter frames.
+    // A shape without duck groups: the strips' meters read every frame.
     let mut shape = crate::meters::tests::shape();
     shape["ducks"] = json!([]);
     let mut e = engine(1);
     e.start(0);
     e.opened(1, 0);
     e.received(1, &meter_snapshot("r1", 5, shape), 0);
-    assert!(credits(&e.take_actions(), 1).is_empty());
+    assert_eq!(credits(&e.take_actions(), 1), vec![json!(METER_CREDIT_CAP)]);
 }
 
 #[test]
@@ -557,6 +557,8 @@ fn a_meter_frame_keeps_the_duck_readings_and_another_layout_asks_once() {
         at: 40,
     };
     assert_eq!(e.duck("comm"), Some(&read));
+    assert_eq!(e.peaks().dbfs, vec![-6.5]);
+    assert_eq!((e.peaks().at, e.peaks().frames), (40, 1));
     // Of another length: dropped.
     e.binary(1, &frame[..frame.len() - 2], 80);
     assert_eq!(e.duck("comm"), Some(&read));

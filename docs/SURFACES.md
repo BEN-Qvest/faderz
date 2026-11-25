@@ -4,9 +4,10 @@
 X-Touch Extenders, over USB-MIDI or over the network by RTP-MIDI, and
 connects to faderz as a WebSocket client of kind `console`: fader touch
 and moves, motors, mute, solo, select, bank, the V-Pots and their rings,
-duck keys and the scribble strips. Every unit is a console of its own in `/consoles`, all of them
-over one session. Its source is in `bridge/`, a crate of its own,
-released with its own version.
+the strip meters, duck keys and the scribble strips. Every unit is a
+console of its own in `/consoles`, all of them over one session. Its
+source is in `bridge/`, a crate of its own, released with its own
+version.
 
 ## Running
 
@@ -240,6 +241,8 @@ console shows the bridge's controls as `<console> (<user>)`.
 | V-Pot turn | Sets `/channels/<id>/pan/lr` by 0.02 per detent, clockwise to the right, within -1 to 1 and at most 50 per second; nothing while another session holds it |
 | V-Pot push | With ALT held, centres `/channels/<id>/pan/lr`, as Alt+0 on a screen; alone it does nothing |
 | V-Pot ring | The pan from the centre out, 11 LEDs; the centre LED alone only at the exact centre |
+| Strip meter | The channel's highest peak leg as the console's meter draws it: its height on the console's scale on 7 LEDs, sent again with every meter frame as the surface lets it fall, dark once the last frame is 120 ms old or past the last channel |
+| CLIP | On while that peak is above -1 dBFS, close to clipping; sent on crossing that either way, before the level. While it is on, the level sent is 14, the overload, in place of a bar |
 | REC | No action, unless `keys` binds it to a duck group |
 | F1 to F8 (X-Touch) | The shape's duck groups in order, or what `keys` binds (below) |
 | F1 to F8 LEDs | On while the group is held or its mode is `on`, blinking while it is bypassed and not held, on while it ducks its targets, else off |
@@ -283,9 +286,8 @@ The bridge speaks the protocol in
 [USAGE.md](USAGE.md#websocket) with kind `console`. After every
 snapshot or resume on a new primary connection it releases every
 control its session owns that no fader holds, touches again what a held
-fader lost, and registers its consoles again. On a shape with duck
-groups the primary connection takes meter frames for the duck keys'
-LEDs.
+fader lost, and registers its consoles again. The primary connection
+takes meter frames for the strip meters and the duck keys' LEDs.
 
 ## Not verified on hardware
 
@@ -312,3 +314,10 @@ an X-Touch or X-Touch Extender:
 The V-Pots were tried on an X-Touch in MC mode over RTP-MIDI: turns on
 CC 16-23 with bit 6 anticlockwise, the push on notes 32-39, and the
 ring on CC 48-55 in mode 1 with LEDs 1 to 11.
+
+The strip meters and CLIP were tried on an X-Touch in MC mode over
+RTP-MIDI, with steady tones from -45 to -0.5 dBFS on eight channels:
+the levels 0 to 12 lit as many LEDs as the console's meters, and CLIP
+lit above -1 dBFS. What the 7 LEDs show while 14 is sent was not
+checked. The meters of an X-Touch Extender and of other MCU surfaces
+are unverified.

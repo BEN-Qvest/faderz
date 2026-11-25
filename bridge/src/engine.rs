@@ -4,7 +4,7 @@
 //! reconnecting; commands with ids and seqs, sent again after a 503 or a
 //! failover and dropped 3 s after they were issued; continuous writes
 //! coalesced to 50 per second; meter credits on the primary, whose
-//! frames' duck section is kept. Deadlines follow the measured round trip
+//! frames' channel peaks and duck section are kept. Deadlines follow the measured round trip
 //! as the web client's sync engine sizes them
 //! (web/src/lib/sync/engine.ts).
 //!
@@ -234,6 +234,17 @@ struct Entry {
     sent_in: u64,
 }
 
+/// The channels' peaks of a meter frame.
+#[derive(Debug, Default, Clone)]
+pub struct Peaks {
+    /// dBFS per channel, in shape order.
+    pub dbfs: Vec<f64>,
+    /// When the frame arrived.
+    pub at: u64,
+    /// Frames read so far: a new one is a new reading.
+    pub frames: u64,
+}
+
 /// A duck group's latest reading from a meter frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Duck {
@@ -299,6 +310,8 @@ pub struct Engine {
     /// Meter frames the primary may still send.
     credits: u32,
     ducks: BTreeMap<String, Duck>,
+    /// The channels' peaks of the last meter frame, in shape order.
+    peaks: Peaks,
     actions: Vec<Action>,
     events: Vec<Event>,
     ids: Box<dyn FnMut() -> String + Send>,
@@ -354,6 +367,7 @@ impl Engine {
             layout_resync_sent: false,
             credits: 0,
             ducks: BTreeMap::new(),
+            peaks: Peaks::default(),
             actions: Vec::new(),
             events: Vec::new(),
             ids,
@@ -420,6 +434,11 @@ impl Engine {
     /// Duck group `id`'s latest reading, when a meter frame carried one.
     pub fn duck(&self, id: &str) -> Option<&Duck> {
         self.ducks.get(id)
+    }
+
+    /// The channels' peaks of the last meter frame.
+    pub fn peaks(&self) -> &Peaks {
+        &self.peaks
     }
 
     /// Whether a touch of `path` is waiting for its answer.
@@ -792,9 +811,9 @@ impl Engine {
         }
         self.credits = self.credits.saturating_sub(1);
         if let Some(layout) = &self.layout {
-            match layout.ducks(frame) {
-                Ok(readings) => {
-                    for (id, m) in layout.ducks.iter().zip(readings) {
+            match layout.read(frame) {
+                Ok(reading) => {
+                    for (id, m) in layout.ducks.iter().zip(reading.ducks) {
                         let duck = Duck {
                             envelope: m.envelope,
                             engaged: m.engaged,
@@ -802,6 +821,11 @@ impl Engine {
                         };
                         self.ducks.insert(id.clone(), duck);
                     }
+                    self.peaks = Peaks {
+                        dbfs: reading.peaks,
+                        at: now,
+                        frames: self.peaks.frames.wrapping_add(1),
+                    };
                 }
                 Err(Mismatch::Fingerprint)
                     if self.sync == Sync::Live && !self.layout_resync_sent =>
@@ -816,11 +840,10 @@ impl Engine {
     }
 
     /// Tops the primary's meter credits up to the cap once half are used,
-    /// while it is live on a shape with duck groups: the bridge reads
-    /// meter frames for their duck section only.
+    /// while it is live: the bridge reads meter frames for the strips'
+    /// meters and the duck keys.
     fn grant_credits(&mut self) {
-        let ducks = self.layout.as_ref().is_some_and(|l| !l.ducks.is_empty());
-        if self.sync != Sync::Live || !ducks || self.credits > CREDIT_REFILL_AT {
+        if self.sync != Sync::Live || self.layout.is_none() || self.credits > CREDIT_REFILL_AT {
             return;
         }
         let Some(p) = self.primary().filter(|p| p.opened).map(|p| p.id) else {
