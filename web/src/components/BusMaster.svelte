@@ -1,13 +1,12 @@
 <script lang="ts">
-  import { fit } from '../lib/format';
   import type { ElementShape } from '../lib/contract/types';
   import { LAYOUT_LABELS } from '../lib/contract/types';
   import { getMixer } from '../lib/state/mixer.svelte';
   import type { MeterGroup } from '../lib/meters/store';
   import { pointer } from '../lib/state/pointer';
-  import { formatDb } from '../lib/audio/db';
   import { resetLoudness } from '../lib/state/actions';
   import Fader from './Fader.svelte';
+  import FaderValue from './FaderValue.svelte';
   import Meter from './Meter.svelte';
   import Loudness from './Loudness.svelte';
   import TalkKey from './TalkKey.svelte';
@@ -28,7 +27,6 @@
   const mixer = getMixer();
   const path = (key: string) => pointer(group, element.id, key);
   const mute = $derived(mixer.value<boolean>(path('mute')));
-  const fader = $derived(mixer.value<number>(path('fader')));
   const labels = $derived(LAYOUT_LABELS[element.layout]);
   const tone = $derived(mixer.state!.tone);
   /** Line-up tone replaces this output's programme. */
@@ -74,7 +72,7 @@
     <div class="legs" aria-hidden="true" style:grid-template-columns={`repeat(${labels.length}, minmax(0, 1fr))`}>
       {#each labels as l (l)}<span>{l}</span>{/each}
     </div>
-    <output class="num value"><span class="fixed">{fit(formatDb(fader), 5)}</span></output>
+    <FaderValue path={path('fader')} label={`${element.name} fader`} />
   </div>
 </section>
 
@@ -209,21 +207,7 @@
     overflow: visible;
     white-space: nowrap;
   }
-  .value {
+  .foot > :global(.value) {
     grid-column: 1 / -1;
-    font-size: 11.5px;
-    text-align: center;
-    background: var(--well);
-    border-radius: 2px;
-    color: #e6edf3;
-    line-height: 18px;
-  }
-  /* The text changes with every update. A flex item is never a relayout
-     boundary, so the text sits in a block child of fixed size with strict
-     containment, which lays out nothing outside it. */
-  .value span {
-    display: block;
-    height: 18px;
-    contain: strict;
   }
 </style>

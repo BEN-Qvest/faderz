@@ -15,6 +15,7 @@ import {
   formatDb,
   live,
   patch,
+  patchAll,
   resetMock,
   serverState,
   settled,
@@ -56,7 +57,7 @@ test('moves a fader and shows the value the server echoed', async ({ page, reque
   await settled(page);
   const after = await fader(request, 'ch3');
   expect(after).toBeGreaterThan(before);
-  await expect(page.getByTestId('fader-value-ch3')).toHaveText(formatDb(after));
+  await expect(page.getByTestId('fader-value-ch3')).toHaveValue(formatDb(after));
   await expect.poll(async () => (await serverState(request)).owners['/channels/ch3/fader']).toBeUndefined();
 });
 
@@ -125,7 +126,7 @@ test('keeps the fader cap under the pointer while dragging', async ({ page, requ
   await live(page);
   await patch(request, '/channels/ch3/fader', -20);
   const cap = page.locator('[data-path="/channels/ch3/fader"] .cap');
-  await expect(page.getByTestId('fader-value-ch3')).toHaveText(formatDb(-20));
+  await expect(page.getByTestId('fader-value-ch3')).toHaveValue(formatDb(-20));
   const before = (await cap.boundingBox())!.y;
   await dragFader(page, '/channels/ch3/fader', -60);
   await settled(page);
@@ -135,7 +136,68 @@ test('keeps the fader cap under the pointer while dragging', async ({ page, requ
 test("applies another client's change as a delta", async ({ page, request }) => {
   await live(page);
   await patch(request, '/channels/ch17/fader', -12.5);
-  await expect(page.getByTestId('fader-value-ch17')).toHaveText('-12.5');
+  await expect(page.getByTestId('fader-value-ch17')).toHaveValue('-12.5');
+});
+
+test('sets a fader from a value typed under it, and never clamps one outside its range', async ({ page, request }) => {
+  await live(page);
+  const before = await fader(request, 'ch3');
+  try {
+    await patch(request, '/channels/ch3/fader', -20);
+    const field = page.getByTestId('fader-value-ch3');
+    await expect(field).toHaveValue(formatDb(-20));
+
+    await field.click();
+    await field.fill('-6.54');
+    await field.press('Enter');
+    await expect.poll(() => fader(request, 'ch3')).toBe(-6.5);
+    await expect(field).toHaveValue(formatDb(-6.5));
+
+    // Out of range: refused, not clamped to +10.
+    await field.fill('12');
+    await field.press('Enter');
+    await expect(page.getByTestId('notice')).toContainText('Guest 1 fader takes -90 to +10 dB');
+    await expect(field).toHaveValue(formatDb(-6.5));
+    expect(await fader(request, 'ch3')).toBe(-6.5);
+
+    await field.fill('-inf');
+    await field.press('Enter');
+    await expect.poll(() => fader(request, 'ch3')).toBe(-90);
+
+    // A move from elsewhere does not overwrite what is being typed; Escape
+    // then shows the fader as it is.
+    await field.fill('-1');
+    await patch(request, '/channels/ch3/fader', -30);
+    await expect(page.getByRole('slider', { name: 'Guest 1 fader' })).toHaveAttribute('aria-valuenow', '-30');
+    await expect(field).toHaveValue('-1');
+    await field.press('Escape');
+    await expect(field).toHaveValue(formatDb(-30));
+    expect(await fader(request, 'ch3')).toBe(-30);
+  } finally {
+    // Later tests read this channel's level.
+    await patchAll(request, [{ path: '/channels/ch3/fader', value: before }]);
+  }
+});
+
+test('refuses a typed value for a fader another client holds', async ({ page, request, baseURL }) => {
+  await live(page);
+  const path = '/channels/ch4/fader';
+  const before = await fader(request, 'ch4');
+  await patch(request, path, -20);
+  const other = await RawClient.open(baseURL!);
+  try {
+    expect((await other.command({ type: 'touch', path })).type).toBe('delta');
+    const field = page.getByTestId('fader-value-ch4');
+    await field.click();
+    await field.fill('-3');
+    await field.press('Enter');
+    await expect(page.getByTestId('notice')).toContainText('Guest 2 fader is held by');
+    await expect(field).toHaveValue(formatDb(-20));
+    expect(await fader(request, 'ch4')).toBe(-20);
+  } finally {
+    other.close();
+    await patchAll(request, [{ path, value: before }]);
+  }
 });
 
 test('mutes a channel', async ({ page, request }) => {
@@ -183,7 +245,7 @@ test('stores and recalls a scene', async ({ page, request }) => {
   await expect(confirmStore).toBeVisible();
   await expect(confirmStore).toBeHidden({ timeout: 6000 });
   await page.getByRole('button', { name: 'Mixer' }).click();
-  await expect(page.getByTestId('fader-value-ch18')).toHaveText(formatDb(stored));
+  await expect(page.getByTestId('fader-value-ch18')).toHaveValue(formatDb(stored));
 });
 
 test('arms and confirms a scene store and delete from the keyboard alone, within the arm time', async ({ page }) => {
@@ -339,7 +401,7 @@ test('refuses a fader held by another session at the gesture and shows its value
     const monitor = (await page.getByRole('region', { name: 'Monitor' }).boundingBox())!;
     expect(box.y).toBeGreaterThanOrEqual(monitor.y + monitor.height);
     await settled(page);
-    await expect(page.getByTestId('fader-value-ch4')).toHaveText(formatDb(held));
+    await expect(page.getByTestId('fader-value-ch4')).toHaveValue(formatDb(held));
     expect(await fader(request, 'ch4')).toBe(held);
     expect((await other.command({ type: 'release', path })).type).toBe('delta');
     // The page names the holder by its handle and never sees its session id.
@@ -359,7 +421,7 @@ test('reconnects and resyncs after a dropped link and after a revision gap', asy
   await request.post('/__mock/skip-revision');
   const value = (await fader(request, 'ch19')) === -7 ? -8 : -7;
   await patch(request, '/channels/ch19/fader', value);
-  await expect(page.getByTestId('fader-value-ch19')).toHaveText(formatDb(value));
+  await expect(page.getByTestId('fader-value-ch19')).toHaveValue(formatDb(value));
   const server = await serverState(request);
   await expect(page.getByTestId('revision')).toHaveText(`rev ${server.revision}`);
 });
@@ -1349,7 +1411,7 @@ test('labels the channel meter in dBFS on its outer side, apart from the fader s
 test('moves faders at a tenth of their travel while FINE is lit, without a modifier key', async ({ page, request }) => {
   await live(page);
   await patch(request, '/channels/ch2/fader', 0);
-  await expect(page.getByTestId('fader-value-ch2')).toHaveText(formatDb(0));
+  await expect(page.getByTestId('fader-value-ch2')).toHaveValue(formatDb(0));
   await page.getByRole('button', { name: 'FINE' }).click();
   await dragFader(page, '/channels/ch2/fader', 100);
   await settled(page);
@@ -1904,16 +1966,23 @@ test('puts an aux on the channel faders and gives the faders back on EXIT', asyn
   const strip = (await page.locator('[data-channel="ch2"]').boundingBox())!;
   await page.getByRole('combobox', { name: 'Sends on faders' }).selectOption({ label: 'IFB 1' });
   await expect(page.getByTestId('sends-on-faders')).toBeVisible();
-  await expect(page.getByTestId('fader-value-ch2')).toHaveText(formatDb(-20));
+  await expect(page.getByTestId('fader-value-ch2')).toHaveValue(formatDb(-20));
   await dragFader(page, '/channels/ch2/sends/aux1/level', -60);
   await settled(page);
   const send = (await serverState(request)).state.channels['ch2']!.sends['aux1']!.level;
   expect(send).toBeGreaterThan(-20);
   expect(await fader(request, 'ch2')).toBe(faderBefore);
   expect(await page.locator('[data-channel="ch2"]').boundingBox()).toEqual(strip);
+  // A level typed under the fader goes to the send too.
+  const field = page.getByTestId('fader-value-ch2');
+  await field.click();
+  await field.fill('-12');
+  await field.press('Enter');
+  await expect.poll(async () => (await serverState(request)).state.channels['ch2']!.sends['aux1']!.level).toBe(-12);
+  expect(await fader(request, 'ch2')).toBe(faderBefore);
   await page.getByTestId('sends-on-faders').click();
   await expect(page.getByRole('slider', { name: 'Pres 2 fader' })).toBeVisible();
-  await expect(page.getByTestId('fader-value-ch2')).toHaveText(formatDb(faderBefore));
+  await expect(page.getByTestId('fader-value-ch2')).toHaveValue(formatDb(faderBefore));
 });
 
 const DUCK_HOLD = '/ducks/comm/hold';

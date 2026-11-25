@@ -96,7 +96,7 @@ async function writeAcross(
   for (let i = 1; i < values.length; i++) expect(values[i]!).toBeLessThan(values[i - 1]!);
   expect(values.at(-1)).toBe(-3);
   expect(await fader(request, channel)).toBe(-3);
-  await expect(page.getByTestId(`fader-value-${channel}`)).toHaveText('-3.0');
+  await expect(page.getByTestId(`fader-value-${channel}`)).toHaveValue('-3.0');
 }
 
 // The mock answers REST without keep-alive: a test that reused a pooled
@@ -123,8 +123,8 @@ test('two clients move different faders at the same time and see each other', { 
     expect(ch5).toBeGreaterThan(-20);
     expect(ch6).toBeGreaterThan(ch5);
     for (const p of [a!, b!]) {
-      await expect(p.getByTestId('fader-value-ch5')).toHaveText(formatDb(ch5));
-      await expect(p.getByTestId('fader-value-ch6')).toHaveText(formatDb(ch6));
+      await expect(p.getByTestId('fader-value-ch5')).toHaveValue(formatDb(ch5));
+      await expect(p.getByTestId('fader-value-ch6')).toHaveValue(formatDb(ch6));
     }
     const entries = (await audit(request)).entries.filter((e) => e.type === 'set');
     expect(new Set(entries.filter((e) => e.path === '/channels/ch5/fader').map((e) => e.owner.handle))).toEqual(new Set([ownerHandle(sessions[0])]));
@@ -145,7 +145,7 @@ test('a fader held across a reload stays owned by the session and is released af
   await expect.poll(async () => (await serverState(request)).owners[path]?.handle).toBe(ownerHandle(session));
   await page.waitForFunction(() => window.__faderz?.outbox === 0);
   const value = await fader(request, 'ch9');
-  await expect(page.getByTestId('fader-value-ch9')).toHaveText(formatDb(value));
+  await expect(page.getByTestId('fader-value-ch9')).toHaveValue(formatDb(value));
   const other = await RawClient.open(baseURL!);
   try {
     // The reloaded document waits for its entry module until the other
@@ -174,7 +174,7 @@ test('a fader held across a reload stays owned by the session and is released af
     const releases = (await audit(request)).entries.filter((e) => e.type === 'release' && e.path === path);
     expect(releases.map((e) => e.owner.handle)).toEqual([ownerHandle(session)]);
     expect(await fader(request, 'ch9')).toBe(value);
-    await expect(page.getByTestId('fader-value-ch9')).toHaveText(formatDb(value));
+    await expect(page.getByTestId('fader-value-ch9')).toHaveValue(formatDb(value));
     expect(await debug(page, 'touching')).toEqual([]);
   } finally {
     await page.mouse.up();
@@ -255,7 +255,7 @@ test('keeps a held fader owned across a replica kill', { tag: '@mock' }, async (
   await page.mouse.up();
   await settled(page);
   await expect.poll(async () => (await serverState(request)).owners[path]).toBeUndefined();
-  await expect(page.getByTestId('fader-value-ch20')).toHaveText(formatDb(await fader(request, 'ch20')));
+  await expect(page.getByTestId('fader-value-ch20')).toHaveValue(formatDb(await fader(request, 'ch20')));
 });
 
 test('a hidden tab stops meter traffic after at most the credit cap and resumes when visible', { tag: '@meters' }, async ({ page, request }) => {
@@ -324,18 +324,29 @@ test('a promote onto a lagging replica never shows an older value', { tag: '@moc
   const before = await fader(request, 'ch1');
   const target = before === -7 ? -8 : -7;
   const readout = page.getByTestId('fader-value-ch1');
+  // The readout is a field: its value changes without a DOM mutation, so
+  // every value it shows is sampled once per frame.
   await page.evaluate(() => {
-    const w = window as unknown as { __seen: string[] };
+    const w = window as unknown as { __seen: string[]; __sampling: boolean };
     w.__seen = [];
-    const el = document.querySelector('[data-testid="fader-value-ch1"]')!;
-    new MutationObserver(() => w.__seen.push(el.textContent ?? '')).observe(el, { subtree: true, characterData: true, childList: true });
+    w.__sampling = true;
+    const el = document.querySelector<HTMLInputElement>('[data-testid="fader-value-ch1"]')!;
+    const sample = () => {
+      if (el.value !== w.__seen.at(-1)) w.__seen.push(el.value);
+      if (w.__sampling) requestAnimationFrame(sample);
+    };
+    sample();
   });
   await patch(request, '/channels/ch1/fader', target);
-  await expect(readout).toHaveText(formatDb(target));
+  await expect(readout).toHaveValue(formatDb(target));
   expect((await request.post('/__mock/replicas/r1/kill')).ok()).toBe(true);
   await page.waitForFunction(() => window.__faderz?.primaryReplica === 'r2' && window.__faderz.connection === 'Live', null, { timeout: 10_000 });
-  await expect(readout).toHaveText(formatDb(target));
-  const seen = await page.evaluate(() => (window as unknown as { __seen: string[] }).__seen);
+  await expect(readout).toHaveValue(formatDb(target));
+  const seen = await page.evaluate(() => {
+    const w = window as unknown as { __seen: string[]; __sampling: boolean };
+    w.__sampling = false;
+    return w.__seen;
+  });
   expect(seen.slice(seen.indexOf(formatDb(target)))).not.toContain(formatDb(before));
 });
 
@@ -480,7 +491,7 @@ test('a client never resumes onto a restored cluster that has committed past its
   await patch(request, '/channels/ch19/fader', -11);
   const written = (await serverState(request)).revision;
   await expect.poll(() => debug(page, 'revision')).toBeGreaterThanOrEqual(written);
-  await expect(page.getByTestId('fader-value-ch19')).toHaveText(formatDb(-11));
+  await expect(page.getByTestId('fader-value-ch19')).toHaveValue(formatDb(-11));
   const mine = (await debug(page, 'revision')) as number;
   for (const id of REPLICAS) expect((await request.post(`/__mock/replicas/${id}/kill`)).ok()).toBe(true);
   await request.post('/__mock/rewind?by=2');
@@ -498,10 +509,10 @@ test('a client never resumes onto a restored cluster that has committed past its
   await expect(banner).toContainText(`revision ${mine} of an earlier history`);
   expect(await debug(page, 'connection')).toBe('Ahead');
   expect(await debug(page, 'revision')).toBe(mine);
-  await expect(page.getByTestId('fader-value-ch19')).toHaveText(formatDb(-11));
+  await expect(page.getByTestId('fader-value-ch19')).toHaveValue(formatDb(-11));
   await banner.getByRole('button', { name: 'TAKE CLUSTER STATE' }).click();
   await expect.poll(() => debug(page, 'connection')).toBe('Live');
-  await expect(page.getByTestId('fader-value-ch19')).toHaveText(formatDb(-32));
+  await expect(page.getByTestId('fader-value-ch19')).toHaveValue(formatDb(-32));
   await expect.poll(async () => (await debug(page, 'revision')) === (await serverState(request)).revision).toBe(true);
 });
 
