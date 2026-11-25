@@ -68,6 +68,10 @@ describe('fader value field', () => {
     expect(sets()).toEqual([]);
     expect(input.value).toBe('-10.0');
     expect(s.notices.at(-1)?.text).toBe('Pres 1 fader takes -90 to +10 dB');
+    // Refused, it follows the fader again at once, focus or not.
+    s.apply({ type: 'patch', input: 0, changes: [[FADER, -5]], owners: [] });
+    flushSync();
+    expect(input.value).toBe('-5.0');
     unmount(c);
   });
 
@@ -94,6 +98,9 @@ describe('fader value field', () => {
     expect(sets()).toEqual([]);
     expect(input.value).toBe('-10.0');
     expect(s.notices.at(-1)?.text).toContain('is held by');
+    s.apply({ type: 'patch', input: 0, changes: [[FADER, -5]], owners: [] });
+    flushSync();
+    expect(input.value).toBe('-5.0');
     unmount(c);
   });
 
@@ -103,6 +110,21 @@ describe('fader value field', () => {
     type('-12');
     enter();
     expect(sets()).toEqual([{ type: 'set', path: SEND, value: -12 }]);
+    unmount(c);
+  });
+
+  it('follows the fader again when left with its text put back, which fires no change', () => {
+    const { s, c, input, type, enter, sets } = field();
+    type('-');
+    type('-10.0');
+    input.blur();
+    flushSync();
+    s.apply({ type: 'patch', input: 0, changes: [[FADER, -5]], owners: [] });
+    flushSync();
+    expect(input.value).toBe('-5.0');
+    input.focus();
+    enter();
+    expect(sets()).toEqual([]);
     unmount(c);
   });
 });

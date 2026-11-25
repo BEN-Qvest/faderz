@@ -63,6 +63,10 @@
     disabled={mixer.locked}
     oninput={() => (dirty = true)}
     onfocus={() => input?.select()}
+    onblur={() => {
+      // change fires first when the text changed; a dirty field left unchanged follows the fader again.
+      if (dirty) restore();
+    }}
     onchange={commit}
     onkeydown={keydown}
     aria-label={`${label} value, type to set`}
