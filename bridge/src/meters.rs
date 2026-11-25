@@ -32,6 +32,15 @@ pub struct DuckMeter {
     pub engaged: bool,
 }
 
+/// What the bridge reads of a meter frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reading {
+    /// Each channel's highest peak leg, dBFS from -120, in shape order.
+    pub peaks: Vec<f64>,
+    /// One reading per duck group, in shape order.
+    pub ducks: Vec<DuckMeter>,
+}
+
 /// Why a frame does not match a layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mismatch {
@@ -83,11 +92,11 @@ impl Layout {
         })
     }
 
-    /// Each channel's highest peak leg in `frame`, dBFS from -120, in
-    /// shape order.
-    pub fn channel_peaks(&self, frame: &[u8]) -> Result<Vec<f64>, Mismatch> {
+    /// What the bridge reads of `frame`: each channel's highest peak leg,
+    /// dBFS from -120, and the duck section, in shape order.
+    pub fn read(&self, frame: &[u8]) -> Result<Reading, Mismatch> {
         let value = self.values(frame)?;
-        Ok((self.channels.iter())
+        let peaks = (self.channels.iter())
             .map(|&(at, width)| {
                 let peak = (0..width).map(|leg| value(at + leg)).max().unwrap_or(NULL);
                 if peak == NULL {
@@ -96,13 +105,8 @@ impl Layout {
                     (f64::from(peak) / 100.0).clamp(-120.0, 30.0)
                 }
             })
-            .collect())
-    }
-
-    /// The duck section of `frame`, one reading per group in shape order.
-    pub fn ducks(&self, frame: &[u8]) -> Result<Vec<DuckMeter>, Mismatch> {
-        let value = self.values(frame)?;
-        Ok((0..self.ducks.len())
+            .collect();
+        let ducks = (0..self.ducks.len())
             .map(|g| {
                 let key = value(self.ducks_at + 3 * g);
                 DuckMeter {
@@ -112,7 +116,8 @@ impl Layout {
                     engaged: value(self.ducks_at + 3 * g + 2) & 1 == 1,
                 }
             })
-            .collect())
+            .collect();
+        Ok(Reading { peaks, ducks })
     }
 
     /// The value at an index of `frame`, once its header, layout and
@@ -147,6 +152,14 @@ fn fnv1a(text: &str) -> u32 {
 
 #[cfg(test)]
 impl Layout {
+    pub(crate) fn ducks(&self, frame: &[u8]) -> Result<Vec<DuckMeter>, Mismatch> {
+        self.read(frame).map(|r| r.ducks)
+    }
+
+    pub(crate) fn channel_peaks(&self, frame: &[u8]) -> Result<Vec<f64>, Mismatch> {
+        self.read(frame).map(|r| r.peaks)
+    }
+
     /// A frame of this layout from replica `r1` whose duck groups read
     /// `ducks` (key, envelope and flags as sent), every other value 0.
     pub(crate) fn frame(&self, ducks: &[[i16; 3]]) -> Vec<u8> {

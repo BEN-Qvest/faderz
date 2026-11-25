@@ -795,9 +795,9 @@ impl Engine {
         }
         self.credits = self.credits.saturating_sub(1);
         if let Some(layout) = &self.layout {
-            match layout.ducks(frame) {
-                Ok(readings) => {
-                    for (id, m) in layout.ducks.iter().zip(readings) {
+            match layout.read(frame) {
+                Ok(reading) => {
+                    for (id, m) in layout.ducks.iter().zip(reading.ducks) {
                         let duck = Duck {
                             envelope: m.envelope,
                             engaged: m.engaged,
@@ -805,13 +805,11 @@ impl Engine {
                         };
                         self.ducks.insert(id.clone(), duck);
                     }
-                    if let Ok(dbfs) = layout.channel_peaks(frame) {
-                        self.peaks = Peaks {
-                            dbfs,
-                            at: now,
-                            frames: self.peaks.frames.wrapping_add(1),
-                        };
-                    }
+                    self.peaks = Peaks {
+                        dbfs: reading.peaks,
+                        at: now,
+                        frames: self.peaks.frames.wrapping_add(1),
+                    };
                 }
                 Err(Mismatch::Fingerprint)
                     if self.sync == Sync::Live && !self.layout_resync_sent =>

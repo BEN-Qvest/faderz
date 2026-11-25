@@ -675,9 +675,9 @@ fn function_key_leds_light_while_the_group_ducks_until_the_frames_go_stale() {
     assert_eq!(led(&mut s, &e, 90), vec![0], "engaged, not yet ducking");
     e.binary(1, &frame(10_000), 130);
     assert_eq!(led(&mut s, &e, 130), vec![0x7f]);
-    assert_eq!(led(&mut s, &e, 130 + DUCK_STALE_MS - 1), Vec::<u8>::new());
+    assert_eq!(led(&mut s, &e, 130 + FRAME_STALE_MS - 1), Vec::<u8>::new());
     assert_eq!(
-        led(&mut s, &e, 130 + DUCK_STALE_MS),
+        led(&mut s, &e, 130 + FRAME_STALE_MS),
         vec![0],
         "stale: the state alone"
     );
@@ -1137,4 +1137,99 @@ fn the_overload_lights_in_the_top_db_only_and_goes_before_the_level() {
     );
     peak(&mut e, -20.0, 160);
     assert_eq!(meter_of(&s.render(&e, 160), 0), vec![15, 5]);
+}
+
+#[test]
+fn the_meter_scale_is_the_consoles() {
+    // web/src/lib/meters/ballistics.ts METER_SCALE, which the console
+    // draws its meters on: a change there must reach the surface too.
+    let ts = include_str!("../../../web/src/lib/meters/ballistics.ts");
+    let body = &ts[ts.find("METER_SCALE").expect("METER_SCALE")..];
+    let body = &body[..body.find("];").expect("its end")];
+    let pairs: Vec<(f64, f64)> = (body.lines().map(str::trim))
+        .filter_map(|l| l.strip_prefix('[')?.strip_suffix("],"))
+        .map(|p| {
+            let (db, at) = p.split_once(',').expect("a pair");
+            (db.trim().parse().unwrap(), at.trim().parse().unwrap())
+        })
+        .collect();
+    assert_eq!(pairs, METER_SCALE.to_vec());
+}
+
+/// A live engine on `n` mono channels ch1 to chN.
+fn channels(n: usize) -> Engine {
+    let ids: Vec<Value> = (1..=n)
+        .map(|i| json!({ "id": format!("ch{i}"), "name": format!("Ch {i}"), "width": 1 }))
+        .collect();
+    let state: serde_json::Map<String, Value> = (1..=n)
+        .map(|i| {
+            (
+                format!("ch{i}"),
+                json!({ "fader": -90, "mute": false, "solo": "off" }),
+            )
+        })
+        .collect();
+    let snapshot = json!({ "type": "snapshot", "replica": { "id": "r1", "role": "leader" },
+        "you": {}, "epoch": "1", "revision": 5,
+        "shape": { "channels": ids, "buses": [] },
+        "state": { "channels": state, "consoles": [] }, "owners": {} });
+    let mut e = engine(1);
+    e.start(0);
+    e.opened(1, 0);
+    e.received(1, &snapshot.to_string(), 0);
+    e.take_actions();
+    e.take_events();
+    e
+}
+
+/// A meter frame with these channel peaks, dBFS, the first channels first.
+fn peaks(e: &mut Engine, dbfs: &[f64], now: u64) {
+    let layout = Layout::of(&e.mirror().shape).expect("a layout");
+    let cents: Vec<i16> = dbfs.iter().map(|d| (d * 100.0) as i16).collect();
+    e.binary(1, &layout.frame_with(&cents, &[]), now);
+}
+
+#[test]
+fn strip_meters_follow_the_bank_and_an_extenders_offset() {
+    let mut e = channels(10);
+    let mut s = Surface::new(units(2), None);
+    // ch1 -45, ch2 -20, ch9 -12, ch10 -7 dBFS.
+    let frame = [
+        -45.0, -20.0, -60.0, -60.0, -60.0, -60.0, -60.0, -60.0, -12.0, -7.0,
+    ];
+    peaks(&mut e, &frame, 0);
+    let out = s.render(&e, 0);
+    let on = |out: &[(usize, Vec<u8>)], unit: usize, strip: u8| -> Vec<u8> {
+        meter_of(
+            &out.iter()
+                .filter(|(u, _)| *u == unit)
+                .cloned()
+                .collect::<Vec<_>>(),
+            strip,
+        )
+    };
+    assert_eq!(on(&out, 0, 0), vec![15, 0], "-45 dBFS lights none");
+    assert_eq!(on(&out, 0, 1), vec![15, 5]);
+    assert_eq!(
+        on(&out, 1, 0),
+        vec![15, 7],
+        "the Extender's first strip is ch9"
+    );
+    assert_eq!(on(&out, 1, 1), vec![15, 9]);
+    // CHANNEL right: every strip shows the next channel.
+    key(&mut s, &mut e, 49, true, 10);
+    peaks(&mut e, &frame, 40);
+    let out = s.render(&e, 40);
+    assert_eq!(on(&out, 0, 0), vec![5]);
+    assert_eq!(on(&out, 1, 0), vec![9]);
+    assert_eq!(on(&out, 1, 1), vec![0], "past the last channel");
+}
+
+#[test]
+fn a_stale_frame_while_clipping_turns_the_overload_off_and_the_meter_dark() {
+    let mut e = ducking();
+    let mut s = Surface::new(units(1), None);
+    peak(&mut e, -0.5, 0);
+    assert_eq!(meter_of(&s.render(&e, 0), 0), vec![14, 14]);
+    assert_eq!(meter_of(&s.render(&e, FRAME_STALE_MS), 0), vec![15, 0]);
 }

@@ -26,16 +26,11 @@ pub const STALE_TOUCH_MS: u64 = 1500;
 /// A duck key let go sooner than this after its press was a tap, as the
 /// web UI's talk key tells a tap from a hold.
 pub const LATCH_MS: u64 = 300;
-/// A duck reading older than this, 3 meter periods of 40 ms, no longer
-/// lights a duck key.
-pub const DUCK_STALE_MS: u64 = 120;
 /// A meter frame older than this, 3 meter periods of 40 ms, no longer
-/// lights a strip's meter.
-pub const METER_STALE_MS: u64 = 120;
+/// lights a duck key or a strip's meter.
+pub const FRAME_STALE_MS: u64 = 120;
 /// A peak above this lights CLIP: the top 1 dB of the digital scale,
-/// close to clipping. A lower mark, such as the console meter's red zone
-/// from the permitted maximum up, lights it so often that it says
-/// nothing.
+/// close to clipping.
 pub const CLIP_DBFS: f64 = -1.0;
 /// The pan one V-Pot detent moves: 100 detents from full left to full
 /// right.
@@ -764,9 +759,9 @@ impl Surface {
                     continue;
                 }
                 let s8 = s as u8;
-                // The overload goes out on entering and leaving the red
-                // zone, before the level; a level goes out on every new
-                // meter frame, as an X-Touch lets it fall, silence once.
+                // The overload goes out on crossing CLIP_DBFS either way,
+                // before the level; a level goes out on every new meter
+                // frame, as an X-Touch lets it fall, silence once.
                 if u.shown.clips[s] != Some(v.clip) {
                     out.push((i, mcu::meter_clip(s8, v.clip)));
                     u.shown.clips[s] = Some(v.clip);
@@ -898,7 +893,7 @@ impl Surface {
         // the console's meter scale, CLIP close to clipping.
         let peaks = engine.peaks();
         let index = self.bank + self.units[unit].offset + usize::from(strip);
-        let peak = (now < peaks.at + METER_STALE_MS)
+        let peak = (now < peaks.at + FRAME_STALE_MS)
             .then(|| peaks.dbfs.get(index).copied())
             .flatten();
         let clip = peak.is_some_and(|p| p > CLIP_DBFS);
@@ -951,12 +946,12 @@ fn meter_position(db: f64) -> f64 {
 
 /// A duck key's LED: on while the group is held or latched in, blinking
 /// while it is bypassed (`mode` `off`) and not held, on while it ducks its
-/// targets by a meter frame younger than `DUCK_STALE_MS`, else off.
+/// targets by a meter frame younger than `FRAME_STALE_MS`, else off.
 fn duck_led(engine: &Engine, duck: &str, now: u64) -> Led {
     let at = |leaf: &str| engine.display(&format!("/ducks/{duck}/{leaf}")).cloned();
     let ducking = engine
         .duck(duck)
-        .is_some_and(|d| d.envelope > 0.0 && now < d.at + DUCK_STALE_MS);
+        .is_some_and(|d| d.envelope > 0.0 && now < d.at + FRAME_STALE_MS);
     if at("hold") == Some(json!(true)) || at("mode") == Some(json!("on")) {
         Led::On
     } else if at("mode") == Some(json!("off")) {
@@ -975,8 +970,8 @@ struct StripView {
     select: Led,
     /// The V-Pot ring's [`mcu::ring_value`].
     ring: u8,
-    /// The meter's [`mcu::meter_level`], and whether it is in the red
-    /// zone.
+    /// The meter's [`mcu::meter_level`], and whether the peak is above
+    /// [`CLIP_DBFS`].
     meter: u8,
     clip: bool,
     name: String,

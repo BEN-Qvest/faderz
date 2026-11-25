@@ -1,6 +1,7 @@
 //! Paces what goes to a network surface: a byte rate with bursts of one
-//! packet, and a queue in which a newer motor position, LED, V-Pot ring
-//! or meter level replaces the queued one it supersedes, and a scribble strip
+//! packet, and a queue in which a newer motor position, LED or V-Pot
+//! ring replaces the queued one it supersedes, a newer meter message
+//! goes last in place of it, and a scribble strip
 //! write drops the queued ones it overwrites whole.
 
 use std::collections::VecDeque;
@@ -69,6 +70,14 @@ impl Pacer {
             self.queue.retain(|(q, _)| {
                 !matches!(q, Some(Key::Lcd(d, f, l)) if *d == device && *f >= first && *l <= last)
             });
+            self.queue.push_back((k, message));
+            return;
+        }
+        // A meter message goes last, so a level never ends up before the
+        // overload it follows: an X-Touch reads 15, the overload off, as a
+        // level until the next one.
+        if let Some(Key::Meter(..)) = k {
+            self.queue.retain(|(q, _)| q != &k);
             self.queue.push_back((k, message));
             return;
         }
@@ -142,7 +151,7 @@ mod tests {
     use crate::mcu::{self, Device, Key as McuKey, Led};
 
     #[test]
-    fn newer_faders_leds_rings_meters_and_cells_replace_queued_ones_in_place() {
+    fn newer_faders_leds_rings_meters_and_cells_replace_queued_ones() {
         let mut p = Pacer::new(1_000_000);
         p.push(mcu::fader(0, 100));
         p.push(mcu::led(McuKey::Mute(0), Led::On));
@@ -165,10 +174,11 @@ mod tests {
             vec![
                 mcu::fader(0, 200),
                 mcu::led(McuKey::Mute(0), Led::Off),
-                vec![0xd0, 0x0c],
                 vec![0xb0, 0x10, 0x41],
                 mcu::ring(2, 0x18),
                 mcu::fader(1, 7),
+                // A newer meter message goes last instead.
+                vec![0xd0, 0x0c],
                 vec![0xd0, 0x13],
                 mcu::lcd(Device::Main, 0, "Chan 9 "),
                 mcu::lcd(Device::Main, 7, "Chan 2 "),
@@ -181,6 +191,14 @@ mod tests {
     #[test]
     fn a_meter_level_never_takes_the_place_of_the_overload_before_it() {
         let mut p = Pacer::new(1_000_000);
+        p.push(mcu::meter(2, 11));
+        p.push(mcu::meter_clip(2, true));
+        p.push(mcu::meter_clip(2, false));
+        p.push(mcu::meter(2, 5));
+        assert_eq!(
+            p.take(0).unwrap(),
+            vec![mcu::meter_clip(2, false), mcu::meter(2, 5)]
+        );
         p.push(mcu::meter_clip(2, true));
         p.push(mcu::meter(2, 14));
         p.push(mcu::meter_clip(2, false));
