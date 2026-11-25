@@ -400,7 +400,7 @@ test('operates a fader from the keyboard', async ({ page, request }) => {
   await expect(slider).toHaveAttribute('aria-valuenow', '0.4');
   expect(await fader(request, 'ch21')).toBe(0.4);
   // Alt+0 as macOS sends it: Option gives the 0 key another character.
-  await slider.dispatchEvent('keydown', { key: '≠', code: 'Digit0', altKey: true, bubbles: true, cancelable: true });
+  await slider.dispatchEvent('keydown', { key: '\u2260', code: 'Digit0', altKey: true, bubbles: true, cancelable: true });
   await settled(page);
   await expect(slider).toHaveAttribute('aria-valuenow', '0');
   await page.keyboard.press('ArrowUp');
@@ -472,7 +472,7 @@ test('operates a pan from the keyboard, with no jump from a lone key or a double
   await page.keyboard.press('Alt+End');
   await settled(page);
   await expect(pan).toHaveAttribute('aria-valuenow', '1');
-  await pan.dispatchEvent('keydown', { key: '≠', code: 'Digit0', altKey: true, bubbles: true, cancelable: true });
+  await pan.dispatchEvent('keydown', { key: '\u2260', code: 'Digit0', altKey: true, bubbles: true, cancelable: true });
   await settled(page);
   await expect(pan).toHaveAttribute('aria-valuenow', '0');
 });

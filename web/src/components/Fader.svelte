@@ -2,6 +2,7 @@
   import { getMixer } from '../lib/state/mixer.svelte';
   import { FADER_MARKS, FADER_OFF_DB, dbToPosition, dragDb, formatDb, keyStepDb, stepDb } from '../lib/audio/db';
   import { tip } from '../lib/tip';
+  import { isAltZero } from '../lib/keys';
 
   interface Props {
     path: string;
@@ -84,9 +85,7 @@
   function keydown(e: KeyboardEvent): void {
     let next: number | null = null;
     const fine = isFine(e);
-    // Alt+0 by the key's place: on macOS, Option turns the 0 key's
-    // character into another one, which one depending on the layout.
-    switch (e.altKey && /^(Digit|Numpad)0$/.test(e.code) ? '0' : e.key) {
+    switch (isAltZero(e) ? '0' : e.key) {
       case 'ArrowUp':
       case 'ArrowRight':
         next = stepDb(value, fine ? 0.1 : keyStepDb(value));
