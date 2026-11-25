@@ -1381,14 +1381,12 @@ fn select_takes_the_screen_that_moved_not_one_that_follows_late() {
 fn select_waits_for_the_principal() {
     let mut e = live(1);
     let mut s = Surface::new(units(1), None);
+    assert_eq!(select_led(&mut s, &e), Some(Led::Off));
     let mine = screen("anonymous", "aaaaaaaaaaaaaaaaaaaaaa", "ui");
     selections(
         &mut s,
         &mut e,
         json!([{ "session": mine, "element": "ch1" }]),
     );
-    assert!(
-        selects(&e.take_actions()).is_empty(),
-        "the snapshot named nobody"
-    );
+    assert_eq!(select_led(&mut s, &e), None, "the snapshot named nobody");
 }

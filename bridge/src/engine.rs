@@ -1013,11 +1013,10 @@ impl Engine {
         self.offline_rounds = 0;
         self.sync_timeouts = 0;
         self.events.push(Event::Synced);
-        if let Some(p) = self.primary().map(|p| p.id)
-            && let Some(element) = self.selection.clone()
-        {
-            self.send(p, &json!({ "type": "select", "element": element }));
-        }
+        // A selection is a SELECT press screens follow once: it lapses
+        // with its connection, so a reconnect never replays it over what
+        // a screen selected since.
+        self.selection = None;
         for c in self.consoles.values_mut() {
             c.sent = None;
             c.last = None;

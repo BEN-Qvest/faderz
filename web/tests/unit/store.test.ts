@@ -185,6 +185,16 @@ describe('mixer store: a surface of the same principal', () => {
     expect(s.surfaceSelect).not.toBe(first);
   });
 
+  it('is followed by an anonymous screen only with FOLLOW on', () => {
+    const { s } = store();
+    s.apply(patch(0, { status: { ...LIVE, session: SESSION, handle: ME.handle, you: ME } }));
+    s.apply(patch(0, { selections: [{ session: desk('anonymous'), element: 'ch2' }] }));
+    expect(s.surfaceSelect).toBeNull();
+    s.follow = true;
+    s.apply(patch(0, { selections: [{ session: desk('anonymous'), element: 'ch3' }] }));
+    expect(s.surfaceSelect).toEqual({ element: 'ch3' });
+  });
+
   it('is the only kind followed: screens and other principals are not', () => {
     const s = signedIn();
     s.apply(patch(0, { selections: [{ session: desk('ana'), element: 'ch2' }, { session: { ...BEN, handle: 'other-screen-handle-00', kind: 'ui' }, element: 'ch3' }] }));

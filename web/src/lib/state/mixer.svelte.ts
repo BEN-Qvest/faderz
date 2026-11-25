@@ -247,7 +247,8 @@ export class MixerStore {
     const now = new Map(list.filter((s) => s.session.kind === 'console' && s.session.principal === you.principal).map((s) => [s.session.handle, s.element]));
     const changed = [...now].find(([h, element]) => this.surfaces.get(h) !== element);
     this.surfaces = now;
-    if (changed) this.surfaceSelect = { element: changed[1] };
+    // While every session is anonymous, everyone in the room is the same user: then only with FOLLOW on.
+    if (changed && (this.follow || you.principal !== 'anonymous')) this.surfaceSelect = { element: changed[1] };
   }
 
   /** Tells other screens what this one has selected; not a write, so sent while locked too. */

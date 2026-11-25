@@ -21,7 +21,8 @@ over them.
 SELECT on a control surface signed in as the same user opens that
 strip's panel too ([SURFACES.md](SURFACES.md#mapping)). While every
 session is anonymous, with auth mode none or token, it does so only on
-a screen with FOLLOW on, which also follows the surface's bank.
+a screen with FOLLOW on: FOLLOW then covers both the surface's bank and
+its SELECT.
 
 ![The mixer on a tablet in the light theme](screenshots/tablet-light.png)
 

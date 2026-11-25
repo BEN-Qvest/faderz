@@ -269,15 +269,17 @@ missing, a held duck key is let go after 1.5 seconds, as a fader is. A key also 
 frame, if it is no older than 120 ms.
 
 SELECT is shared with the screens signed in as the bridge's principal.
-A SELECT press opens or switches the panel on each of them, on a screen
-of an anonymous session only while its FOLLOW is on; letting go
-of it, or the bridge leaving, closes no panel. The SELECT LEDs show
-what such a screen selected last, and all are dark while that is on no
-strip or no screen of the principal has a selection. Following a
-screen publishes nothing, so one screen never moves another through
-the surface. With `auth.mode` none or token every session is
-`anonymous`, so every screen shares it. Selections are kept per
-replica and not replicated: a screen and the bridge share them only
+A SELECT press opens or switches the panel on each of them; letting go
+of it, or the bridge leaving, closes no panel. A press is sent once: a
+reconnect does not send it again. The SELECT LEDs show what the screen
+that changed last selected, and go dark when that is on no strip, when
+that screen's panel closes or the screen leaves, or when SELECT lets
+go. Following a screen publishes nothing, so one screen never moves
+another through the surface. With `auth.mode` none or token every
+session is `anonymous`, so everyone's screens count as the bridge's
+user: there a screen follows SELECT only while its FOLLOW is on, which
+then covers both the surface's bank and its SELECT. Selections are kept
+per replica and not replicated: a screen and the bridge share them only
 while both are connected to the same replica.
 
 ## Connection

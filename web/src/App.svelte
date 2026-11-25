@@ -58,11 +58,10 @@
   let section = $state<string | null>(null);
   // Other screens mark what this one has selected.
   $effect(() => mixer.select(selected));
-  // SELECT on a surface signed in as the same user opens that panel here too. While every session
-  // is anonymous, everyone in the room is the same user: then only with FOLLOW on.
+  // SELECT on a surface signed in as the same user opens that panel here too.
   $effect(() => {
     const s = mixer.surfaceSelect;
-    if (s) untrack(() => (mixer.follow || (mixer.status.you?.principal ?? 'anonymous') !== 'anonymous') && select(s.element));
+    if (s) untrack(() => select(s.element));
   });
 
   /** Moves focus to a region; on a narrow screen the masters open first. */

@@ -678,10 +678,8 @@ impl Surface {
                 ))
             })
             .collect();
-        // A screen that changed to what this surface shows only followed
-        // it. Taking such a change, a screen that has not followed yet
-        // (selections come at most every 100 ms) would pull the surface
-        // back, and the screens and the surface would chase each other.
+        // A screen that changed to what the LEDs show followed a SELECT
+        // press; one that moved elsewhere in the same message is taken.
         let changed = (screens.keys().chain(self.screens.keys())).find_map(|h| {
             let now = screens.get(h).cloned();
             (now != self.screens.get(h).cloned() && now != self.selected).then_some(now)

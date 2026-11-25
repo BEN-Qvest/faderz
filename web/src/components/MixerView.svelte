@@ -164,7 +164,7 @@
         aria-pressed={mixer.follow}
         disabled={surfaces.length === 0}
         onclick={() => (mixer.follow = !mixer.follow)}
-        title={surfaces[0] ? `Follow the bank of ${surfaces[0].name}, and SELECT on a surface` : 'No control surface connected'}>FOLLOW</button
+        title={surfaces[0] ? `Follow the bank of ${surfaces[0].name}, and open the panel a surface's SELECT picks` : 'No control surface connected'}>FOLLOW</button
       >
       <button
         class="key overs"
