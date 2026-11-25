@@ -983,25 +983,26 @@ fn a_v_pot_turns_its_channels_pan_by_detents_within_full_left_and_right() {
     assert!(values(&e.take_actions()).is_empty());
 }
 
+const ALT: u8 = 73;
+
 #[test]
-fn a_v_pot_pushed_twice_in_quick_succession_centres_the_pan() {
+fn a_v_pot_pushed_with_alt_centres_the_pan_and_alone_does_nothing() {
     let mut e = live(1);
     let mut s = Surface::new(units(1), None);
     pot(&mut s, &mut e, 5, 0);
     e.take_actions();
-    // One push, and a second one too late, do nothing.
     key(&mut s, &mut e, 32, true, 100);
     key(&mut s, &mut e, 32, false, 150);
-    key(&mut s, &mut e, 32, true, 100 + DOUBLE_PUSH_MS);
-    key(&mut s, &mut e, 32, false, 150 + DOUBLE_PUSH_MS);
-    assert!(values(&e.take_actions()).is_empty());
-    // The late push starts a new pair: the next one in time centres.
-    key(&mut s, &mut e, 32, true, 200 + DOUBLE_PUSH_MS);
+    key(&mut s, &mut e, 32, true, 200);
+    assert!(values(&e.take_actions()).is_empty(), "pushes alone");
+    key(&mut s, &mut e, ALT, true, 300);
+    key(&mut s, &mut e, 32, true, 350);
     assert_eq!(values(&e.take_actions()), vec![cmd("set", PAN, json!(0.0))]);
-    // A pair is used up: a third push in time starts the next.
-    pot(&mut s, &mut e, 5, 300 + DOUBLE_PUSH_MS);
+    // ALT let go, a push is a push again.
+    pot(&mut s, &mut e, 5, 400);
+    key(&mut s, &mut e, ALT, false, 450);
     e.take_actions();
-    key(&mut s, &mut e, 32, true, 350 + DOUBLE_PUSH_MS);
+    key(&mut s, &mut e, 32, true, 500);
     assert!(values(&e.take_actions()).is_empty());
 }
 
@@ -1017,7 +1018,7 @@ fn a_v_pot_leaves_a_pan_another_session_holds() {
         json!([{ "path": PAN, "owner": other }]),
     );
     pot(&mut s, &mut e, 1, 0);
-    key(&mut s, &mut e, 32, true, 1);
+    key(&mut s, &mut e, ALT, true, 1);
     key(&mut s, &mut e, 32, true, 2);
     assert!(values(&e.take_actions()).is_empty());
 }
@@ -1060,11 +1061,12 @@ fn detents_within_one_write_interval_add_up() {
 }
 
 #[test]
-fn a_push_before_a_new_session_is_no_half_of_a_pair() {
+fn alt_is_let_go_with_its_session() {
     let mut e = live(1);
     let mut s = Surface::new(units(1), None);
     pot(&mut s, &mut e, 5, 0);
-    key(&mut s, &mut e, 32, true, 100);
+    key(&mut s, &mut e, ALT, true, 100);
+    // Its release may be among what went missing.
     s.reconnected(0, &mut e, 150);
     e.take_actions();
     key(&mut s, &mut e, 32, true, 200);

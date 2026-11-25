@@ -64,7 +64,7 @@ power-on to choose it).
 | `auth` | `{"mode": "none"}` (default); `{"mode": "token", "token": ...}` or `{"mode": "token", "tokenFile": ...}` for a bearer token, faderz's `auth.token` or an access token of its OIDC provider; `{"mode": "device", ...}` to sign in at the OIDC provider ([Signing in](#signing-in)). |
 | `units` | Left to right. `id` is the console id (`^[a-z][a-z0-9-]{0,31}$`), `name` its display name, `model` `x-touch` (default) or `x-touch-extender`, `transport` `midi` (default) or `rtp-midi`. With `midi`, `midiIn` and `midiOut` are parts of the port names (`midiOut` defaults to `midiIn`). |
 | `master` | The control the X-Touch master fader drives. Default: the fader of the shape's program bus. |
-| `keys` | The X-Touch's duck keys by MIDI note, replacing F1 to F8: `{"0": {"duck": "comm", "action": "hold"}}`. `duck` is a duck group's id; `action` is `holdOrLatch` (default), `hold` or `latch`. A note is a REC key (0 to 7), a V-Pot push (32 to 39), a function key (54 to 61) or another note below 104 the bridge does not map, each named once; a bound note does what `keys` says instead of its mapping; `{}` leaves the X-Touch without duck keys. The bridge warns of keys without an X-Touch unit and of a key whose group the shape lacks. |
+| `keys` | The X-Touch's duck keys by MIDI note, replacing F1 to F8: `{"0": {"duck": "comm", "action": "hold"}}`. `duck` is a duck group's id; `action` is `holdOrLatch` (default), `hold` or `latch`. A note is a REC key (0 to 7), a V-Pot push (32 to 39), a function key (54 to 61), ALT (73) or another note below 104 the bridge does not map, each named once; a bound note does what `keys` says instead of its mapping; `{}` leaves the X-Touch without duck keys. The bridge warns of keys without an X-Touch unit and of a key whose group the shape lacks. |
 
 ## Network surfaces (RTP-MIDI)
 
@@ -238,7 +238,7 @@ console shows the bridge's controls as `<console> (<user>)`.
 | SOLO | Toggles `/channels/<id>/solo` between `off` and `pfl`; the LED is on while it is not `off` |
 | SELECT | Selects the strip's channel; the LED shows the selection, and blinks while another session holds the strip's fader |
 | V-Pot turn | Sets `/channels/<id>/pan/lr` by 0.02 per detent, clockwise to the right, within -1 to 1 and at most 50 per second; nothing while another session holds it |
-| V-Pot push | Pushed twice within 400 ms, centres `/channels/<id>/pan/lr`; a single push does nothing |
+| V-Pot push | With ALT held, centres `/channels/<id>/pan/lr`, as Alt+0 on a screen; alone it does nothing |
 | V-Pot ring | The pan from the centre out, 11 LEDs |
 | REC | No action, unless `keys` binds it to a duck group |
 | F1 to F8 (X-Touch) | The shape's duck groups in order, or what `keys` binds (below) |
@@ -294,7 +294,8 @@ an X-Touch or X-Touch Extender:
 - RTP-MIDI with a surface's own network port, in role MASTER and SLAVE,
   across a router and a NAT, and the rate a surface takes;
 - an RTP-MIDI session from macOS, and the scribble strip SysEx through
-  its live routings.
+  its live routings;
+- ALT on note 73.
 
 The V-Pots were tried on an X-Touch in MC mode over RTP-MIDI: turns on
 CC 16-23 with bit 6 anticlockwise, the push on notes 32-39, and the

@@ -48,6 +48,8 @@ pub enum Key {
     BankRight,
     ChannelLeft,
     ChannelRight,
+    /// ALT, a modifier.
+    Alt,
     /// F1 to F8 as 0 to 7.
     Function(u8),
     /// Any other note: not mapped.
@@ -67,6 +69,7 @@ impl Key {
             48 => Key::ChannelLeft,
             49 => Key::ChannelRight,
             54..=61 => Key::Function(note - 54),
+            73 => Key::Alt,
             n => Key::Other(n),
         }
     }
@@ -84,6 +87,7 @@ impl Key {
             Key::ChannelLeft => 48,
             Key::ChannelRight => 49,
             Key::Function(f) => 54 + f,
+            Key::Alt => 73,
             Key::Other(n) => n,
         }
     }
@@ -306,6 +310,7 @@ mod tests {
             );
         }
         assert_eq!(key(62), Key::Other(62));
+        assert_eq!(key(73), Key::Alt);
         for note in 0..=103 {
             assert_eq!(Key::from_note(note).note(), note);
         }

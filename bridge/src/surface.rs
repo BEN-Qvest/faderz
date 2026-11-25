@@ -32,9 +32,6 @@ pub const DUCK_STALE_MS: u64 = 120;
 /// The pan one V-Pot detent moves: 100 detents from full left to full
 /// right.
 pub const POT_STEP: f64 = 0.02;
-/// A V-Pot pushed again within this long after its last push centres the
-/// pan: a single push, easily made while turning, does nothing.
-pub const DOUBLE_PUSH_MS: u64 = 400;
 
 /// What a duck key does with its group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -146,8 +143,8 @@ struct Unit {
     touches: [Option<Touch>; 9],
     /// Duck keys held down, by note.
     presses: BTreeMap<u8, Press>,
-    /// When each V-Pot was last pushed, until a second push uses it.
-    pushed: [Option<u64>; 8],
+    /// Whether ALT is down: a V-Pot pushed with it centres the pan.
+    alt: bool,
     shown: Shown,
 }
 
@@ -185,7 +182,7 @@ impl Surface {
                 offset: i * usize::from(mcu::STRIPS),
                 touches: Default::default(),
                 presses: BTreeMap::new(),
-                pushed: [None; 8],
+                alt: false,
                 shown: Shown::default(),
             })
             .collect();
@@ -390,7 +387,7 @@ impl Surface {
         while let Some((_, p)) = self.units[unit].presses.pop_first() {
             self.let_go(p, engine, now);
         }
-        self.units[unit].pushed = [None; 8];
+        self.units[unit].alt = false;
         self.resend(unit);
     }
 
@@ -491,6 +488,9 @@ impl Surface {
                 now,
             ),
             Input::Key { key, down: false } => {
+                if key == Key::Alt {
+                    self.units[unit].alt = false;
+                }
                 if let Some(p) = self.units[unit].presses.remove(&key.note()) {
                     self.duck_up(p, engine, now);
                 }
@@ -583,15 +583,11 @@ impl Surface {
                     engine.select(self.selected.as_deref());
                 }
             }
-            Key::Pot(s) => {
-                let last = &mut self.units[unit].pushed[usize::from(s)];
-                if last.is_some_and(|at| now < at + DOUBLE_PUSH_MS) {
-                    *last = None;
-                    self.pan(unit, s, |_| 0.0, engine, now);
-                } else {
-                    *last = Some(now);
-                }
-            }
+            // Only with ALT, as Alt+0 on a screen: a push alone, easily
+            // made while turning, would move a pan on air.
+            Key::Pot(s) if self.units[unit].alt => self.pan(unit, s, |_| 0.0, engine, now),
+            Key::Pot(_) => {}
+            Key::Alt => self.units[unit].alt = true,
             // Mapped, and left without an action until recording exists.
             Key::Rec(_) => {}
             Key::BankLeft => self.move_bank(-(self.strips() as isize), engine, now),
@@ -610,10 +606,6 @@ impl Surface {
         let bank = self.bank.saturating_add_signed(by).min(last);
         if bank != self.bank {
             self.bank = bank;
-            // A push before the move was on another channel.
-            for u in &mut self.units {
-                u.pushed = [None; 8];
-            }
             self.register(engine, now);
         }
     }
