@@ -84,7 +84,9 @@
   function keydown(e: KeyboardEvent): void {
     let next: number | null = null;
     const fine = isFine(e);
-    switch (e.key) {
+    // Alt+0 by the key's place: on macOS, Option turns the 0 key's
+    // character into another one, which one depending on the layout.
+    switch (e.altKey && /^(Digit|Numpad)0$/.test(e.code) ? '0' : e.key) {
       case 'ArrowUp':
       case 'ArrowRight':
         next = stepDb(value, fine ? 0.1 : keyStepDb(value));

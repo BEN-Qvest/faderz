@@ -77,7 +77,9 @@
     // Jumps need Alt, as on a fader: a stray key never swings a source.
     else if (e.key === 'Home' && e.altKey) v = -1;
     else if (e.key === 'End' && e.altKey) v = 1;
-    else if (e.key === '0' && e.altKey) v = 0;
+    // By the key's place: on macOS, Option turns the 0 key's character
+    // into another one.
+    else if (e.altKey && /^(Digit|Numpad)0$/.test(e.code)) v = 0;
     if (v === null) return;
     e.preventDefault();
     if (mixer.refuseIfHeld(path)) return;
