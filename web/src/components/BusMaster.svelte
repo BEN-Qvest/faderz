@@ -72,7 +72,7 @@
     <div class="legs" aria-hidden="true" style:grid-template-columns={`repeat(${labels.length}, minmax(0, 1fr))`}>
       {#each labels as l (l)}<span>{l}</span>{/each}
     </div>
-    <div class="num value"><FaderValue path={path('fader')} label={`${element.name} fader`} /></div>
+    <FaderValue path={path('fader')} label={`${element.name} fader`} />
   </div>
 </section>
 
@@ -207,13 +207,7 @@
     overflow: visible;
     white-space: nowrap;
   }
-  .value {
+  .foot > :global(.value) {
     grid-column: 1 / -1;
-    font-size: 11.5px;
-    text-align: center;
-    background: var(--well);
-    border-radius: 2px;
-    color: #e6edf3;
-    line-height: 18px;
   }
 </style>

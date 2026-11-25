@@ -40,7 +40,7 @@
     <button {@attach pendingWrite(mixer, vcaPath(vca.id, 'mute'))} class="key mute" aria-disabled={mixer.locked} aria-pressed={mute} onclick={() => mixer.set(vcaPath(vca.id, 'mute'), !mute)} aria-label={`VCA ${vca.name} mute`}>MUTE</button>
   </div>
   <div class="f"><Fader path={vcaPath(vca.id, 'offset')} label={`VCA ${vca.name} offset`} /></div>
-  <div class="num value"><FaderValue path={vcaPath(vca.id, 'offset')} label={`VCA ${vca.name} offset`} /></div>
+  <FaderValue path={vcaPath(vca.id, 'offset')} label={`VCA ${vca.name} offset`} />
 </section>
 
 <style>
@@ -101,13 +101,8 @@
   .f {
     min-height: 140px;
   }
-  .value {
+  .vca > :global(.value) {
     align-self: end;
     font-size: 11px;
-    text-align: center;
-    background: var(--well);
-    border-radius: 2px;
-    color: #e6edf3;
-    line-height: 18px;
   }
 </style>

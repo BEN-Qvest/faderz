@@ -1964,6 +1964,13 @@ test('puts an aux on the channel faders and gives the faders back on EXIT', asyn
   expect(send).toBeGreaterThan(-20);
   expect(await fader(request, 'ch2')).toBe(faderBefore);
   expect(await page.locator('[data-channel="ch2"]').boundingBox()).toEqual(strip);
+  // A level typed under the fader goes to the send too.
+  const field = page.getByTestId('fader-value-ch2');
+  await field.click();
+  await field.fill('-12');
+  await field.press('Enter');
+  await expect.poll(async () => (await serverState(request)).state.channels['ch2']!.sends['aux1']!.level).toBe(-12);
+  expect(await fader(request, 'ch2')).toBe(faderBefore);
   await page.getByTestId('sends-on-faders').click();
   await expect(page.getByRole('slider', { name: 'Pres 2 fader' })).toBeVisible();
   await expect(page.getByTestId('fader-value-ch2')).toHaveValue(formatDb(faderBefore));

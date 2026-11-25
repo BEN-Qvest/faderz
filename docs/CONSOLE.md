@@ -190,9 +190,10 @@ nothing commits, TALK starts no talk.
   range is never clamped: the field is restored and the range shown.
 - The value under a channel, master or VCA fader is such a field: a
   click takes a level in dB, rounded to 0.1, with `-inf` or `off` for
-  the floor. It is no tab stop. A fader another session holds refuses
-  it as it refuses a drag, and while the field has focus the fader's
-  moves do not overwrite what is being typed.
+  the floor. It is no tab stop. It follows the fader until something is
+  typed, and Enter with nothing typed writes nothing, so a surface's move
+  is never written over. A fader another session holds refuses a typed
+  level as it refuses a drag.
 - A parameter or send slider moves by the distance dragged and never
   jumps to the touch point; its arrows step a hundredth of its travel,
   Page Up and Page Down a tenth.

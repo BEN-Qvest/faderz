@@ -277,9 +277,7 @@
   </div>
 
   <div class="foot">
-    <div class="num value">
-      <FaderValue path={levelPath} label={sendsTo ? `${channel.name} send to ${sendsTo.name}` : `${channel.name} fader`} testid={`fader-value-${channel.id}`} />
-    </div>
+    <FaderValue path={levelPath} label={sendsTo ? `${channel.name} send to ${sendsTo.name}` : `${channel.name} fader`} testid={`fader-value-${channel.id}`} />
     <!-- Who holds the fader, in words; the slot is there whether held or
          not. It is no tab stop: the held fader's tooltip and value text
          give the keyboard the full label. -->
@@ -324,7 +322,7 @@
   .strip.sof {
     box-shadow: inset 0 3px 0 var(--meter-loud);
   }
-  .strip.sof .value {
+  .strip.sof :global(.value) {
     color: var(--meter-loud);
   }
   .strip.alt {
@@ -661,14 +659,6 @@
     flex-direction: column;
     gap: 2px;
     align-items: stretch;
-  }
-  .value {
-    font-size: 11.5px;
-    text-align: center;
-    background: var(--well);
-    border-radius: 2px;
-    color: #e6edf3;
-    line-height: 18px;
   }
   .holder {
     height: 14px;

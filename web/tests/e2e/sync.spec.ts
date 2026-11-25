@@ -327,12 +327,13 @@ test('a promote onto a lagging replica never shows an older value', { tag: '@moc
   // The readout is a field: its value changes without a DOM mutation, so
   // every value it shows is sampled once per frame.
   await page.evaluate(() => {
-    const w = window as unknown as { __seen: string[] };
+    const w = window as unknown as { __seen: string[]; __sampling: boolean };
     w.__seen = [];
+    w.__sampling = true;
     const el = document.querySelector<HTMLInputElement>('[data-testid="fader-value-ch1"]')!;
     const sample = () => {
       if (el.value !== w.__seen.at(-1)) w.__seen.push(el.value);
-      requestAnimationFrame(sample);
+      if (w.__sampling) requestAnimationFrame(sample);
     };
     sample();
   });
@@ -341,7 +342,11 @@ test('a promote onto a lagging replica never shows an older value', { tag: '@moc
   expect((await request.post('/__mock/replicas/r1/kill')).ok()).toBe(true);
   await page.waitForFunction(() => window.__faderz?.primaryReplica === 'r2' && window.__faderz.connection === 'Live', null, { timeout: 10_000 });
   await expect(readout).toHaveValue(formatDb(target));
-  const seen = await page.evaluate(() => (window as unknown as { __seen: string[] }).__seen);
+  const seen = await page.evaluate(() => {
+    const w = window as unknown as { __seen: string[]; __sampling: boolean };
+    w.__sampling = false;
+    return w.__seen;
+  });
   expect(seen.slice(seen.indexOf(formatDb(target)))).not.toContain(formatDb(before));
 });
 
