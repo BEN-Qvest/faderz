@@ -1465,3 +1465,31 @@ fn a_new_session_is_sent_everything_again_twice_while_the_surface_settles() {
     s.tick(&mut e, 10_000);
     assert!(s.render(&e, 10_000).is_empty(), "then only what changes");
 }
+
+#[test]
+fn a_surface_heard_again_is_sent_everything_now_and_while_it_settles() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None).without_refresh();
+    let full = s.render(&e, 0).len();
+    let link = Link {
+        connected: true,
+        session: 1,
+        ..Link::default()
+    };
+    s.link_changed(0, Link::default(), link, &mut e, 0);
+    for after in RESEND_AFTER_MS {
+        s.tick(&mut e, after);
+    }
+    s.render(&e, 10_000);
+    let back = Link { resync: 1, ..link };
+    s.link_changed(0, link, back, &mut e, 20_000);
+    assert_eq!(s.render(&e, 20_000).len(), full, "at once");
+    for after in RESEND_AFTER_MS {
+        s.tick(&mut e, 20_000 + after);
+        assert_eq!(
+            s.render(&e, 20_000 + after).len(),
+            full,
+            "again after {after} ms"
+        );
+    }
+}

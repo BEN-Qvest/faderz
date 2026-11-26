@@ -753,3 +753,47 @@ fn closing_says_bye_and_malformed_commands_are_ignored() {
     assert_eq!(sent(&mut s).len(), 2);
     assert_eq!(events(&mut s), vec![Event::Down { reason: "closed" }]);
 }
+
+#[test]
+fn a_peer_heard_again_after_a_silence_asks_for_the_state_again() {
+    let mut s = up();
+    // Feedback every second, as an X-Touch sends it: no loss.
+    for t in 1..=5 {
+        s.received(
+            Socket::Control,
+            addr("198.51.100.1:6000"),
+            &feedback(PEER_SSRC, 0),
+            t * SECOND,
+        );
+    }
+    assert!(events(&mut s).is_empty());
+    // A pulled cable: nothing for 3 s, then the peer is back in the same
+    // session.
+    s.received(
+        Socket::Control,
+        addr("198.51.100.1:6000"),
+        &feedback(PEER_SSRC, 0),
+        5 * SECOND + PEER_SILENT,
+    );
+    assert_eq!(events(&mut s), vec![Event::Lost]);
+    // A peer that is quiet for 10 s as a rule, as a Mac's clock sync, is
+    // not cut off by that.
+    let mut s = up();
+    for t in 1..=6 {
+        s.received(
+            Socket::Control,
+            addr("198.51.100.1:6000"),
+            &feedback(PEER_SSRC, 0),
+            t * 10 * SECOND,
+        );
+    }
+    assert!(events(&mut s).is_empty());
+    // Another address is no sign of the peer.
+    s.received(
+        Socket::Control,
+        addr("198.51.100.9:6000"),
+        &feedback(PEER_SSRC, 0),
+        20 * SECOND,
+    );
+    assert!(events(&mut s).is_empty());
+}

@@ -40,10 +40,11 @@ pub const POT_STEP: f64 = 0.02;
 /// a surface that lost or garbled messages, such as right after it
 /// invited the bridge again, shows the state again.
 pub const REFRESH_STEP_MS: u64 = 500;
-/// After a unit's session starts, it is sent all it shows again this long
-/// after the first full send: an X-Touch that just invited the bridge
-/// drops part of what comes while it settles, different parts each time.
-pub const RESEND_AFTER_MS: [u64; 2] = [300, 1000];
+/// After a unit's session starts, or the unit is heard again after a
+/// silence, it is sent all it shows again this long after the first full
+/// send: an X-Touch that just came back drops part of what comes while it
+/// settles, different parts each time.
+pub const RESEND_AFTER_MS: [u64; 3] = [300, 1000, 3000];
 
 /// What a duck key does with its group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -477,7 +478,10 @@ impl Surface {
         if is.missed != was.missed {
             self.missed(unit, now);
         }
+        // The surface lost what it was sent, or was cut off and is heard
+        // again: everything again now and while it settles.
         if is.resync != was.resync {
+            self.units[unit].resends = RESEND_AFTER_MS.iter().map(|d| now + d).collect();
             self.resend(unit);
         }
     }
