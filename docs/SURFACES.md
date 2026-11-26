@@ -192,8 +192,11 @@ grant (RFC 8628):
 ```
 
 On start the bridge prints a verification URL and a user code, and
-shows them on the first unit's scribble strip; the user opens the URL
-in any browser, enters the code and signs in. The bridge keeps the
+shows them on the first unit's scribble strip, one 7-character cell per
+strip: the code on the first two strips, split at its hyphen, and the
+URL without its scheme over both lines of the last five, broken after a
+slash. The user opens the URL in any browser, enters the code and signs
+in. The bridge keeps the
 access and refresh tokens in `<stateDir>/tokens.json`, mode 0600, and a
 restart signs in with the stored refresh token while the provider still
 accepts it. It refreshes the access token a quarter of its lifetime

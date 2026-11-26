@@ -211,23 +211,99 @@ fn show_on_connect(
 
 fn show_lcd(code: &auth::DeviceCode, lcd: Option<&(UnboundedSender<Vec<u8>>, Device)>) {
     if let Some((out, device)) = lcd {
-        let line = |text: String| format!("{text:<width$.width$}", width = mcu::LINE_CHARS);
-        let _ = out.send(mcu::lcd(
-            *device,
-            0,
-            &line(format!("Sign in: {}", code.verification_uri)),
-        ));
-        let _ = out.send(mcu::lcd(
-            *device,
-            mcu::LINE_CHARS,
-            &line(format!("Code: {}", code.user_code)),
-        ));
+        let [top, bottom] = sign_in_lines(&code.verification_uri, &code.user_code);
+        let _ = out.send(mcu::lcd(*device, 0, &top));
+        let _ = out.send(mcu::lcd(*device, mcu::LINE_CHARS, &bottom));
     }
+}
+
+/// The scribble strip's two lines for a sign-in, laid out on its 8 cells
+/// of 7 characters, each its own display: the code on the first two
+/// strips, split at its hyphen, "Sign in" on the third, and the URL
+/// without its scheme over both lines of the last five, broken after a
+/// slash where one fits. Text past the cells is cut; the log has it all.
+fn sign_in_lines(uri: &str, code: &str) -> [String; 2] {
+    let w = mcu::STRIP_CHARS;
+    let cell = |text: &str| format!("{text:<w$.w$}");
+    let (first, second) = match code.split_once('-') {
+        Some((a, b)) if a.len() < w && b.len() <= w => (format!("{a}-"), b.to_owned()),
+        _ => (
+            code.chars().take(w).collect(),
+            code.chars().skip(w).collect(),
+        ),
+    };
+    let url: Vec<char> = uri
+        .split_once("://")
+        .map_or(uri, |(_, rest)| rest)
+        .chars()
+        .collect();
+    let width = mcu::LINE_CHARS - 3 * w;
+    let at = if url.len() <= width {
+        url.len()
+    } else {
+        url[..=width]
+            .iter()
+            .rposition(|&c| c == '/')
+            .map_or(width, |i| i + 1)
+    };
+    let top: String = url[..at].iter().collect();
+    let bottom: String = url[at..].iter().collect();
+    let line = |text: String| format!("{text:<n$.n$}", n = mcu::LINE_CHARS);
+    [
+        line(format!(
+            "{}{}{}{top}",
+            cell("Code:"),
+            cell(""),
+            cell("Sign in")
+        )),
+        line(format!(
+            "{}{}{}{bottom}",
+            cell(&first),
+            cell(&second),
+            cell("")
+        )),
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 7-character cells of a line, one per strip.
+    fn cells(line: &str) -> Vec<&str> {
+        (0..8).map(|s| &line[s * 7..s * 7 + 7]).collect()
+    }
+
+    #[test]
+    fn a_sign_in_fits_the_scribble_strips_cell_by_cell() {
+        let [top, bottom] = sign_in_lines(
+            "https://idp.broadcast-facility.example.org/realms/mix/device",
+            "TTBL-FLPH",
+        );
+        assert_eq!(top.len(), mcu::LINE_CHARS);
+        assert_eq!(bottom.len(), mcu::LINE_CHARS);
+        assert_eq!(&cells(&top)[..3], ["Code:  ", "       ", "Sign in"]);
+        assert_eq!(&cells(&bottom)[..3], ["TTBL-  ", "FLPH   ", "       "]);
+        // The URL over the last five strips, broken after a slash.
+        assert_eq!(top[21..].trim_end(), "idp.broadcast-facility.example.org/");
+        assert_eq!(bottom[21..].trim_end(), "realms/dmf/device");
+    }
+
+    #[test]
+    fn a_code_or_url_that_does_not_fit_is_cut_rather_than_spilled() {
+        let [top, bottom] = sign_in_lines("http://a.example/x", "ABCDEFGHIJ");
+        assert_eq!(&cells(&bottom)[..2], ["ABCDEFG", "HIJ    "]);
+        assert_eq!(top[21..].trim_end(), "a.example/x");
+        assert_eq!(bottom[21..].trim_end(), "");
+        let long = format!("https://{}", "x".repeat(80));
+        let [top, bottom] = sign_in_lines(&long, "AB-CD");
+        assert_eq!(top[21..], "x".repeat(35));
+        assert_eq!(bottom[21..], "x".repeat(35));
+        assert_eq!(&cells(&bottom)[..2], ["AB-    ", "CD     "]);
+        // A character past ASCII is cut at a character, never in it.
+        let [top, _] = sign_in_lines(&format!("https://{}", "\u{e9}".repeat(40)), "AB-CD");
+        assert_eq!(top.chars().count(), mcu::LINE_CHARS);
+    }
 
     #[tokio::test]
     async fn a_surface_that_connects_during_a_sign_in_is_shown_the_code() {
@@ -257,9 +333,12 @@ mod tests {
         wait().await;
         let first = mcu::parse_lcd(&lcd.try_recv().unwrap()).unwrap();
         let second = mcu::parse_lcd(&lcd.try_recv().unwrap()).unwrap();
-        assert!(first.2.starts_with("Sign in: https://idp.example/device"));
+        assert_eq!(first.1, 0);
         assert_eq!(second.1, mcu::LINE_CHARS);
-        assert!(second.2.starts_with("Code: WXYZ-1234"));
+        assert_eq!(
+            [first.2, second.2],
+            sign_in_lines("https://idp.example/device", "WXYZ-1234")
+        );
         // A resend while connected is no new connection.
         link.send_modify(|l| l.resync += 1);
         wait().await;
