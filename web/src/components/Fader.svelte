@@ -8,8 +8,10 @@
     path: string;
     label: string;
     scale?: boolean;
+    /** A colour the cap's face takes on in part; its edge and rings still show ownership. */
+    tint?: string;
   }
-  let { path, label, scale = true }: Props = $props();
+  let { path, label, scale = true, tint }: Props = $props();
 
   const mixer = getMixer();
   const value = $derived(mixer.value<number>(path) ?? FADER_OFF_DB);
@@ -174,7 +176,7 @@
     {/each}
     <div class="range">
       <div class="travel" style:transform="translateY({(1 - position) * 100}%)">
-        <div class="cap" class:mine class:foreign><span></span></div>
+        <div class="cap" class:mine class:foreign style:--face={tint ? `color-mix(in srgb, ${tint} var(--cap-tint), var(--cap))` : undefined}><span></span></div>
       </div>
     </div>
   </div>
@@ -298,7 +300,7 @@
     right: 1px;
     height: 34px;
     border-radius: 3px;
-    background: linear-gradient(180deg, color-mix(in srgb, var(--cap) 92%, white) 0%, var(--cap) 45%, color-mix(in srgb, var(--cap) 80%, black) 100%);
+    background: linear-gradient(180deg, color-mix(in srgb, var(--face, var(--cap)) 92%, white) 0%, var(--face, var(--cap)) 45%, color-mix(in srgb, var(--face, var(--cap)) 80%, black) 100%);
     border: 1px solid var(--cap-edge);
     box-shadow: 0 2px 4px rgba(0, 0, 0, 0.45);
     pointer-events: none;

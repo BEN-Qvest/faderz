@@ -24,6 +24,10 @@ session is anonymous, with auth mode none or token, it does so only on
 a screen with FOLLOW on: FOLLOW then covers both the surface's bank and
 its SELECT.
 
+A channel's strip colour shows as the band on its scribble strip, a
+tint of the strip's dark background and a tint of its fader cap; the
+cap's edge still shows who holds the fader.
+
 ![The mixer on a tablet in the light theme](screenshots/tablet-light.png)
 
 ## Status bar and connection
