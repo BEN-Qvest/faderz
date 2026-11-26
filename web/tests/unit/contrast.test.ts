@@ -134,8 +134,8 @@ describe('channel colours', () => {
     it('a selected strip shows its --on ring against the strip around it, tinted or not', () => {
       expect(contrast(t['on']!, t['strip-sel']!)).toBeGreaterThanOrEqual(3);
     });
-    // Guards the colours, the cap token and the line's ink: on these caps
-    // no share of the colour would make the line less clear than on a plain one.
+    // Guards the colours, --cap and the line's ink: on these caps no share
+    // of the colour would make the line less clear than on a plain one.
     it.each(colours)('a %s fader cap keeps its centre line as clear as a plain one', (_name, colour) => {
       const face = mix(colour, tint, t['cap']!);
       expect(contrast(capLine, face)).toBeGreaterThanOrEqual(Math.min(3, contrast(capLine, t['cap']!)));

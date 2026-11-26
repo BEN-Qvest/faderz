@@ -1541,7 +1541,9 @@ test('tints the scribble strip and fader cap of a coloured channel, and the cap 
   } finally {
     other.close();
   }
-  // Held here: the --on edge and ring, as on a plain cap held here.
+  // Held here: the --on edge and ring, as on a plain cap held here, once the refuse flash is over.
+  const err = await token('--err');
+  await expect.poll(() => style(cap, 'boxShadow')).not.toContain(err);
   const held = async (ch: string) => {
     const c = page.locator(`[data-channel="${ch}"] .cap`);
     const at = await faderCenter(page, `/channels/${ch}/fader`);
