@@ -197,11 +197,11 @@ fn a_new_session_lets_go_of_held_faders_and_gets_everything_again() {
     let mut e = live(1);
     let mut s = Surface::new(units(2), None);
     let first = s.render(&e, 0);
-    // Faders, LEDs, rings and both lines of every strip per unit, and the
-    // X-Touch's function key LEDs.
+    // Faders, LEDs, rings, meters with their overload and both lines of
+    // every strip per unit, and the X-Touch's function key LEDs.
     let on = |out: &[(usize, Vec<u8>)], unit| out.iter().filter(|(u, _)| *u == unit).count();
-    assert_eq!(on(&first, 0), 9 + 8 * 5 + 16 + 8);
-    assert_eq!(on(&first, 1), 8 + 8 * 5 + 16);
+    assert_eq!(on(&first, 0), 9 + 8 * 7 + 16 + 8);
+    assert_eq!(on(&first, 1), 8 + 8 * 7 + 16);
     assert!(s.render(&e, 100).is_empty(), "only what changed");
 
     s.resend(1);
@@ -266,7 +266,7 @@ fn after_missed_messages_a_touch_that_does_not_move_is_let_go() {
     s.link_changed(0, lost(2), resend, &mut e, 8000);
     s.tick(&mut e, 20_000);
     assert_eq!(s.touching(), held());
-    assert_eq!(s.render(&e, 20_000).len(), 9 + 8 * 5 + 16 + 8 - 1);
+    assert_eq!(s.render(&e, 20_000).len(), 9 + 8 * 7 + 16 + 8 - 1);
     // The session ending lets go of everything.
     let down = Link {
         connected: false,
@@ -675,9 +675,9 @@ fn function_key_leds_light_while_the_group_ducks_until_the_frames_go_stale() {
     assert_eq!(led(&mut s, &e, 90), vec![0], "engaged, not yet ducking");
     e.binary(1, &frame(10_000), 130);
     assert_eq!(led(&mut s, &e, 130), vec![0x7f]);
-    assert_eq!(led(&mut s, &e, 130 + DUCK_STALE_MS - 1), Vec::<u8>::new());
+    assert_eq!(led(&mut s, &e, 130 + FRAME_STALE_MS - 1), Vec::<u8>::new());
     assert_eq!(
-        led(&mut s, &e, 130 + DUCK_STALE_MS),
+        led(&mut s, &e, 130 + FRAME_STALE_MS),
         vec![0],
         "stale: the state alone"
     );
@@ -1071,4 +1071,322 @@ fn alt_is_let_go_with_its_session() {
     e.take_actions();
     key(&mut s, &mut e, 32, true, 200);
     assert!(values(&e.take_actions()).is_empty());
+}
+
+/// A meter frame in which channel ch1 peaks at `dbfs`.
+fn peak(e: &mut Engine, dbfs: f64, now: u64) {
+    let layout = Layout::of(&e.mirror().shape).expect("a layout");
+    let frame = layout.frame_with(&[(dbfs * 100.0) as i16], &[]);
+    e.binary(1, &frame, now);
+}
+
+/// The meter messages of strip `strip` in `out`, in order.
+fn meter_of(out: &[(usize, Vec<u8>)], strip: u8) -> Vec<u8> {
+    (out.iter())
+        .filter(|(_, m)| m[0] == 0xd0 && m[1] >> 4 == strip)
+        .map(|(_, m)| m[1] & 0x0f)
+        .collect()
+}
+
+#[test]
+fn a_strip_meter_shows_the_peak_on_7_leds_again_on_every_frame() {
+    let mut e = ducking();
+    let mut s = Surface::new(units(1), None);
+    // -20 dBFS is 0.48 of the console's scale: 3 of 7 LEDs, level 5.
+    peak(&mut e, -20.0, 0);
+    let out = s.render(&e, 0);
+    assert_eq!(
+        meter_of(&out, 0),
+        vec![15, 5],
+        "the overload off, then the level"
+    );
+    // Strips past the last channel: off once.
+    assert_eq!(meter_of(&out, 1), vec![15, 0]);
+    assert!(meter_of(&s.render(&e, 10), 0).is_empty(), "no new frame");
+    peak(&mut e, -20.0, 40);
+    assert_eq!(
+        meter_of(&s.render(&e, 40), 0),
+        vec![5],
+        "the X-Touch lets it fall"
+    );
+    assert!(
+        meter_of(&s.render(&e, 40), 1).is_empty(),
+        "silence goes out once"
+    );
+    // A frame older than 3 meter periods: silence, once.
+    assert_eq!(meter_of(&s.render(&e, 160), 0), vec![0]);
+    assert!(meter_of(&s.render(&e, 200), 0).is_empty());
+}
+
+#[test]
+fn the_overload_lights_in_the_top_db_only_and_goes_before_the_level() {
+    let mut e = ducking();
+    let mut s = Surface::new(units(1), None);
+    peak(&mut e, -20.0, 0);
+    s.render(&e, 0);
+    // Loud, as high as the console's red zone, and not clipping: no CLIP.
+    peak(&mut e, -1.0, 40);
+    assert_eq!(meter_of(&s.render(&e, 40), 0), vec![11]);
+    peak(&mut e, -0.5, 80);
+    assert_eq!(meter_of(&s.render(&e, 80), 0), vec![14, 14]);
+    peak(&mut e, -0.5, 120);
+    assert_eq!(
+        meter_of(&s.render(&e, 120), 0),
+        vec![14],
+        "the overload goes out once"
+    );
+    peak(&mut e, -20.0, 160);
+    assert_eq!(meter_of(&s.render(&e, 160), 0), vec![15, 5]);
+}
+
+#[test]
+fn the_meter_scale_is_the_consoles() {
+    // web/src/lib/meters/ballistics.ts METER_SCALE, which the console
+    // draws its meters on: a change there must reach the surface too.
+    let ts = include_str!("../../../web/src/lib/meters/ballistics.ts");
+    let body = &ts[ts.find("METER_SCALE").expect("METER_SCALE")..];
+    let body = &body[..body.find("];").expect("its end")];
+    let pairs: Vec<(f64, f64)> = (body.lines().map(str::trim))
+        .filter_map(|l| l.strip_prefix('[')?.strip_suffix("],"))
+        .map(|p| {
+            let (db, at) = p.split_once(',').expect("a pair");
+            (db.trim().parse().unwrap(), at.trim().parse().unwrap())
+        })
+        .collect();
+    assert_eq!(pairs, METER_SCALE.to_vec());
+}
+
+/// A live engine on `n` mono channels ch1 to chN.
+fn channels(n: usize) -> Engine {
+    let ids: Vec<Value> = (1..=n)
+        .map(|i| json!({ "id": format!("ch{i}"), "name": format!("Ch {i}"), "width": 1 }))
+        .collect();
+    let state: serde_json::Map<String, Value> = (1..=n)
+        .map(|i| {
+            (
+                format!("ch{i}"),
+                json!({ "fader": -90, "mute": false, "solo": "off" }),
+            )
+        })
+        .collect();
+    let snapshot = json!({ "type": "snapshot", "replica": { "id": "r1", "role": "leader" },
+        "you": {}, "epoch": "1", "revision": 5,
+        "shape": { "channels": ids, "buses": [] },
+        "state": { "channels": state, "consoles": [] }, "owners": {} });
+    let mut e = engine(1);
+    e.start(0);
+    e.opened(1, 0);
+    e.received(1, &snapshot.to_string(), 0);
+    e.take_actions();
+    e.take_events();
+    e
+}
+
+/// A meter frame with these channel peaks, dBFS, the first channels first.
+fn peaks(e: &mut Engine, dbfs: &[f64], now: u64) {
+    let layout = Layout::of(&e.mirror().shape).expect("a layout");
+    let cents: Vec<i16> = dbfs.iter().map(|d| (d * 100.0) as i16).collect();
+    e.binary(1, &layout.frame_with(&cents, &[]), now);
+}
+
+#[test]
+fn strip_meters_follow_the_bank_and_an_extenders_offset() {
+    let mut e = channels(10);
+    let mut s = Surface::new(units(2), None);
+    // ch1 -45, ch2 -20, ch9 -12, ch10 -7 dBFS.
+    let frame = [
+        -45.0, -20.0, -60.0, -60.0, -60.0, -60.0, -60.0, -60.0, -12.0, -7.0,
+    ];
+    peaks(&mut e, &frame, 0);
+    let out = s.render(&e, 0);
+    let on = |out: &[(usize, Vec<u8>)], unit: usize, strip: u8| -> Vec<u8> {
+        meter_of(
+            &out.iter()
+                .filter(|(u, _)| *u == unit)
+                .cloned()
+                .collect::<Vec<_>>(),
+            strip,
+        )
+    };
+    assert_eq!(on(&out, 0, 0), vec![15, 0], "-45 dBFS lights none");
+    assert_eq!(on(&out, 0, 1), vec![15, 5]);
+    assert_eq!(
+        on(&out, 1, 0),
+        vec![15, 7],
+        "the Extender's first strip is ch9"
+    );
+    assert_eq!(on(&out, 1, 1), vec![15, 9]);
+    // CHANNEL right: every strip shows the next channel.
+    key(&mut s, &mut e, 49, true, 10);
+    peaks(&mut e, &frame, 40);
+    let out = s.render(&e, 40);
+    assert_eq!(on(&out, 0, 0), vec![5]);
+    assert_eq!(on(&out, 1, 0), vec![9]);
+    assert_eq!(on(&out, 1, 1), vec![0], "past the last channel");
+}
+
+#[test]
+fn a_stale_frame_while_clipping_turns_the_overload_off_and_the_meter_dark() {
+    let mut e = ducking();
+    let mut s = Surface::new(units(1), None);
+    peak(&mut e, -0.5, 0);
+    assert_eq!(meter_of(&s.render(&e, 0), 0), vec![14, 14]);
+    assert_eq!(meter_of(&s.render(&e, FRAME_STALE_MS), 0), vec![15, 0]);
+}
+
+/// A live engine answered as principal `ben`.
+fn signed_in() -> Engine {
+    let mut snapshot: Value =
+        serde_json::from_str(&crate::engine::tests::snapshot("r1", 5)).unwrap();
+    snapshot["you"] = json!({ "principal": "ben", "kind": "console", "connection": "c1" });
+    let mut e = engine(1);
+    e.start(0);
+    e.opened(1, 0);
+    e.received(1, &snapshot.to_string(), 0);
+    e.take_actions();
+    e.take_events();
+    e
+}
+
+fn screen(principal: &str, handle: &str, kind: &str) -> Value {
+    json!({ "principal": principal, "handle": handle, "kind": kind, "connection": "c9" })
+}
+
+/// The primary reports `selections`; the surface sees the event.
+fn selections(s: &mut Surface, e: &mut Engine, list: Value) {
+    let m = json!({ "type": "selections", "replica": { "id": "r1", "role": "leader" }, "selections": list });
+    e.received(1, &m.to_string(), 0);
+    for ev in e.take_events() {
+        s.event(&ev, e, 0);
+    }
+}
+
+fn selects(actions: &[Action]) -> Vec<Value> {
+    sent(actions, 1)
+        .into_iter()
+        .filter(|m| m["type"] == "select")
+        .map(|m| m["element"].clone())
+        .collect()
+}
+
+fn select_led(s: &mut Surface, e: &Engine) -> Option<Led> {
+    (s.render(e, 0).into_iter())
+        .find(|(_, m)| m[0] == 0x90 && m[1] == Key::Select(0).note())
+        .map(|(_, m)| if m[2] == 0 { Led::Off } else { Led::On })
+}
+
+#[test]
+fn select_leds_follow_a_screen_of_the_same_principal_and_publish_nothing() {
+    let mut e = signed_in();
+    let mut s = Surface::new(units(1), None);
+    assert_eq!(select_led(&mut s, &e), Some(Led::Off));
+    let mine = screen("ben", "aaaaaaaaaaaaaaaaaaaaaa", "ui");
+    selections(
+        &mut s,
+        &mut e,
+        json!([{ "session": mine, "element": "ch1" }]),
+    );
+    assert_eq!(select_led(&mut s, &e), Some(Led::On));
+    // Gone from the list, its panel closed or the screen left: dark.
+    selections(&mut s, &mut e, json!([]));
+    assert_eq!(select_led(&mut s, &e), Some(Led::Off));
+    // A bus is on no strip: every SELECT LED stays dark.
+    selections(
+        &mut s,
+        &mut e,
+        json!([{ "session": mine, "element": "pgm" }]),
+    );
+    assert_eq!(
+        select_led(&mut s, &e),
+        None,
+        "nothing changed on the surface"
+    );
+    // Following publishes nothing, so no other screen follows through it.
+    assert!(selects(&e.take_actions()).is_empty());
+    // Other principals and other surfaces are not followed.
+    let list = json!([
+        { "session": screen("ana", "bbbbbbbbbbbbbbbbbbbbbb", "ui"), "element": "ch1" },
+        { "session": screen("ben", "cccccccccccccccccccccc", "console"), "element": "ch1" },
+        { "session": mine, "element": "pgm" },
+    ]);
+    selections(&mut s, &mut e, list);
+    assert_eq!(select_led(&mut s, &e), None);
+}
+
+#[test]
+fn select_publishes_a_press_and_a_screen_following_it_changes_nothing() {
+    let mut e = signed_in();
+    let mut s = Surface::new(units(1), None);
+    key(&mut s, &mut e, 24, true, 0);
+    assert_eq!(selects(&e.take_actions()), vec![json!("ch1")]);
+    let mine = screen("ben", "aaaaaaaaaaaaaaaaaaaaaa", "ui");
+    selections(
+        &mut s,
+        &mut e,
+        json!([{ "session": mine, "element": "ch1" }]),
+    );
+    assert!(selects(&e.take_actions()).is_empty());
+    assert_eq!(select_led(&mut s, &e), Some(Led::On));
+    // Again on the channel it published: it lets it go.
+    key(&mut s, &mut e, 24, true, 1);
+    assert_eq!(selects(&e.take_actions()), vec![Value::Null]);
+    // A screen moves on: the LEDs follow, and the press it published
+    // before no longer stands. A press on the strip the screen lit
+    // publishes it rather than letting go.
+    key(&mut s, &mut e, 24, true, 2);
+    e.take_actions();
+    selections(
+        &mut s,
+        &mut e,
+        json!([{ "session": mine, "element": "pgm" }]),
+    );
+    assert_eq!(selects(&e.take_actions()), vec![Value::Null]);
+    selections(
+        &mut s,
+        &mut e,
+        json!([{ "session": mine, "element": "ch1" }]),
+    );
+    assert!(selects(&e.take_actions()).is_empty());
+    key(&mut s, &mut e, 24, true, 3);
+    assert_eq!(selects(&e.take_actions()), vec![json!("ch1")]);
+}
+
+#[test]
+fn select_takes_the_screen_that_moved_not_one_that_follows_late() {
+    let mut e = signed_in();
+    let mut s = Surface::new(units(1), None);
+    // b sorts first, so its change is met first.
+    let a = screen("ben", "cccccccccccccccccccccc", "ui");
+    let b = screen("ben", "aaaaaaaaaaaaaaaaaaaaaa", "ui");
+    key(&mut s, &mut e, 24, true, 0);
+    assert_eq!(select_led(&mut s, &e), Some(Led::On));
+    // In one message: screen a moved to pgm, and screen b, before it had
+    // seen that, followed the surface's press to ch1. The surface takes
+    // a: pgm is on no strip, so strip 1 goes dark.
+    selections(
+        &mut s,
+        &mut e,
+        json!([{ "session": a, "element": "pgm" }, { "session": b, "element": "ch1" }]),
+    );
+    assert_eq!(select_led(&mut s, &e), Some(Led::Off));
+    selections(
+        &mut s,
+        &mut e,
+        json!([{ "session": a, "element": "pgm" }, { "session": b, "element": "pgm" }]),
+    );
+    assert_eq!(select_led(&mut s, &e), None, "b following changes nothing");
+}
+
+#[test]
+fn select_waits_for_the_principal() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    assert_eq!(select_led(&mut s, &e), Some(Led::Off));
+    let mine = screen("anonymous", "aaaaaaaaaaaaaaaaaaaaaa", "ui");
+    selections(
+        &mut s,
+        &mut e,
+        json!([{ "session": mine, "element": "ch1" }]),
+    );
+    assert_eq!(select_led(&mut s, &e), None, "the snapshot named nobody");
 }

@@ -26,9 +26,12 @@ pub const STALE_TOUCH_MS: u64 = 1500;
 /// A duck key let go sooner than this after its press was a tap, as the
 /// web UI's talk key tells a tap from a hold.
 pub const LATCH_MS: u64 = 300;
-/// A duck reading older than this, 3 meter periods of 40 ms, no longer
-/// lights a duck key.
-pub const DUCK_STALE_MS: u64 = 120;
+/// A meter frame older than this, 3 meter periods of 40 ms, no longer
+/// lights a duck key or a strip's meter.
+pub const FRAME_STALE_MS: u64 = 120;
+/// A peak above this lights CLIP: the top 1 dB of the digital scale,
+/// close to clipping.
+pub const CLIP_DBFS: f64 = -1.0;
 /// The pan one V-Pot detent moves: 100 detents from full left to full
 /// right.
 pub const POT_STEP: f64 = 0.02;
@@ -132,6 +135,10 @@ struct Shown {
     moved_at: [Option<u64>; 9],
     leds: HashMap<u8, Led>,
     rings: [Option<u8>; 8],
+    meters: [Option<u8>; 8],
+    clips: [Option<bool>; 8],
+    /// The meter frame the levels were last sent for.
+    meter_frame: Option<u64>,
     /// 16 cells: 8 per line.
     cells: [Option<String>; 16],
 }
@@ -155,6 +162,9 @@ pub struct Surface {
     /// The master fader's control; else the program bus's fader.
     master: Option<String>,
     selected: Option<String>,
+    /// What each screen of this bridge's principal has selected, by
+    /// handle, as the last `selections` said.
+    screens: BTreeMap<String, String>,
     /// Duck keys of their own; else F1 to F8.
     keys: Option<DuckKeys>,
 }
@@ -191,6 +201,7 @@ impl Surface {
             bank: 0,
             master,
             selected: None,
+            screens: BTreeMap::new(),
             keys: None,
         }
     }
@@ -577,9 +588,11 @@ impl Surface {
                     engine.set(&path, json!(if off { "pfl" } else { "off" }), now);
                 }
             }
+            // Selects the strip's channel for the screens to follow; again on
+            // the channel it published, it lets that go.
             Key::Select(s) => {
                 if let Some(c) = strip_channel(s) {
-                    self.selected = (self.selected.as_deref() != Some(c.as_str())).then_some(c);
+                    self.selected = (engine.selection() != Some(c.as_str())).then_some(c);
                     engine.select(self.selected.as_deref());
                 }
             }
@@ -646,7 +659,40 @@ impl Surface {
             Event::Requested { path, from } => {
                 tracing::info!(path, from = %short_name(from), "asked to give up a control");
             }
+            Event::Selections(list) => self.follow(list, engine),
             Event::Error(e) => tracing::warn!("{e}"),
+        }
+    }
+
+    /// Shows on the SELECT LEDs what a screen signed in as this bridge's
+    /// principal selected last, dark once that screen's selection is gone,
+    /// its panel closed or the screen left.
+    fn follow(&mut self, list: &Value, engine: &mut Engine) {
+        let Some(me) = engine.principal() else { return };
+        let screens: BTreeMap<String, String> = (list.as_array().into_iter().flatten())
+            .filter(|s| s["session"]["kind"] == "ui" && s["session"]["principal"] == me)
+            .filter_map(|s| {
+                Some((
+                    s["session"]["handle"].as_str()?.to_owned(),
+                    s["element"].as_str()?.to_owned(),
+                ))
+            })
+            .collect();
+        // A screen that changed to what the LEDs show followed a SELECT
+        // press; one that moved elsewhere in the same message is taken.
+        let changed = (screens.keys().chain(self.screens.keys())).find_map(|h| {
+            let now = screens.get(h).cloned();
+            (now != self.screens.get(h).cloned() && now != self.selected).then_some(now)
+        });
+        self.screens = screens;
+        if let Some(element) = changed {
+            self.selected = element;
+            // The LEDs follow; the surface publishes a selection of its own
+            // only on a SELECT press, so no screen drives another through
+            // it, and one it published before no longer stands.
+            if engine.selection().is_some() {
+                engine.select(None);
+            }
         }
     }
 
@@ -724,7 +770,7 @@ impl Surface {
         let mut out = Vec::new();
         for i in 0..self.units.len() {
             let view: Vec<StripView> = (0..=mcu::MASTER)
-                .map(|s| self.strip_view(engine, i, s))
+                .map(|s| self.strip_view(engine, i, s, now))
                 .collect();
             let duck_leds: Vec<(u8, Led)> = (self.duck_notes(i).into_iter())
                 .map(|note| {
@@ -752,6 +798,20 @@ impl Surface {
                     continue;
                 }
                 let s8 = s as u8;
+                // The overload goes out on crossing CLIP_DBFS either way,
+                // before the level; a level goes out on every new meter
+                // frame, as an X-Touch lets it fall, silence once.
+                if u.shown.clips[s] != Some(v.clip) {
+                    out.push((i, mcu::meter_clip(s8, v.clip)));
+                    u.shown.clips[s] = Some(v.clip);
+                }
+                let frame = engine.peaks().frames;
+                if u.shown.meters[s] != Some(v.meter)
+                    || (u.shown.meter_frame != Some(frame) && v.meter > 0)
+                {
+                    out.push((i, mcu::meter(s8, v.meter)));
+                    u.shown.meters[s] = Some(v.meter);
+                }
                 if u.shown.rings[s] != Some(v.ring) {
                     out.push((i, mcu::ring(s8, v.ring)));
                     u.shown.rings[s] = Some(v.ring);
@@ -784,6 +844,7 @@ impl Surface {
                     }
                 }
             }
+            u.shown.meter_frame = Some(engine.peaks().frames);
             for (note, led) in duck_leds {
                 if u.shown.leds.get(&note) != Some(&led) {
                     out.push((i, mcu::led(Key::from_note(note), led)));
@@ -827,13 +888,15 @@ impl Surface {
             .collect()
     }
 
-    fn strip_view(&self, engine: &Engine, unit: usize, strip: u8) -> StripView {
+    fn strip_view(&self, engine: &Engine, unit: usize, strip: u8, now: u64) -> StripView {
         let blank = StripView {
             fader: 0,
             mute: Led::Off,
             solo: Led::Off,
             select: Led::Off,
             ring: 0,
+            meter: 0,
+            clip: false,
             name: mcu::cell(""),
             value: mcu::cell(""),
         };
@@ -865,7 +928,17 @@ impl Surface {
                 .cloned()
         };
         let on = |b: bool| if b { Led::On } else { Led::Off };
+        // The peak of a frame no older than 3 meter periods: its height on
+        // the console's meter scale, CLIP close to clipping.
+        let peaks = engine.peaks();
+        let index = self.bank + self.units[unit].offset + usize::from(strip);
+        let peak = (now < peaks.at + FRAME_STALE_MS)
+            .then(|| peaks.dbfs.get(index).copied())
+            .flatten();
+        let clip = peak.is_some_and(|p| p > CLIP_DBFS);
         StripView {
+            meter: peak.map_or(0, |p| mcu::meter_level(meter_position(p), clip)),
+            clip,
             fader: taper::db_to_fader(db),
             mute: on(at("mute") == Some(json!(true))),
             solo: on(at("solo").is_some_and(|s| s != "off")),
@@ -881,14 +954,43 @@ impl Surface {
     }
 }
 
+/// The console's meter scale (web/src/lib/meters/ballistics.ts
+/// `METER_SCALE`) as dBFS and height pairs: finest between -20 dBFS and
+/// full scale.
+const METER_SCALE: [(f64, f64); 8] = [
+    (-60.0, 0.0),
+    (-50.0, 0.07),
+    (-40.0, 0.16),
+    (-30.0, 0.3),
+    (-20.0, 0.48),
+    (-10.0, 0.7),
+    (-6.0, 0.8),
+    (0.0, 1.0),
+];
+
+/// The height 0 to 1 of `db` on the console's meter scale.
+fn meter_position(db: f64) -> f64 {
+    let pairs = METER_SCALE.windows(2);
+    if db <= METER_SCALE[0].0 {
+        return 0.0;
+    }
+    for w in pairs {
+        let ((a_db, a), (b_db, b)) = (w[0], w[1]);
+        if db <= b_db {
+            return a + (db - a_db) / (b_db - a_db) * (b - a);
+        }
+    }
+    1.0
+}
+
 /// A duck key's LED: on while the group is held or latched in, blinking
 /// while it is bypassed (`mode` `off`) and not held, on while it ducks its
-/// targets by a meter frame younger than `DUCK_STALE_MS`, else off.
+/// targets by a meter frame younger than `FRAME_STALE_MS`, else off.
 fn duck_led(engine: &Engine, duck: &str, now: u64) -> Led {
     let at = |leaf: &str| engine.display(&format!("/ducks/{duck}/{leaf}")).cloned();
     let ducking = engine
         .duck(duck)
-        .is_some_and(|d| d.envelope > 0.0 && now < d.at + DUCK_STALE_MS);
+        .is_some_and(|d| d.envelope > 0.0 && now < d.at + FRAME_STALE_MS);
     if at("hold") == Some(json!(true)) || at("mode") == Some(json!("on")) {
         Led::On
     } else if at("mode") == Some(json!("off")) {
@@ -907,6 +1009,10 @@ struct StripView {
     select: Led,
     /// The V-Pot ring's [`mcu::ring_value`].
     ring: u8,
+    /// The meter's [`mcu::meter_level`], and whether the peak is above
+    /// [`CLIP_DBFS`].
+    meter: u8,
+    clip: bool,
     name: String,
     value: String,
 }

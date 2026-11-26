@@ -4,7 +4,7 @@
 //! reconnecting; commands with ids and seqs, sent again after a 503 or a
 //! failover and dropped 3 s after they were issued; continuous writes
 //! coalesced to 50 per second; meter credits on the primary, whose
-//! frames' duck section is kept. Deadlines follow the measured round trip
+//! frames' channel peaks and duck section are kept. Deadlines follow the measured round trip
 //! as the web client's sync engine sizes them
 //! (web/src/lib/sync/engine.ts).
 //!
@@ -96,6 +96,9 @@ pub enum Event {
     Requested { path: String, from: Value },
     /// A refusal or failure that concerns no control of a strip.
     Error(String),
+    /// What every session has selected, from the primary: entries of
+    /// `session` (an owner record) and `element`.
+    Selections(Value),
 }
 
 /// Round-trip time estimate, as TCP keeps it (RFC 6298).
@@ -231,6 +234,17 @@ struct Entry {
     sent_in: u64,
 }
 
+/// The channels' peaks of a meter frame.
+#[derive(Debug, Default, Clone)]
+pub struct Peaks {
+    /// dBFS per channel, in shape order.
+    pub dbfs: Vec<f64>,
+    /// When the frame arrived.
+    pub at: u64,
+    /// Frames read so far: a new one is a new reading.
+    pub frames: u64,
+}
+
 /// A duck group's latest reading from a meter frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Duck {
@@ -283,6 +297,8 @@ pub struct Engine {
     /// Values written and not yet answered.
     local: BTreeMap<String, Value>,
     selection: Option<String>,
+    /// The principal the primary connection was answered as.
+    principal: Option<String>,
     consoles: BTreeMap<String, Console>,
     /// Registrations refused with 409 in a row, and when they go out again.
     console_refusals: u32,
@@ -294,6 +310,8 @@ pub struct Engine {
     /// Meter frames the primary may still send.
     credits: u32,
     ducks: BTreeMap<String, Duck>,
+    /// The channels' peaks of the last meter frame, in shape order.
+    peaks: Peaks,
     actions: Vec<Action>,
     events: Vec<Event>,
     ids: Box<dyn FnMut() -> String + Send>,
@@ -341,6 +359,7 @@ impl Engine {
             last_write: BTreeMap::new(),
             local: BTreeMap::new(),
             selection: None,
+            principal: None,
             consoles: BTreeMap::new(),
             console_refusals: 0,
             console_retry_at: None,
@@ -348,6 +367,7 @@ impl Engine {
             layout_resync_sent: false,
             credits: 0,
             ducks: BTreeMap::new(),
+            peaks: Peaks::default(),
             actions: Vec::new(),
             events: Vec::new(),
             ids,
@@ -373,6 +393,16 @@ impl Engine {
 
     pub fn handle(&self) -> &str {
         &self.handle
+    }
+
+    /// Who this session is signed in as, once the primary answered.
+    pub fn principal(&self) -> Option<&str> {
+        self.principal.as_deref()
+    }
+
+    /// The element this session has selected.
+    pub fn selection(&self) -> Option<&str> {
+        self.selection.as_deref()
     }
 
     /// Whether commands go out.
@@ -404,6 +434,11 @@ impl Engine {
     /// Duck group `id`'s latest reading, when a meter frame carried one.
     pub fn duck(&self, id: &str) -> Option<&Duck> {
         self.ducks.get(id)
+    }
+
+    /// The channels' peaks of the last meter frame.
+    pub fn peaks(&self) -> &Peaks {
+        &self.peaks
     }
 
     /// Whether a touch of `path` is waiting for its answer.
@@ -776,9 +811,9 @@ impl Engine {
         }
         self.credits = self.credits.saturating_sub(1);
         if let Some(layout) = &self.layout {
-            match layout.ducks(frame) {
-                Ok(readings) => {
-                    for (id, m) in layout.ducks.iter().zip(readings) {
+            match layout.read(frame) {
+                Ok(reading) => {
+                    for (id, m) in layout.ducks.iter().zip(reading.ducks) {
                         let duck = Duck {
                             envelope: m.envelope,
                             engaged: m.engaged,
@@ -786,6 +821,11 @@ impl Engine {
                         };
                         self.ducks.insert(id.clone(), duck);
                     }
+                    self.peaks = Peaks {
+                        dbfs: reading.peaks,
+                        at: now,
+                        frames: self.peaks.frames.wrapping_add(1),
+                    };
                 }
                 Err(Mismatch::Fingerprint)
                     if self.sync == Sync::Live && !self.layout_resync_sent =>
@@ -800,11 +840,10 @@ impl Engine {
     }
 
     /// Tops the primary's meter credits up to the cap once half are used,
-    /// while it is live on a shape with duck groups: the bridge reads
-    /// meter frames for their duck section only.
+    /// while it is live: the bridge reads meter frames for the strips'
+    /// meters and the duck keys.
     fn grant_credits(&mut self) {
-        let ducks = self.layout.as_ref().is_some_and(|l| !l.ducks.is_empty());
-        if self.sync != Sync::Live || !ducks || self.credits > CREDIT_REFILL_AT {
+        if self.sync != Sync::Live || self.layout.is_none() || self.credits > CREDIT_REFILL_AT {
             return;
         }
         let Some(p) = self.primary().filter(|p| p.opened).map(|p| p.id) else {
@@ -878,6 +917,10 @@ impl Engine {
                 self.send(link, &json!({ "type": "resync" }));
                 self.sync_by = Some(now + self.sync_timeout());
             }
+            "selections" if role == Role::Primary => {
+                self.events
+                    .push(Event::Selections(msg["selections"].clone()));
+            }
             "controlRequest" if role == Role::Primary => {
                 if let Some(path) = msg["path"].as_str() {
                     self.events.push(Event::Requested {
@@ -891,6 +934,7 @@ impl Engine {
     }
 
     fn primary_snapshot(&mut self, msg: &Value, now: u64) {
+        self.principal = msg["you"]["principal"].as_str().map(str::to_owned);
         let other_history =
             self.mirror.ready() && msg["epoch"].as_str() != self.mirror.epoch.as_deref();
         let older = self.mirror.ready()
@@ -927,6 +971,7 @@ impl Engine {
     }
 
     fn primary_resume(&mut self, msg: &Value, now: u64) {
+        self.principal = msg["you"]["principal"].as_str().map(str::to_owned);
         if !self.mirror.ready() || msg["epoch"].as_str() != self.mirror.epoch.as_deref() {
             return self.resync(true, now);
         }
@@ -968,11 +1013,10 @@ impl Engine {
         self.offline_rounds = 0;
         self.sync_timeouts = 0;
         self.events.push(Event::Synced);
-        if let Some(p) = self.primary().map(|p| p.id)
-            && let Some(element) = self.selection.clone()
-        {
-            self.send(p, &json!({ "type": "select", "element": element }));
-        }
+        // A selection is a SELECT press screens follow once: it lapses
+        // with its connection, so a reconnect never replays it over what
+        // a screen selected since.
+        self.selection = None;
         for c in self.consoles.values_mut() {
             c.sent = None;
             c.last = None;

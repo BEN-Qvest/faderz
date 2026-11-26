@@ -78,6 +78,21 @@ export class MixerStore {
   notices = $state<Notice[]>([]);
   /** What every session has selected, this one included. */
   selections = $state.raw<Selection[]>([]);
+  /**
+   * The latest element a control surface signed in as this screen's
+   * principal selected with its SELECT key: the screen opens its panel.
+   * A new object per selection; a surface dropping or leaving its
+   * selection closes nothing.
+   */
+  surfaceSelect = $state.raw<{ element: string } | null>(null);
+  /**
+   * FOLLOW on this screen: its strips follow the first surface's bank and,
+   * while every session is anonymous, its panel follows surfaces' SELECT.
+   * Off by default.
+   */
+  follow = $state(false);
+  /** What each such surface had selected, by handle, at the last selections. */
+  private surfaces = new Map<string, string>();
   /** The sessions connected to the primary's replica, this one included. */
   presence = $state.raw<PresentSession[]>([]);
   /** Page time (Date.now()) when the worker last reported a failover. */
@@ -225,6 +240,17 @@ export class MixerStore {
     return true;
   }
 
+  /** Notes the change of a surface's selection that `surfaceSelect` carries. */
+  private followSurfaces(list: Selection[]): void {
+    const you = this.status.you;
+    if (!you) return;
+    const now = new Map(list.filter((s) => s.session.kind === 'console' && s.session.principal === you.principal).map((s) => [s.session.handle, s.element]));
+    const changed = [...now].find(([h, element]) => this.surfaces.get(h) !== element);
+    this.surfaces = now;
+    // While every session is anonymous, everyone in the room is the same user: then only with FOLLOW on.
+    if (changed && (this.follow || you.principal !== 'anonymous')) this.surfaceSelect = { element: changed[1] };
+  }
+
   /** Tells other screens what this one has selected; not a write, so sent while locked too. */
   select(element: string | null): void {
     this.post({ type: 'select', element });
@@ -335,7 +361,10 @@ export class MixerStore {
       this.loudnessHealth = Object.fromEntries((p.counters.loudness ?? []).map((l) => [l.id, l]));
       this.countersReplica = p.counters.replica;
     }
-    if (p.selections) this.selections = p.selections;
+    if (p.selections) {
+      this.selections = p.selections;
+      this.followSurfaces(p.selections);
+    }
     if (p.presence) this.presence = p.presence;
     for (const n of p.notices ?? []) {
       if (n.kind === 'request') {

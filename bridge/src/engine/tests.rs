@@ -347,7 +347,7 @@ fn a_handover_moves_the_session_to_a_new_connection_on_the_same_replica() {
 }
 
 #[test]
-fn consoles_and_the_selection_go_out_after_every_sync_and_on_change() {
+fn consoles_go_out_after_every_sync_and_a_selection_lapses_with_its_connection() {
     let mut e = live(1);
     let console = |bank: u64| {
         json!({ "type": "console", "id": "xt", "name": "X-Touch",
@@ -366,7 +366,7 @@ fn consoles_and_the_selection_go_out_after_every_sync_and_on_change() {
         .filter(|m| m["type"] == "console")
         .collect();
     assert_eq!(out, vec![console(16)]);
-    // A new connection gets both again.
+    // A new connection gets the consoles again, never the selection.
     e.closed(1, 200);
     e.tick(1000);
     let link = e.primary().unwrap().id;
@@ -376,10 +376,8 @@ fn consoles_and_the_selection_go_out_after_every_sync_and_on_change() {
         .into_iter()
         .map(|m| m["type"].clone())
         .collect();
-    assert_eq!(
-        types,
-        vec![json!("hello"), json!("select"), json!("console")]
-    );
+    assert_eq!(types, vec![json!("hello"), json!("console")]);
+    assert_eq!(e.selection(), None);
 }
 
 #[test]
@@ -531,14 +529,14 @@ fn meter_credits_go_to_the_primary_topped_up_once_half_are_used() {
         credits(&e.take_actions(), sb),
         vec![json!(METER_CREDIT_CAP)]
     );
-    // A shape without duck groups: the bridge reads no meter frames.
+    // A shape without duck groups: the strips' meters read every frame.
     let mut shape = crate::meters::tests::shape();
     shape["ducks"] = json!([]);
     let mut e = engine(1);
     e.start(0);
     e.opened(1, 0);
     e.received(1, &meter_snapshot("r1", 5, shape), 0);
-    assert!(credits(&e.take_actions(), 1).is_empty());
+    assert_eq!(credits(&e.take_actions(), 1), vec![json!(METER_CREDIT_CAP)]);
 }
 
 #[test]
@@ -557,6 +555,8 @@ fn a_meter_frame_keeps_the_duck_readings_and_another_layout_asks_once() {
         at: 40,
     };
     assert_eq!(e.duck("comm"), Some(&read));
+    assert_eq!(e.peaks().dbfs, vec![-6.5]);
+    assert_eq!((e.peaks().at, e.peaks().frames), (40, 1));
     // Of another length: dropped.
     e.binary(1, &frame[..frame.len() - 2], 80);
     assert_eq!(e.duck("comm"), Some(&read));
