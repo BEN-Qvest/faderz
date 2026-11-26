@@ -141,6 +141,7 @@ struct Shown {
     meter_frame: Option<u64>,
     /// 16 cells: 8 per line.
     cells: [Option<String>; 16],
+    timecode: [Option<(u8, bool)>; mcu::TIMECODE_DIGITS],
 }
 
 struct Unit {
@@ -167,6 +168,10 @@ pub struct Surface {
     screens: BTreeMap<String, String>,
     /// Duck keys of their own; else F1 to F8.
     keys: Option<DuckKeys>,
+    /// Minutes east of UTC of the time of day on the timecode display.
+    clock_offset: i32,
+    /// The wall clock, Unix seconds, once the driver has set it.
+    time: Option<u64>,
 }
 
 /// A short name for the holder of a control: its principal, or its kind
@@ -203,7 +208,21 @@ impl Surface {
             selected: None,
             screens: BTreeMap::new(),
             keys: None,
+            clock_offset: 0,
+            time: None,
         }
+    }
+
+    /// Shows the time of day `offset` minutes east of UTC on the X-Touch's
+    /// timecode display.
+    pub fn with_clock(mut self, offset: i32) -> Surface {
+        self.clock_offset = offset;
+        self
+    }
+
+    /// The wall clock, Unix seconds, for the timecode display.
+    pub fn set_time(&mut self, unix: u64) {
+        self.time = Some(unix);
     }
 
     /// Binds the X-Touch's duck keys by `keys` instead of F1 to F8.
@@ -845,6 +864,17 @@ impl Surface {
                 }
             }
             u.shown.meter_frame = Some(engine.peaks().frames);
+            if u.spec.device == Device::Main
+                && let Some(unix) = self.time
+            {
+                let digits = mcu::clock_digits(unix, self.clock_offset);
+                for (p, &(ch, dot)) in digits.iter().enumerate() {
+                    if u.shown.timecode[p] != Some((ch, dot)) {
+                        out.push((i, mcu::timecode_digit(p as u8, ch, dot)));
+                        u.shown.timecode[p] = Some((ch, dot));
+                    }
+                }
+            }
             for (note, led) in duck_leds {
                 if u.shown.leds.get(&note) != Some(&led) {
                     out.push((i, mcu::led(Key::from_note(note), led)));

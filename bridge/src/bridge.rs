@@ -43,6 +43,8 @@ pub struct Options {
     pub master: Option<String>,
     /// Duck keys of their own instead of F1 to F8.
     pub keys: Option<DuckKeys>,
+    /// Minutes east of UTC of the time of day an X-Touch shows.
+    pub clock_offset: i32,
     /// A message here says the credentials changed: the session moves to
     /// a connection opened with the new ones.
     pub renewed: Option<UnboundedReceiver<()>>,
@@ -170,7 +172,9 @@ pub async fn run(options: Options, ports: Vec<Port>, shutdown: impl Future<Outpu
         seq_base,
         Box::new(crate::session::uuid),
     );
-    let mut surface = Surface::new(options.units, options.master).with_keys(options.keys);
+    let mut surface = Surface::new(options.units, options.master)
+        .with_keys(options.keys)
+        .with_clock(options.clock_offset);
     let tls = tls();
     let (net_tx, mut net_rx) = unbounded_channel::<Net>();
     let mut links: HashMap<LinkId, UnboundedSender<String>> = HashMap::new();
@@ -243,6 +247,9 @@ pub async fn run(options: Options, ports: Vec<Port>, shutdown: impl Future<Outpu
             }
         }
         let t = now();
+        if let Ok(unix) = SystemTime::now().duration_since(UNIX_EPOCH) {
+            surface.set_time(unix.as_secs());
+        }
         for (unit, message) in surface.render(&engine, t) {
             let _ = outputs[unit].send(message);
         }

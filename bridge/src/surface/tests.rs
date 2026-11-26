@@ -1390,3 +1390,34 @@ fn select_waits_for_the_principal() {
     );
     assert_eq!(select_led(&mut s, &e), None, "the snapshot named nobody");
 }
+
+#[test]
+fn the_x_touch_shows_the_time_of_day_and_sends_only_the_digits_that_change() {
+    let e = live(1);
+    let mut s = Surface::new(units(2), None).with_clock(60);
+    let timecode = |out: &[(usize, Vec<u8>)], unit: usize| -> Vec<Vec<u8>> {
+        (out.iter())
+            .filter(|(u, m)| *u == unit && m[0] == 0xb0 && (0x40..0x4a).contains(&m[1]))
+            .map(|(_, m)| m.clone())
+            .collect()
+    };
+    assert!(
+        timecode(&s.render(&e, 0), 0).is_empty(),
+        "no clock before the time is set"
+    );
+    // 09:05:07 UTC, 10:05:07 at +01:00.
+    s.set_time(1_795_683_907);
+    let out = s.render(&e, 1);
+    assert_eq!(timecode(&out, 0).len(), mcu::TIMECODE_DIGITS);
+    assert!(
+        timecode(&out, 1).is_empty(),
+        "an Extender has no timecode display"
+    );
+    assert!(out.contains(&(0, mcu::timecode_digit(8, b'1', false))));
+    assert!(out.contains(&(0, mcu::timecode_digit(7, b'0', true))));
+    s.set_time(1_795_683_908);
+    assert_eq!(
+        timecode(&s.render(&e, 2), 0),
+        vec![mcu::timecode_digit(3, b'8', false)]
+    );
+}
