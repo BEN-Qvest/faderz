@@ -3,6 +3,7 @@
 
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { SCRIBBLE_COLORS } from '../../src/lib/contract/types';
 
 const css = readFileSync(new URL('../../src/app.css', import.meta.url), 'utf8');
 
@@ -103,29 +104,40 @@ describe('channel colours', () => {
   const strip = readFileSync(new URL('../../src/components/ChannelStrip.svelte', import.meta.url), 'utf8');
   const fader = readFileSync(new URL('../../src/components/Fader.svelte', import.meta.url), 'utf8');
   const colours = [...strip.matchAll(/\.strip\[data-color='([a-z]+)'\] \{ --strip-color: (#[0-9a-f]{6}); \}/g)].map((m) => [m[1]!, m[2]!] as const);
-  const headInk = /\n  \.head \{[^}]*\n    color: (#[0-9a-f]{6});/.exec(strip)![1]!;
+  /** The text colour of the first rule of ChannelStrip.svelte with exactly this selector. */
+  const ink = (selector: string) => new RegExp(`\\n  ${selector.replace('.', '\\.')} \\{[^}]*\\n    color: (#[0-9a-f]{6});`).exec(strip)![1]!;
+  const inks = ['.head', '.no', '.source'].map((sel) => [sel, ink(sel)] as const);
   const headMix = Number(/var\(--strip-color, var\(--well\)\) (\d+)%, var\(--well\)/.exec(strip)![1]);
-  const capMix = Number(/color-mix\(in srgb, var\(--cap\) (\d+)%, \$\{tint\}\)/.exec(fader)![1]);
+  /** --cap-tint of a theme block of app.css. */
+  const capTint = (selector: string) => {
+    const at = css.indexOf(`${selector} {`);
+    return Number(/--cap-tint:\s*(\d+)%/.exec(css.slice(at, css.indexOf('}', at)))![1]);
+  };
   const capLine = /\n  \.cap span \{[^}]*background: (#[0-9a-f]{6});/.exec(fader)![1]!;
 
-  it('has the seven colours of the strip colour picker', () => {
-    expect(colours.map(([name]) => name)).toEqual(['red', 'orange', 'yellow', 'green', 'cyan', 'blue', 'purple']);
+  it('tints a fader cap by the --cap-tint of its theme', () => {
+    expect(fader).toContain('color-mix(in srgb, ${tint} var(--cap-tint), var(--cap))');
+  });
+
+  it('has a tint for every colour of the strip colour picker', () => {
+    expect(colours.map(([name]) => name)).toEqual(SCRIBBLE_COLORS.filter((c) => c !== 'none'));
   });
 
   describe.each([
-    ['dark', dark],
-    ['light', light],
-  ])('%s theme', (_, t) => {
-    it.each(colours)('a %s scribble strip stays dark: its text reads, selected or not', (_name, colour) => {
+    ['dark', dark, capTint(':root')],
+    ['light', light, capTint(":root[data-theme='light']")],
+  ])('%s theme', (_, t, tint) => {
+    it.each(colours)('a %s scribble strip stays dark: its name, number and source read', (_name, colour) => {
       const head = mix(colour, headMix, t['well']!);
-      expect(contrast(headInk, head)).toBeGreaterThanOrEqual(4.5);
-      // Selected, the --on ring around it shows against the selected strip
-      // outside it or against the head inside it: in the light theme the
-      // strip, as for a plain head.
-      expect(Math.max(contrast(t['on']!, head), contrast(t['on']!, t['strip-sel']!))).toBeGreaterThanOrEqual(3);
+      for (const [, c] of inks) expect(contrast(c, head)).toBeGreaterThanOrEqual(4.5);
     });
+    it('a selected strip shows its --on ring against the strip around it, tinted or not', () => {
+      expect(contrast(t['on']!, t['strip-sel']!)).toBeGreaterThanOrEqual(3);
+    });
+    // Guards the colours, the cap token and the line's ink: on these caps
+    // no share of the colour would make the line less clear than on a plain one.
     it.each(colours)('a %s fader cap keeps its centre line as clear as a plain one', (_name, colour) => {
-      const face = mix(t['cap']!, capMix, colour);
+      const face = mix(colour, tint, t['cap']!);
       expect(contrast(capLine, face)).toBeGreaterThanOrEqual(Math.min(3, contrast(capLine, t['cap']!)));
     });
   });

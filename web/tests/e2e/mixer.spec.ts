@@ -1464,7 +1464,7 @@ test('shows the source under the channel name and colours the scribble strip fro
   const before = (await head.boundingBox())!.height;
   await head.click();
   await page.getByRole('radiogroup', { name: 'Guest 1 strip colour' }).getByRole('radio', { name: 'red' }).click();
-  await expect(head).toHaveAttribute('data-color', 'red');
+  await expect(page.locator('[data-channel="ch3"]')).toHaveAttribute('data-color', 'red');
   await expect.poll(async () => (await serverState(request)).state.channels['ch3']!.color).toBe('red');
   expect((await head.boundingBox())!.height).toBe(before);
   await page.getByRole('radiogroup', { name: 'Guest 1 strip colour' }).getByRole('radio', { name: 'No colour' }).click();
@@ -1500,6 +1500,8 @@ test('SELECT on a surface opens the panel on every following screen, and no scre
   await expect(guest1(second)).toBeVisible();
   await expect(guest2(page)).toBeVisible();
   await second.close();
+});
+
 test('tints the scribble strip and fader cap of a coloured channel, and the cap still shows who holds it', { tag: '@mock' }, async ({ page, baseURL }) => {
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await live(page);
@@ -1523,11 +1525,15 @@ test('tints the scribble strip and fader cap of a coloured channel, and the cap 
   const cap = blue.locator('.cap');
   const other = await RawClient.open(baseURL!);
   try {
-    // Held by another session: the --owned edge, as on a plain cap.
-    expect((await other.command({ type: 'touch', path: '/channels/ch1/fader' })).type).toBe('delta');
+    // Held by another session: the --owned edge and ring, as on a plain cap held the same way.
+    const plainCap = plain.locator('.cap');
+    for (const ch of ['ch1', 'ch4']) expect((await other.command({ type: 'touch', path: `/channels/${ch}/fader` })).type).toBe('delta');
     await expect(cap).toHaveClass(/foreign/);
+    await expect(plainCap).toHaveClass(/foreign/);
     const owned = await token('--owned');
     await expect.poll(() => style(cap, 'borderTopColor')).toBe(owned);
+    expect(await style(cap, 'boxShadow')).toBe(await style(plainCap, 'boxShadow'));
+    expect((await other.command({ type: 'release', path: '/channels/ch4/fader' })).type).toBe('delta');
     // A refused gesture flashes the --err ring over the tint.
     await dragFader(page, '/channels/ch1/fader', -40);
     await expect.poll(() => style(cap, 'boxShadow')).toContain(await token('--err'));
@@ -1535,17 +1541,22 @@ test('tints the scribble strip and fader cap of a coloured channel, and the cap 
   } finally {
     other.close();
   }
-  // Held here: the --on edge.
-  const at = await faderCenter(page, '/channels/ch1/fader');
-  await page.mouse.move(at.x, at.y);
-  await page.mouse.down();
-  try {
-    await expect(cap).toHaveClass(/mine/);
-    const on = await token('--on');
-    await expect.poll(() => style(cap, 'borderTopColor')).toBe(on);
-  } finally {
-    await page.mouse.up();
-  }
+  // Held here: the --on edge and ring, as on a plain cap held here.
+  const held = async (ch: string) => {
+    const c = page.locator(`[data-channel="${ch}"] .cap`);
+    const at = await faderCenter(page, `/channels/${ch}/fader`);
+    await page.mouse.move(at.x, at.y);
+    await page.mouse.down();
+    try {
+      await expect(c).toHaveClass(/mine/);
+      const on = await token('--on');
+      await expect.poll(() => style(c, 'borderTopColor')).toBe(on);
+      return await style(c, 'boxShadow');
+    } finally {
+      await page.mouse.up();
+    }
+  };
+  expect(await held('ch1')).toBe(await held('ch4'));
 });
 
 test('opens the engine counters above the lamp, inside the viewport, at desktop and phone widths', async ({ page }) => {

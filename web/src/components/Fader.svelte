@@ -176,7 +176,7 @@
     {/each}
     <div class="range">
       <div class="travel" style:transform="translateY({(1 - position) * 100}%)">
-        <div class="cap" class:mine class:foreign style:--face={tint ? `color-mix(in srgb, var(--cap) 65%, ${tint})` : undefined}><span></span></div>
+        <div class="cap" class:mine class:foreign style:--face={tint ? `color-mix(in srgb, ${tint} var(--cap-tint), var(--cap))` : undefined}><span></span></div>
       </div>
     </div>
   </div>

@@ -116,7 +116,6 @@
 <section class="strip" class:sof={sendsTo !== null} class:selected class:alt={index % 2 === 1} aria-label={`Channel ${index + 1} ${channel.name}`} data-channel={channel.id} data-color={st.color}>
   <button
     class="head"
-    data-color={st.color}
     onclick={() => onselect(channel.id)}
     aria-pressed={selected}
     use:tip={`${tone ? `${channel.name} (${toneText})` : channel.source ? `${channel.name} (${channel.source})` : channel.name}${safe.length > 0 ? `; recall safe: ${safe.join(', ')}` : ''}${selectorsText ? `; ${selectorsText}` : ''}`}
