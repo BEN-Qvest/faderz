@@ -35,6 +35,11 @@ pub const CLIP_DBFS: f64 = -1.0;
 /// The pan one V-Pot detent moves: 100 detents from full left to full
 /// right.
 pub const POT_STEP: f64 = 0.02;
+/// Every this long, one strip of every unit is sent all it shows again,
+/// the master strip with the unit's other key LEDs: in 9 steps, 4.5 s,
+/// a surface that lost or garbled messages, such as right after it
+/// invited the bridge again, shows the state again.
+pub const REFRESH_STEP_MS: u64 = 500;
 
 /// What a duck key does with its group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -129,6 +134,28 @@ fn hold_path(duck: &str) -> String {
     format!("/ducks/{duck}/hold")
 }
 
+impl Shown {
+    /// Forgets what strip `strip` shows, so the next render sends it all
+    /// again; the master strip (8) also forgets the key LEDs of no strip.
+    fn forget(&mut self, strip: usize) {
+        self.faders[strip] = None;
+        if strip == usize::from(mcu::MASTER) {
+            let strip_keys = |n: u8| n < 4 * mcu::STRIPS;
+            self.leds.retain(|n, _| strip_keys(*n));
+            return;
+        }
+        let s = strip as u8;
+        for key in [Key::Rec(s), Key::Solo(s), Key::Mute(s), Key::Select(s)] {
+            self.leds.remove(&key.note());
+        }
+        self.rings[strip] = None;
+        self.meters[strip] = None;
+        self.clips[strip] = None;
+        self.cells[strip] = None;
+        self.cells[usize::from(mcu::STRIPS) + strip] = None;
+    }
+}
+
 #[derive(Debug, Default)]
 struct Shown {
     faders: [Option<u16>; 9],
@@ -167,6 +194,9 @@ pub struct Surface {
     screens: BTreeMap<String, String>,
     /// Duck keys of their own; else F1 to F8.
     keys: Option<DuckKeys>,
+    /// The strip the next refresh step sends again, and when.
+    refresh_strip: usize,
+    refresh_at: u64,
 }
 
 /// A short name for the holder of a control: its principal, or its kind
@@ -203,7 +233,17 @@ impl Surface {
             selected: None,
             screens: BTreeMap::new(),
             keys: None,
+            refresh_strip: 0,
+            refresh_at: 0,
         }
+    }
+
+    /// Without the rolling refresh: a fixture checks that nothing more is
+    /// sent once the state is shown.
+    #[cfg(test)]
+    pub(crate) fn without_refresh(mut self) -> Surface {
+        self.refresh_at = u64::MAX;
+        self
     }
 
     /// Binds the X-Touch's duck keys by `keys` instead of F1 to F8.
@@ -699,6 +739,13 @@ impl Surface {
     /// Asks for refused controls held for a second, and notices a touched
     /// control that went to another session.
     pub fn tick(&mut self, engine: &mut Engine, now: u64) {
+        if now >= self.refresh_at {
+            for u in &mut self.units {
+                u.shown.forget(self.refresh_strip);
+            }
+            self.refresh_strip = (self.refresh_strip + 1) % (usize::from(mcu::MASTER) + 1);
+            self.refresh_at = now + REFRESH_STEP_MS;
+        }
         for u in &mut self.units {
             for (strip, slot) in u.touches.iter_mut().enumerate() {
                 if slot

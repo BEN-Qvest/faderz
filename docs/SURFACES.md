@@ -291,6 +291,14 @@ control its session owns that no fader holds, touches again what a held
 fader lost, and registers its consoles again. The primary connection
 takes meter frames for the strip meters and the duck keys' LEDs.
 
+A surface is sent all it shows when its session starts, and besides
+what changes, one strip of every unit is sent all it shows again every
+500 ms: its fader unless touched, key LEDs, ring, meter and both
+scribble strip cells, the master strip with the unit's other key LEDs.
+In 4.5 s every strip has been sent again, so a surface that lost or
+garbled messages, such as right after it invited the bridge again,
+shows the state again within that time.
+
 ## Not verified on hardware
 
 No surface was available while the bridge was built. The mapping
