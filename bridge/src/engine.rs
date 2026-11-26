@@ -96,6 +96,9 @@ pub enum Event {
     Requested { path: String, from: Value },
     /// A refusal or failure that concerns no control of a strip.
     Error(String),
+    /// What every session has selected, from the primary: entries of
+    /// `session` (an owner record) and `element`.
+    Selections(Value),
 }
 
 /// Round-trip time estimate, as TCP keeps it (RFC 6298).
@@ -294,6 +297,8 @@ pub struct Engine {
     /// Values written and not yet answered.
     local: BTreeMap<String, Value>,
     selection: Option<String>,
+    /// The principal the primary connection was answered as.
+    principal: Option<String>,
     consoles: BTreeMap<String, Console>,
     /// Registrations refused with 409 in a row, and when they go out again.
     console_refusals: u32,
@@ -354,6 +359,7 @@ impl Engine {
             last_write: BTreeMap::new(),
             local: BTreeMap::new(),
             selection: None,
+            principal: None,
             consoles: BTreeMap::new(),
             console_refusals: 0,
             console_retry_at: None,
@@ -387,6 +393,16 @@ impl Engine {
 
     pub fn handle(&self) -> &str {
         &self.handle
+    }
+
+    /// Who this session is signed in as, once the primary answered.
+    pub fn principal(&self) -> Option<&str> {
+        self.principal.as_deref()
+    }
+
+    /// The element this session has selected.
+    pub fn selection(&self) -> Option<&str> {
+        self.selection.as_deref()
     }
 
     /// Whether commands go out.
@@ -901,6 +917,10 @@ impl Engine {
                 self.send(link, &json!({ "type": "resync" }));
                 self.sync_by = Some(now + self.sync_timeout());
             }
+            "selections" if role == Role::Primary => {
+                self.events
+                    .push(Event::Selections(msg["selections"].clone()));
+            }
             "controlRequest" if role == Role::Primary => {
                 if let Some(path) = msg["path"].as_str() {
                     self.events.push(Event::Requested {
@@ -914,6 +934,7 @@ impl Engine {
     }
 
     fn primary_snapshot(&mut self, msg: &Value, now: u64) {
+        self.principal = msg["you"]["principal"].as_str().map(str::to_owned);
         let other_history =
             self.mirror.ready() && msg["epoch"].as_str() != self.mirror.epoch.as_deref();
         let older = self.mirror.ready()
@@ -950,6 +971,7 @@ impl Engine {
     }
 
     fn primary_resume(&mut self, msg: &Value, now: u64) {
+        self.principal = msg["you"]["principal"].as_str().map(str::to_owned);
         if !self.mirror.ready() || msg["epoch"].as_str() != self.mirror.epoch.as_deref() {
             return self.resync(true, now);
         }
@@ -991,11 +1013,10 @@ impl Engine {
         self.offline_rounds = 0;
         self.sync_timeouts = 0;
         self.events.push(Event::Synced);
-        if let Some(p) = self.primary().map(|p| p.id)
-            && let Some(element) = self.selection.clone()
-        {
-            self.send(p, &json!({ "type": "select", "element": element }));
-        }
+        // A selection is a SELECT press screens follow once: it lapses
+        // with its connection, so a reconnect never replays it over what
+        // a screen selected since.
+        self.selection = None;
         for c in self.consoles.values_mut() {
             c.sent = None;
             c.last = None;

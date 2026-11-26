@@ -13,13 +13,14 @@ COPY web ./
 RUN npm run build && node build/check-licenses.mjs
 
 # cargo-about in a stage of its own, so that it builds while faderz does.
-FROM ghcr.io/danielclasen/samplez-builder@sha256:92ece4452be98fff177b49fb201c8c693130c08845c42725dd5b1173d4863fba AS about
+FROM ghcr.io/danielclasen/samplez-builder:latest@sha256:92ece4452be98fff177b49fb201c8c693130c08845c42725dd5b1173d4863fba AS about
 # crates.io downloads over HTTP/2 fail with "Error in the HTTP2 framing
 # layer" on the CI runners now and then; HTTP/1.1 with more retries does not.
 ENV CARGO_HTTP_MULTIPLEXING=false CARGO_NET_RETRY=10
 
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
+# renovate: datasource=crate depName=cargo-about
 ARG CARGO_ABOUT_VERSION=0.9.3
 # Caps cargo's parallel jobs when set.
 ARG CARGO_BUILD_JOBS
@@ -30,7 +31,7 @@ RUN --mount=type=cache,id=cargo-about-registry,target=/usr/local/cargo/registry 
       "cargo-about@${CARGO_ABOUT_VERSION}" \
  && /opt/cargo-about/bin/cargo-about --version
 
-FROM ghcr.io/danielclasen/samplez-builder@sha256:92ece4452be98fff177b49fb201c8c693130c08845c42725dd5b1173d4863fba AS build
+FROM ghcr.io/danielclasen/samplez-builder:latest@sha256:92ece4452be98fff177b49fb201c8c693130c08845c42725dd5b1173d4863fba AS build
 # crates.io downloads over HTTP/2 fail with "Error in the HTTP2 framing
 # layer" on the CI runners now and then; HTTP/1.1 with more retries does not.
 ENV CARGO_HTTP_MULTIPLEXING=false CARGO_NET_RETRY=10
