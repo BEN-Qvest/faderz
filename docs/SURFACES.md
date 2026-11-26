@@ -250,7 +250,7 @@ console shows the bridge's controls as `<console> (<user>)`.
 | CHANNEL left/right | Moves by one channel |
 | Master fader (X-Touch) | `master`, or the program bus's fader |
 | Scribble strip | Line 1: the channel name, 7 characters. Line 2: the fader in dB, or the holder's name while another session holds it |
-| Scribble strip colour (X-Touch) | The channel's `color`: red, green, yellow, blue, purple (magenta) and cyan as they are, orange as yellow, `none` and strips past the last channel white |
+| Scribble strip colour (X-Touch) | The channel's `color`, mapped to the display's colours (below) |
 
 A touch refused because another session holds the fader shows the
 holder; held for a second, it asks the holder to give the control up.
@@ -283,6 +283,22 @@ then covers both the surface's bank and its SELECT. Selections are kept
 per replica and not replicated: a screen and the bridge share them only
 while both are connected to the same replica.
 
+An X-Touch's scribble strips have 7 colours, set by one SysEx
+(`F0 00 00 66 14|15 72`, one byte per strip: bit 0 red, bit 1 green,
+bit 2 blue). A channel's `color` maps to them as follows; orange and
+yellow look alike on the unit, as it has no orange.
+
+| `color` | X-Touch colour | Byte |
+|---|---|---|
+| `red` | red | 1 |
+| `green` | green | 2 |
+| `orange` | yellow | 3 |
+| `yellow` | yellow | 3 |
+| `blue` | blue | 4 |
+| `purple` | magenta | 5 |
+| `cyan` | cyan | 6 |
+| `none`, or a strip past the last channel | white | 7 |
+
 ## Connection
 
 The bridge speaks the protocol in
@@ -312,13 +328,14 @@ an X-Touch or X-Touch Extender:
   across a router and a NAT, and the rate a surface takes;
 - an RTP-MIDI session from macOS, and the scribble strip SysEx through
   its live routings;
-- ALT on note 73;
-- the scribble strip colour SysEx `F0 00 00 66 14|15 72`, one byte per
-  strip with bit 0 red, bit 1 green and bit 2 blue.
+- ALT on note 73.
 
 The V-Pots were tried on an X-Touch in MC mode over RTP-MIDI: turns on
 CC 16-23 with bit 6 anticlockwise, the push on notes 32-39, and the
 ring on CC 48-55 in mode 1 with LEDs 1 to 11.
+
+The scribble strip colours were tried on an X-Touch in MC mode over
+RTP-MIDI: every colour arrived, orange as yellow.
 
 The strip meters and CLIP were tried on an X-Touch in MC mode over
 RTP-MIDI, with steady tones from -45 to -0.5 dBFS on eight channels:
