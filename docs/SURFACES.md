@@ -112,8 +112,9 @@ move within 1.5 seconds is taken as let go; its motor follows faderz
 again until it is touched anew. A session that ends lets go of the
 faders it held.
 
-What goes to the surface is limited to `maxBytesPerSecond` and 512
-octets per packet; a newer motor position, LED, V-Pot ring or meter
+What goes to the surface is limited to `maxBytesPerSecond` and 64
+octets per packet, since an X-Touch drops some of the messages of larger
+packets; a newer motor position, LED, V-Pot ring or meter
 level replaces the queued one it supersedes. faderz shows a console connected while
 the bridge's session holds it, not while its network surface is, so a
 unit whose peer left still shows as connected.
