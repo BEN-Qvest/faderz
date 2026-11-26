@@ -299,12 +299,12 @@ goes when a network surface is heard again after a silence of at least
 cable was pulled or that was switched off and on keeps its session and
 does not invite the bridge again, but it sends receiver feedback about
 every second, so its return shows. Besides
-what changes, one strip of every unit is sent all it shows again every
-500 ms: its fader unless touched, key LEDs, ring, meter and both
-scribble strip cells, the master strip with the unit's other key LEDs.
-In 4.5 s every strip has been sent again, so a surface that lost or
-garbled messages, such as right after it invited the bridge again,
-shows the state again within that time.
+what changes, every unit is sent all it shows again within 5 s, a
+small part at a time at even intervals: a strip's fader unless touched,
+its key LEDs, its ring and meter, each of its cells, the master fader,
+the other key LEDs 16 notes at a time. A surface that lost or garbled
+messages, such as right after it invited the bridge again, shows the
+state again within that time, without a burst it would drop part of.
 
 ## Not verified on hardware
 

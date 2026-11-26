@@ -1392,41 +1392,33 @@ fn select_waits_for_the_principal() {
 }
 
 #[test]
-fn every_strip_is_sent_again_in_turn_so_a_surface_that_lost_it_recovers() {
+fn everything_is_sent_again_a_little_at_a_time_so_a_surface_that_lost_it_recovers() {
     let mut e = live(1);
     let mut s = Surface::new(units(1), None);
-    s.render(&e, 0);
+    let full = s.render(&e, 0);
     assert!(s.render(&e, 1).is_empty(), "only what changed");
-    // A step re-sends strip 1: its fader, key LEDs, ring, meter and both
-    // cells, and nothing of another strip.
+    // A step sends one part again: first strip 1's fader, nothing else.
     s.tick(&mut e, 100);
-    let out = s.render(&e, 100);
-    assert!(out.contains(&(0, mcu::fader(0, 0))));
-    assert!(out.contains(&(0, mcu::led(Key::Mute(0), Led::Off))));
-    assert!(out.contains(&(0, mcu::ring(0, mcu::ring_value(Some(0.0))))));
-    assert_eq!(
-        out.iter().filter(|(_, m)| m[0] == 0xf0).count(),
-        2,
-        "both cells of strip 1"
-    );
-    assert!(!out.contains(&(0, mcu::led(Key::Mute(1), Led::Off))));
+    assert_eq!(s.render(&e, 100), vec![(0, mcu::fader(0, 0))]);
     // The next step is only due after REFRESH_STEP_MS.
     s.tick(&mut e, 100 + REFRESH_STEP_MS - 1);
     assert!(s.render(&e, 100 + REFRESH_STEP_MS - 1).is_empty());
-    // In 9 steps every strip and the master have been sent again.
-    let mut keys = HashSet::new();
-    for step in 1..=9 {
+    // Over one cycle every message of the full state goes again, each
+    // step small enough for one 64-octet packet.
+    let mut again = Vec::new();
+    for step in 1..REFRESH_STEPS as u64 {
         let now = 100 + step * REFRESH_STEP_MS;
         s.tick(&mut e, now);
-        for (_, m) in s.render(&e, now) {
-            if m[0] == 0x90 {
-                keys.insert(m[1]);
-            }
-        }
+        let out = s.render(&e, now);
+        let octets: usize = out.iter().map(|(_, m)| m.len() + 1).sum();
+        assert!(octets <= 64, "step {step}: {octets} octets");
+        again.extend(out);
     }
-    for strip in 0..8 {
-        assert!(keys.contains(&Key::Select(strip).note()), "strip {strip}");
+    again.push((0, mcu::fader(0, 0)));
+    for m in &full {
+        assert!(again.contains(m), "{m:?} not sent again");
     }
+    assert!(REFRESH_STEPS as u64 * REFRESH_STEP_MS <= REFRESH_CYCLE_MS);
 }
 
 #[test]

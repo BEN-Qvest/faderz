@@ -35,11 +35,19 @@ pub const CLIP_DBFS: f64 = -1.0;
 /// The pan one V-Pot detent moves: 100 detents from full left to full
 /// right.
 pub const POT_STEP: f64 = 0.02;
-/// Every this long, one strip of every unit is sent all it shows again,
-/// the master strip with the unit's other key LEDs: in 9 steps, 4.5 s,
-/// a surface that lost or garbled messages, such as right after it
-/// invited the bridge again, shows the state again.
-pub const REFRESH_STEP_MS: u64 = 500;
+/// In this long every unit is sent all it shows again, a few messages
+/// at a time in `REFRESH_STEPS` even steps, so a surface that lost or
+/// garbled messages, such as right after it invited the bridge again,
+/// shows the state again without a burst it would drop part of.
+pub const REFRESH_CYCLE_MS: u64 = 5000;
+/// Per strip its fader, its key LEDs, its ring and meter, and each of its
+/// two cells; then the master fader and the other key LEDs, 16 notes at a
+/// time. Each step fits one packet.
+const STRIP_PARTS: usize = 5;
+const LED_GROUP: u8 = 16;
+pub const REFRESH_STEPS: usize =
+    mcu::STRIPS as usize * STRIP_PARTS + 1 + (128 - 4 * mcu::STRIPS as usize) / LED_GROUP as usize;
+pub const REFRESH_STEP_MS: u64 = REFRESH_CYCLE_MS / REFRESH_STEPS as u64;
 /// After a unit's session starts, or the unit is heard again after a
 /// silence, it is sent all it shows again this long after the first full
 /// send: an X-Touch that just came back drops part of what comes while it
@@ -140,24 +148,38 @@ fn hold_path(duck: &str) -> String {
 }
 
 impl Shown {
-    /// Forgets what strip `strip` shows, so the next render sends it all
-    /// again; the master strip (8) also forgets the key LEDs of no strip.
-    fn forget(&mut self, strip: usize) {
-        self.faders[strip] = None;
-        if strip == usize::from(mcu::MASTER) {
-            let strip_keys = |n: u8| n < 4 * mcu::STRIPS;
-            self.leds.retain(|n, _| strip_keys(*n));
+    /// Forgets refresh step `step` of what the unit shows, so the next
+    /// render sends that part again.
+    fn forget(&mut self, step: usize) {
+        let strips = usize::from(mcu::STRIPS);
+        if step < strips * STRIP_PARTS {
+            let strip = step / STRIP_PARTS;
+            let s = strip as u8;
+            match step % STRIP_PARTS {
+                0 => self.faders[strip] = None,
+                1 => {
+                    for key in [Key::Rec(s), Key::Solo(s), Key::Mute(s), Key::Select(s)] {
+                        self.leds.remove(&key.note());
+                    }
+                }
+                2 => {
+                    self.rings[strip] = None;
+                    self.meters[strip] = None;
+                    self.clips[strip] = None;
+                }
+                3 => self.cells[strip] = None,
+                _ => self.cells[strips + strip] = None,
+            }
             return;
         }
-        let s = strip as u8;
-        for key in [Key::Rec(s), Key::Solo(s), Key::Mute(s), Key::Select(s)] {
-            self.leds.remove(&key.note());
+        match step - strips * STRIP_PARTS {
+            0 => self.faders[usize::from(mcu::MASTER)] = None,
+            group => {
+                let first = 4 * mcu::STRIPS + (group as u8 - 1) * LED_GROUP;
+                self.leds
+                    .retain(|n, _| !(first..first + LED_GROUP).contains(n));
+            }
         }
-        self.rings[strip] = None;
-        self.meters[strip] = None;
-        self.clips[strip] = None;
-        self.cells[strip] = None;
-        self.cells[usize::from(mcu::STRIPS) + strip] = None;
     }
 }
 
@@ -201,8 +223,8 @@ pub struct Surface {
     screens: BTreeMap<String, String>,
     /// Duck keys of their own; else F1 to F8.
     keys: Option<DuckKeys>,
-    /// The strip the next refresh step sends again, and when.
-    refresh_strip: usize,
+    /// The next refresh step, and when.
+    refresh_step: usize,
     refresh_at: u64,
 }
 
@@ -241,7 +263,7 @@ impl Surface {
             selected: None,
             screens: BTreeMap::new(),
             keys: None,
-            refresh_strip: 0,
+            refresh_step: 0,
             refresh_at: 0,
         }
     }
@@ -759,9 +781,9 @@ impl Surface {
         }
         if now >= self.refresh_at {
             for u in &mut self.units {
-                u.shown.forget(self.refresh_strip);
+                u.shown.forget(self.refresh_step);
             }
-            self.refresh_strip = (self.refresh_strip + 1) % (usize::from(mcu::MASTER) + 1);
+            self.refresh_step = (self.refresh_step + 1) % REFRESH_STEPS;
             self.refresh_at = now + REFRESH_STEP_MS;
         }
         for u in &mut self.units {
