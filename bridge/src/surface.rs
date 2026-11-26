@@ -40,6 +40,10 @@ pub const POT_STEP: f64 = 0.02;
 /// a surface that lost or garbled messages, such as right after it
 /// invited the bridge again, shows the state again.
 pub const REFRESH_STEP_MS: u64 = 500;
+/// After a unit's session starts, it is sent all it shows again this long
+/// after the first full send: an X-Touch that just invited the bridge
+/// drops part of what comes while it settles, different parts each time.
+pub const RESEND_AFTER_MS: [u64; 2] = [300, 1000];
 
 /// What a duck key does with its group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -179,6 +183,8 @@ struct Unit {
     presses: BTreeMap<u8, Press>,
     /// Whether ALT is down: a V-Pot pushed with it centres the pan.
     alt: bool,
+    /// When the unit is sent all it shows again after a new session.
+    resends: Vec<u64>,
     shown: Shown,
 }
 
@@ -223,6 +229,7 @@ impl Surface {
                 touches: Default::default(),
                 presses: BTreeMap::new(),
                 alt: false,
+                resends: Vec::new(),
                 shown: Shown::default(),
             })
             .collect();
@@ -439,6 +446,7 @@ impl Surface {
             self.let_go(p, engine, now);
         }
         self.units[unit].alt = false;
+        self.units[unit].resends = RESEND_AFTER_MS.iter().map(|d| now + d).collect();
         self.resend(unit);
     }
 
@@ -739,6 +747,12 @@ impl Surface {
     /// Asks for refused controls held for a second, and notices a touched
     /// control that went to another session.
     pub fn tick(&mut self, engine: &mut Engine, now: u64) {
+        for u in &mut self.units {
+            if u.resends.iter().any(|&at| now >= at) {
+                u.resends.retain(|&at| now < at);
+                u.shown = Shown::default();
+            }
+        }
         if now >= self.refresh_at {
             for u in &mut self.units {
                 u.shown.forget(self.refresh_strip);

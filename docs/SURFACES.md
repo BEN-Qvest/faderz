@@ -291,7 +291,9 @@ control its session owns that no fader holds, touches again what a held
 fader lost, and registers its consoles again. The primary connection
 takes meter frames for the strip meters and the duck keys' LEDs.
 
-A surface is sent all it shows when its session starts, and besides
+A surface is sent all it shows when its session starts, and again
+300 ms and 1 s later: an X-Touch that has just invited the bridge drops
+part of what comes while it settles, different parts each time. Besides
 what changes, one strip of every unit is sent all it shows again every
 500 ms: its fader unless touched, key LEDs, ring, meter and both
 scribble strip cells, the master strip with the unit's other key LEDs.

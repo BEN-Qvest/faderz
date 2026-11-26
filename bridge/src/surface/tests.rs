@@ -1438,3 +1438,30 @@ fn a_refresh_never_moves_a_touched_fader() {
     s.tick(&mut e, 100);
     assert!(!s.render(&e, 100).iter().any(|(_, m)| m[0] == 0xe0));
 }
+
+#[test]
+fn a_new_session_is_sent_everything_again_twice_while_the_surface_settles() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None).without_refresh();
+    let full = s.render(&e, 0).len();
+    let link = Link {
+        connected: true,
+        session: 1,
+        ..Link::default()
+    };
+    s.link_changed(0, Link::default(), link, &mut e, 1000);
+    e.take_actions();
+    assert_eq!(s.render(&e, 1000).len(), full, "at once");
+    s.tick(&mut e, 1000 + RESEND_AFTER_MS[0] - 1);
+    assert!(s.render(&e, 1000 + RESEND_AFTER_MS[0] - 1).is_empty());
+    for after in RESEND_AFTER_MS {
+        s.tick(&mut e, 1000 + after);
+        assert_eq!(
+            s.render(&e, 1000 + after).len(),
+            full,
+            "again after {after} ms"
+        );
+    }
+    s.tick(&mut e, 10_000);
+    assert!(s.render(&e, 10_000).is_empty(), "then only what changes");
+}
