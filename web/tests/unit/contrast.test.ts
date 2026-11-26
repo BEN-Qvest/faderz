@@ -126,7 +126,7 @@ describe('channel colours', () => {
   describe.each([
     ['dark', dark, capTint(':root')],
     ['light', light, capTint(":root[data-theme='light']")],
-  ])('%s theme', (_, t, tint) => {
+  ])('%s theme', (theme, t, tint) => {
     it.each(colours)('a %s scribble strip stays dark: its name, number and source read', (_name, colour) => {
       const head = mix(colour, headMix, t['well']!);
       for (const [, c] of inks) expect(contrast(c, head)).toBeGreaterThanOrEqual(4.5);
@@ -136,6 +136,18 @@ describe('channel colours', () => {
     });
     // Guards the colours, --cap and the line's ink: on these caps no share
     // of the colour would make the line less clear than on a plain one.
+    // The mine and foreign rings sit on the strip outside the cap, so a tint
+    // never touches what they read against; this pins them at their values
+    // before the tint, so a change to the ring or strip tokens shows.
+    it('a held cap shows its mine and foreign rings against the strip, tinted or not', () => {
+      const ring = (token: string) => {
+        const p = Number(new RegExp(`color-mix\\(in srgb, var\\(--${token}\\) (\\d+)%, transparent\\)`).exec(fader)![1]);
+        return contrast(mix(t[token]!, p, t['strip']!), t['strip']!);
+      };
+      const before = theme === 'dark' ? { on: 7.36, owned: 3.15 } : { on: 4.95, owned: 2.87 };
+      expect(ring('on')).toBeGreaterThanOrEqual(before.on);
+      expect(ring('owned')).toBeGreaterThanOrEqual(before.owned);
+    });
     it.each(colours)('a %s fader cap keeps its centre line as clear as a plain one', (_name, colour) => {
       const face = mix(colour, tint, t['cap']!);
       expect(contrast(capLine, face)).toBeGreaterThanOrEqual(Math.min(3, contrast(capLine, t['cap']!)));
