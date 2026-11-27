@@ -112,12 +112,12 @@ move within 1.5 seconds is taken as let go; its motor follows faderz
 again until it is touched anew. A session that ends lets go of the
 faders it held.
 
-What goes to the surface is limited to `maxBytesPerSecond` and 64
-octets per packet, since an X-Touch drops some of the messages of larger
-packets; a newer motor position, LED, V-Pot ring or meter
-level replaces the queued one it supersedes. faderz shows a console connected while
-the bridge's session holds it, not while its network surface is, so a
-unit whose peer left still shows as connected.
+What goes to the surface is limited to `maxBytesPerSecond` and 64 octets
+per packet, since an X-Touch drops some of the messages of larger
+packets; a newer motor position, LED, V-Pot ring, meter level or set of
+strip colours replaces the queued one it supersedes. faderz shows a
+console connected while the bridge's session holds it, not while its
+network surface is, so a unit whose peer left still shows as connected.
 
 ### From a Mac
 
@@ -251,6 +251,7 @@ console shows the bridge's controls as `<console> (<user>)`.
 | CHANNEL left/right | Moves by one channel |
 | Master fader (X-Touch) | `master`, or the program bus's fader |
 | Scribble strip | Line 1: the channel name, 7 characters. Line 2: the fader in dB, or the holder's name while another session holds it |
+| Scribble strip colour (X-Touch) | The channel's `color`, mapped to the display's colours (below) |
 
 A touch refused because another session holds the fader shows the
 holder; held for a second, it asks the holder to give the control up.
@@ -282,6 +283,22 @@ user: there a screen follows SELECT only while its FOLLOW is on, which
 then covers both the surface's bank and its SELECT. Selections are kept
 per replica and not replicated: a screen and the bridge share them only
 while both are connected to the same replica.
+
+An X-Touch's scribble strips have 7 colours, set by one SysEx
+(`F0 00 00 66 14|15 72`, one byte per strip: bit 0 red, bit 1 green,
+bit 2 blue). A channel's `color` maps to them as follows; orange and
+yellow look alike on the unit, as it has no orange.
+
+| `color` | X-Touch colour | Byte |
+|---|---|---|
+| `red` | red | 1 |
+| `green` | green | 2 |
+| `orange` | yellow | 3 |
+| `yellow` | yellow | 3 |
+| `blue` | blue | 4 |
+| `purple` | magenta | 5 |
+| `cyan` | cyan | 6 |
+| `none`, or a strip past the last channel | white | 7 |
 
 ## Connection
 
@@ -317,6 +334,11 @@ an X-Touch or X-Touch Extender:
 The V-Pots were tried on an X-Touch in MC mode over RTP-MIDI: turns on
 CC 16-23 with bit 6 anticlockwise, the push on notes 32-39, and the
 ring on CC 48-55 in mode 1 with LEDs 1 to 11.
+
+The scribble strip colours were tried on an X-Touch in MC mode over
+RTP-MIDI: every colour arrived, orange as yellow. Every unit is sent
+the colour SysEx; the colours of an X-Touch Extender and what other
+MCU surfaces do with it are unverified.
 
 The strip meters and CLIP were tried on an X-Touch in MC mode over
 RTP-MIDI, with steady tones from -45 to -0.5 dBFS on eight channels:

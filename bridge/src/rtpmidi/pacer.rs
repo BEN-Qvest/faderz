@@ -1,6 +1,7 @@
 //! Paces what goes to a network surface: a byte rate with bursts of one
 //! packet, and a queue in which a newer motor position, LED or V-Pot
-//! ring replaces the queued one it supersedes, a newer meter message
+//! ring or a unit's strip colours replace the queued ones they
+//! supersede, a newer meter message
 //! goes last in place of it, and a scribble strip
 //! write drops the queued ones it overwrites whole.
 
@@ -28,6 +29,8 @@ enum Key {
     Meter(u8, u8, bool),
     /// A scribble strip write: device, first and last position.
     Lcd(u8, usize, usize),
+    /// An X-Touch's scribble strip colours: device.
+    Colours(u8),
 }
 
 fn key(m: &[u8]) -> Option<Key> {
@@ -40,6 +43,7 @@ fn key(m: &[u8]) -> Option<Key> {
             let first = usize::from(*offset);
             Some(Key::Lcd(*device, first, first + text.len() - 1))
         }
+        [0xf0, 0, 0, 0x66, device, 0x72, .., 0xf7] => Some(Key::Colours(*device)),
         _ => None,
     }
 }
@@ -193,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn newer_faders_leds_rings_meters_and_cells_replace_queued_ones() {
+    fn newer_faders_leds_rings_meters_cells_and_colours_replace_queued_ones() {
         let mut p = Pacer::new(1_000_000);
         p.push(mcu::fader(0, 100));
         p.push(mcu::led(McuKey::Mute(0), Led::On));
@@ -201,6 +205,8 @@ mod tests {
         p.push(mcu::lcd(Device::Main, 0, "Chan 1 "));
         p.push(vec![0xb0, 0x10, 0x41]);
         p.push(mcu::ring(2, 0x16));
+        p.push(mcu::colours(Device::Main, [1; 8]));
+        p.push(mcu::colours(Device::Extender, [2; 8]));
         p.push(mcu::fader(1, 7));
         p.push(mcu::fader(0, 200));
         p.push(mcu::led(McuKey::Mute(0), Led::Off));
@@ -210,14 +216,16 @@ mod tests {
         p.push(mcu::lcd(Device::Main, 7, "Chan 2 "));
         p.push(vec![0xb0, 0x10, 0x41]);
         p.push(mcu::ring(2, 0x18));
-        let packet = p.take(0).unwrap();
+        p.push(mcu::colours(Device::Main, [3; 8]));
         assert_eq!(
-            packet,
+            all(&mut p),
             vec![
                 mcu::fader(0, 200),
                 mcu::led(McuKey::Mute(0), Led::Off),
                 vec![0xb0, 0x10, 0x41],
                 mcu::ring(2, 0x18),
+                mcu::colours(Device::Main, [3; 8]),
+                mcu::colours(Device::Extender, [2; 8]),
                 mcu::fader(1, 7),
                 // A newer meter message goes last instead.
                 vec![0xd0, 0x0c],
@@ -227,7 +235,6 @@ mod tests {
                 vec![0xb0, 0x10, 0x41],
             ]
         );
-        assert_eq!(p.take(0), None);
     }
 
     #[test]
@@ -306,6 +313,7 @@ mod tests {
             mcu::fader(8, 0x3fff),
             mcu::ring(7, 0x16),
             mcu::led(McuKey::Mute(7), Led::On),
+            mcu::colours(Device::Main, [mcu::WHITE; 8]),
         ] {
             let mut p = Pacer::new(1_000_000);
             p.push(message.clone());
