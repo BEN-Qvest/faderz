@@ -104,9 +104,8 @@ The bridge answers every packet at the address and port it came from,
 so a peer behind a NAT works. It sends no recovery journal and skips a
 received one; instead the whole surface state (motors, LEDs, scribble
 strips) goes out again when a session starts, when packets from the
-peer are missing, when the peer's receiver feedback stays more than
-half a second behind, and every 10 seconds while the peer gives no
-receiver feedback. A packet that arrives after a later one is dropped.
+peer are missing, and when the peer's receiver feedback stays more
+than half a second behind. A packet that arrives after a later one is dropped.
 After packets from the peer went missing, a touched fader that does not
 move within 1.5 seconds is taken as let go; its motor follows faderz
 again until it is touched anew. A session that ends lets go of the
@@ -290,6 +289,23 @@ snapshot or resume on a new primary connection it releases every
 control its session owns that no fader holds, touches again what a held
 fader lost, and registers its consoles again. The primary connection
 takes meter frames for the strip meters and the duck keys' LEDs.
+
+A surface is sent all it shows when its session starts, and again
+300 ms, 1 s and 3 s later: an X-Touch that has just come back drops part
+of what comes while it settles, different parts each time. The same
+goes when a network surface is heard again after a silence of at least
+3 s and three times its usual gap between packets: an X-Touch whose
+cable was pulled or that was switched off and on keeps its session and
+does not invite the bridge again, but it sends receiver feedback about
+every second, so its return shows. A fader held when it went quiet is
+then let go like one after missing packets. A peer that is often that
+quiet, such as a Mac between clock syncs, is not taken as cut off again
+for the same silence. Besides what changes, every unit is sent all it
+shows again within 5 s, a small part at a time at even intervals: a
+strip's fader unless touched, its key LEDs, its ring and meter, each of
+its cells, then the master fader with the duck key LEDs. A surface that lost or garbled
+messages, such as right after it invited the bridge again, shows the
+state again within that time, without a burst it would drop part of.
 
 ## Not verified on hardware
 

@@ -1390,3 +1390,110 @@ fn select_waits_for_the_principal() {
     );
     assert_eq!(select_led(&mut s, &e), None, "the snapshot named nobody");
 }
+
+#[test]
+fn everything_is_sent_again_a_little_at_a_time_so_a_surface_that_lost_it_recovers() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    let full = s.render(&e, 0);
+    assert!(s.render(&e, 1).is_empty(), "only what changed");
+    // A step sends one part again: first strip 1's fader, nothing else.
+    s.tick(&mut e, 100);
+    assert_eq!(s.render(&e, 100), vec![(0, mcu::fader(0, 0))]);
+    // The steps keep the pace they started with at 0: the next is due
+    // at REFRESH_STEP_MS.
+    s.tick(&mut e, REFRESH_STEP_MS - 1);
+    assert!(s.render(&e, REFRESH_STEP_MS - 1).is_empty());
+    // Over one cycle every message of the full state goes again, each
+    // step small enough for one 64-octet packet.
+    let mut again = Vec::new();
+    for step in 1..REFRESH_STEPS as u64 {
+        let now = step * REFRESH_STEP_MS;
+        s.tick(&mut e, now);
+        let out = s.render(&e, now);
+        let octets: usize = out.iter().map(|(_, m)| m.len() + 1).sum();
+        assert!(octets <= 64, "step {step}: {octets} octets");
+        again.extend(out);
+    }
+    again.push((0, mcu::fader(0, 0)));
+    for m in &full {
+        assert!(again.contains(m), "{m:?} not sent again");
+    }
+    assert!(REFRESH_STEPS as u64 * REFRESH_STEP_MS <= REFRESH_CYCLE_MS);
+}
+
+#[test]
+fn a_refresh_never_moves_a_touched_fader() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    s.render(&e, 0);
+    // Strip 1's fader is touched; strip 2's is not.
+    s.input(0, &[0x90, 104, 0x7f], &mut e, 1);
+    let mut faders = Vec::new();
+    for step in 0..REFRESH_STEPS as u64 {
+        let now = 100 + step * REFRESH_STEP_MS;
+        s.tick(&mut e, now);
+        faders.extend(
+            s.render(&e, now)
+                .into_iter()
+                .filter(|(_, m)| m[0] & 0xf0 == 0xe0),
+        );
+    }
+    assert!(faders.contains(&(0, mcu::fader(1, 0))), "{faders:?}");
+    assert!(!faders.iter().any(|(_, m)| m[0] == 0xe0), "{faders:?}");
+}
+
+#[test]
+fn a_new_session_is_sent_everything_again_twice_while_the_surface_settles() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None).without_refresh();
+    let full = s.render(&e, 0).len();
+    let link = Link {
+        connected: true,
+        session: 1,
+        ..Link::default()
+    };
+    s.link_changed(0, Link::default(), link, &mut e, 1000);
+    e.take_actions();
+    assert_eq!(s.render(&e, 1000).len(), full, "at once");
+    s.tick(&mut e, 1000 + RESEND_AFTER_MS[0] - 1);
+    assert!(s.render(&e, 1000 + RESEND_AFTER_MS[0] - 1).is_empty());
+    for after in RESEND_AFTER_MS {
+        s.tick(&mut e, 1000 + after);
+        assert_eq!(
+            s.render(&e, 1000 + after).len(),
+            full,
+            "again after {after} ms"
+        );
+    }
+    s.tick(&mut e, 10_000);
+    assert!(s.render(&e, 10_000).is_empty(), "then only what changes");
+}
+
+#[test]
+fn a_surface_heard_again_is_sent_everything_now_and_while_it_settles() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None).without_refresh();
+    let full = s.render(&e, 0).len();
+    let link = Link {
+        connected: true,
+        session: 1,
+        ..Link::default()
+    };
+    s.link_changed(0, Link::default(), link, &mut e, 0);
+    for after in RESEND_AFTER_MS {
+        s.tick(&mut e, after);
+    }
+    s.render(&e, 10_000);
+    let back = Link { resync: 1, ..link };
+    s.link_changed(0, link, back, &mut e, 20_000);
+    assert_eq!(s.render(&e, 20_000).len(), full, "at once");
+    for after in RESEND_AFTER_MS {
+        s.tick(&mut e, 20_000 + after);
+        assert_eq!(
+            s.render(&e, 20_000 + after).len(),
+            full,
+            "again after {after} ms"
+        );
+    }
+}

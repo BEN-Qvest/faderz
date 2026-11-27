@@ -383,26 +383,19 @@ fn a_gap_in_the_peers_sequence_numbers_asks_for_the_state_again() {
 }
 
 #[test]
-fn a_gap_right_after_a_refresh_still_counts() {
+fn a_gap_inside_the_lost_hold_off_still_counts_as_missed() {
     let mut s = up();
-    s.received(
-        Socket::Data,
-        addr("198.51.100.1:6001"),
-        &midi_packet(1, &[vec![0xfe]]),
-        0,
-    );
-    s.send_midi(&[vec![0x90, 1, 1]], SECOND);
-    sent(&mut s);
-    // No feedback: the state is refreshed at 11 s.
-    s.tick(11 * SECOND);
+    let from = addr("198.51.100.1:6001");
+    s.received(Socket::Data, from, &midi_packet(1, &[vec![0xfe]]), 0);
+    s.received(Socket::Data, from, &midi_packet(3, &[vec![0xfe]]), SECOND);
     assert!(events(&mut s).contains(&Event::Lost));
-    // A gap a second later is inside the resend's hold-off, and
-    // still counts as missed.
+    // A gap a second later is inside the resend's hold-off, and still
+    // counts as missed.
     s.received(
         Socket::Data,
-        addr("198.51.100.1:6001"),
-        &midi_packet(3, &[vec![0xfe]]),
-        12 * SECOND,
+        from,
+        &midi_packet(5, &[vec![0xfe]]),
+        2 * SECOND,
     );
     assert_eq!(events(&mut s), vec![Event::Missed, Event::Midi(vec![0xfe])]);
 }
@@ -681,37 +674,6 @@ fn feedback_counts_only_in_a_session_and_for_its_own_packets() {
 }
 
 #[test]
-fn without_feedback_the_state_is_refreshed_every_ten_seconds_while_sending() {
-    let mut s = up();
-    // Nothing sent: nothing to refresh.
-    assert_eq!(s.deadline(), 10 + SYNC_TIMEOUT);
-    s.tick(20 * SECOND);
-    assert!(events(&mut s).is_empty());
-    s.send_midi(&[vec![0x90, 1, 1]], 21 * SECOND);
-    sent(&mut s);
-    assert_eq!(s.deadline(), 30 * SECOND);
-    s.tick(30 * SECOND - 1);
-    assert!(events(&mut s).is_empty());
-    s.tick(30 * SECOND);
-    assert_eq!(events(&mut s), vec![Event::Lost]);
-    // Feedback within the window: the peer says what it has.
-    s.send_midi(&[vec![0x90, 2, 2]], 31 * SECOND);
-    let seq = Decoder::default()
-        .decode(&sent(&mut s)[0].bytes)
-        .unwrap()
-        .0
-        .seq;
-    s.received(
-        Socket::Control,
-        addr("198.51.100.1:6000"),
-        &feedback(PEER_SSRC, seq),
-        32 * SECOND,
-    );
-    s.tick(40 * SECOND);
-    assert!(events(&mut s).is_empty());
-}
-
-#[test]
 fn invitations_from_peers_not_allowed_are_summarised() {
     let mut s = listener();
     for i in 0..5 {
@@ -752,4 +714,71 @@ fn closing_says_bye_and_malformed_commands_are_ignored() {
     s.close(2);
     assert_eq!(sent(&mut s).len(), 2);
     assert_eq!(events(&mut s), vec![Event::Down { reason: "closed" }]);
+}
+
+#[test]
+fn a_peer_heard_again_after_a_silence_asks_for_the_state_again() {
+    let mut s = up();
+    // Feedback every second, as an X-Touch sends it: no loss.
+    for t in 1..=5 {
+        s.received(
+            Socket::Control,
+            addr("198.51.100.1:6000"),
+            &feedback(PEER_SSRC, 0),
+            t * SECOND,
+        );
+    }
+    assert!(events(&mut s).is_empty());
+    // A pulled cable: nothing for 3 s, then the peer is back in the same
+    // session.
+    s.received(
+        Socket::Control,
+        addr("198.51.100.1:6000"),
+        &feedback(PEER_SSRC, 0),
+        5 * SECOND + PEER_SILENT,
+    );
+    // A fader held then may have been let go unseen.
+    assert_eq!(events(&mut s), vec![Event::Missed, Event::Lost]);
+    // A peer that is quiet for 10 s as a rule, as a Mac's clock sync, is
+    // not cut off by that.
+    let mut s = up();
+    for t in 1..=6 {
+        s.received(
+            Socket::Control,
+            addr("198.51.100.1:6000"),
+            &feedback(PEER_SSRC, 0),
+            t * 10 * SECOND,
+        );
+    }
+    assert!(events(&mut s).is_empty());
+    // Another address is no sign of the peer.
+    s.received(
+        Socket::Control,
+        addr("198.51.100.9:6000"),
+        &feedback(PEER_SSRC, 0),
+        20 * SECOND,
+    );
+    assert!(events(&mut s).is_empty());
+}
+
+#[test]
+fn a_peer_quiet_between_syncs_after_a_burst_is_not_cut_off_at_every_sync() {
+    let mut s = up();
+    let from = addr("198.51.100.1:6000");
+    // A burst of short gaps pulls the usual gap down...
+    for i in 1..=10 {
+        s.received(Socket::Control, from, &feedback(PEER_SSRC, 0), i * 50_000);
+    }
+    // ...then a sync every 10 s: at most the first gap reads as a
+    // silence, and the peer is not sent its state again at every sync.
+    for t in 1..=10 {
+        s.received(
+            Socket::Control,
+            from,
+            &feedback(PEER_SSRC, 0),
+            t * 10 * SECOND,
+        );
+    }
+    let lost = events(&mut s).iter().filter(|e| **e == Event::Lost).count();
+    assert!(lost <= 1, "{lost} times");
 }

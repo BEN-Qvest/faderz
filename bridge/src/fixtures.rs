@@ -67,7 +67,7 @@ impl Replay {
             name: "X-Touch".into(),
             device: Device::Main,
         };
-        let surface = Surface::new(vec![unit], None);
+        let surface = Surface::new(vec![unit], None).without_refresh();
         surface.register(&mut engine, 0);
         engine.take_actions();
         engine.take_events();
