@@ -222,6 +222,7 @@ fn show_lcd(code: &auth::DeviceCode, lcd: Option<&(UnboundedSender<Vec<u8>>, Dev
             mcu::LINE_CHARS,
             &line(format!("Code: {}", code.user_code)),
         ));
+        let _ = out.send(mcu::colours(*device, [mcu::WHITE; 8]));
     }
 }
 
@@ -260,6 +261,11 @@ mod tests {
         assert!(first.2.starts_with("Sign in: https://idp.example/device"));
         assert_eq!(second.1, mcu::LINE_CHARS);
         assert!(second.2.starts_with("Code: WXYZ-1234"));
+        assert_eq!(
+            lcd.try_recv().unwrap(),
+            mcu::colours(Device::Main, [mcu::WHITE; 8]),
+            "the code is not left on the last session's colours"
+        );
         // A resend while connected is no new connection.
         link.send_modify(|l| l.resync += 1);
         wait().await;
