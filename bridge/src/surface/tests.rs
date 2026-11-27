@@ -1390,3 +1390,189 @@ fn select_waits_for_the_principal() {
     );
     assert_eq!(select_led(&mut s, &e), None, "the snapshot named nobody");
 }
+
+#[test]
+fn everything_is_sent_again_a_little_at_a_time_so_a_surface_that_lost_it_recovers() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    let full = s.render(&e, 0);
+    assert!(s.render(&e, 1).is_empty(), "only what changed");
+    // A step sends one part again: first strip 1's fader, nothing else.
+    s.tick(&mut e, 100);
+    assert_eq!(s.render(&e, 100), vec![(0, mcu::fader(0, 0))]);
+    // The steps keep the pace they started with at 0: the next is due
+    // at REFRESH_STEP_MS.
+    s.tick(&mut e, REFRESH_STEP_MS - 1);
+    assert!(s.render(&e, REFRESH_STEP_MS - 1).is_empty());
+    // Over one cycle every message of the full state goes again, each
+    // step small enough for one 64-octet packet.
+    let mut again = Vec::new();
+    for step in 1..REFRESH_STEPS as u64 {
+        let now = step * REFRESH_STEP_MS;
+        s.tick(&mut e, now);
+        let out = s.render(&e, now);
+        let octets: usize = out.iter().map(|(_, m)| m.len() + 1).sum();
+        assert!(
+            octets <= crate::rtpmidi::pacer::MAX_PAYLOAD,
+            "step {step}: {octets} octets"
+        );
+        again.extend(out);
+    }
+    again.push((0, mcu::fader(0, 0)));
+    for m in &full {
+        assert!(again.contains(m), "{m:?} not sent again");
+    }
+    assert!(REFRESH_STEPS as u64 * REFRESH_STEP_MS <= REFRESH_CYCLE_MS);
+}
+
+#[test]
+fn after_a_long_pause_the_refresh_starts_its_pace_anew() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    s.render(&e, 0);
+    s.tick(&mut e, 100);
+    s.render(&e, 100);
+    // Ticks stop for a while, as when the loop was held up: one step
+    // goes, not every step missed, and the next is a full step later.
+    let late = 100 + 20 * REFRESH_STEP_MS;
+    s.tick(&mut e, late);
+    // Step 1: strip 1's four key LEDs.
+    let out = s.render(&e, late);
+    assert_eq!(out.len(), 4, "{out:?}");
+    assert!(out.iter().all(|(_, m)| m[0] == 0x90));
+    s.tick(&mut e, late + REFRESH_STEP_MS - 1);
+    assert!(s.render(&e, late + REFRESH_STEP_MS - 1).is_empty());
+    s.tick(&mut e, late + REFRESH_STEP_MS);
+    assert!(!s.render(&e, late + REFRESH_STEP_MS).is_empty());
+}
+
+#[test]
+fn a_sign_in_on_the_first_unit_stays_up_through_the_refresh() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(2), None);
+    let strips = s.render(&e, 0);
+    let top = format!("{:<56}", "Sign in: https://idp.example/device");
+    let bottom = format!("{:<56}", "Code: WXYZ-1234");
+    s.set_sign_in(Some([top.clone(), bottom.clone()]));
+    let shown = s.render(&e, 1);
+    // Every cell of the code that differs from the blank strip it
+    // replaces goes out.
+    let cell = |line: &str, strip: usize| line[strip * 7..strip * 7 + 7].to_owned();
+    for (line, text) in [(0, &top), (1, &bottom)] {
+        for strip in 0..8 {
+            let c = cell(text, strip);
+            let offset = line * mcu::LINE_CHARS + strip * mcu::STRIP_CHARS;
+            let sent = shown.contains(&(0, mcu::lcd(Device::Main, offset, &c)));
+            assert!(sent || c.trim().is_empty(), "{c:?}");
+        }
+    }
+    // A full refresh cycle and a resend send the code again, never the
+    // strips, on the first unit; the second unit keeps its strips.
+    s.resend(0);
+    let mut cells = Vec::new();
+    for step in 0..=REFRESH_STEPS as u64 {
+        let now = 100 + step * REFRESH_STEP_MS;
+        s.tick(&mut e, now);
+        cells.extend(
+            (s.render(&e, now).into_iter())
+                .filter(|(u, m)| *u == 0 && m[0] == 0xf0 && m.get(5) == Some(&0x12)),
+        );
+    }
+    assert!(!cells.is_empty());
+    for (_, m) in &cells {
+        let (_, offset, text) = mcu::parse_lcd(m).unwrap();
+        let line = if offset < mcu::LINE_CHARS {
+            &top
+        } else {
+            &bottom
+        };
+        let at = offset % mcu::LINE_CHARS;
+        assert_eq!(text, line[at..at + text.len()], "{text:?}");
+    }
+    // Signed in, the strips come back.
+    s.set_sign_in(None);
+    let back = s.render(&e, 10_000);
+    let first_cell = |out: &[(usize, Vec<u8>)]| {
+        out.iter()
+            .find(|(u, m)| *u == 0 && mcu::parse_lcd(m).is_some_and(|(_, o, _)| o == 0))
+            .cloned()
+    };
+    assert!(first_cell(&strips).is_some());
+    assert_eq!(first_cell(&back), first_cell(&strips));
+}
+
+#[test]
+fn a_refresh_never_moves_a_touched_fader() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None);
+    s.render(&e, 0);
+    // Strip 1's fader is touched; strip 2's is not.
+    s.input(0, &[0x90, 104, 0x7f], &mut e, 1);
+    let mut faders = Vec::new();
+    for step in 0..REFRESH_STEPS as u64 {
+        let now = 100 + step * REFRESH_STEP_MS;
+        s.tick(&mut e, now);
+        faders.extend(
+            s.render(&e, now)
+                .into_iter()
+                .filter(|(_, m)| m[0] & 0xf0 == 0xe0),
+        );
+    }
+    assert!(faders.contains(&(0, mcu::fader(1, 0))), "{faders:?}");
+    assert!(!faders.iter().any(|(_, m)| m[0] == 0xe0), "{faders:?}");
+}
+
+#[test]
+fn a_new_session_is_sent_everything_again_twice_while_the_surface_settles() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None).without_refresh();
+    let full = s.render(&e, 0).len();
+    let link = Link {
+        connected: true,
+        session: 1,
+        ..Link::default()
+    };
+    s.link_changed(0, Link::default(), link, &mut e, 1000);
+    e.take_actions();
+    assert_eq!(s.render(&e, 1000).len(), full, "at once");
+    s.tick(&mut e, 1000 + RESEND_AFTER_MS[0] - 1);
+    assert!(s.render(&e, 1000 + RESEND_AFTER_MS[0] - 1).is_empty());
+    for after in RESEND_AFTER_MS {
+        s.tick(&mut e, 1000 + after);
+        assert_eq!(
+            s.render(&e, 1000 + after).len(),
+            full,
+            "again after {after} ms"
+        );
+    }
+    s.tick(&mut e, 10_000);
+    assert!(s.render(&e, 10_000).is_empty(), "then only what changes");
+}
+
+#[test]
+fn a_surface_heard_again_is_sent_everything_now_and_while_it_settles() {
+    let mut e = live(1);
+    let mut s = Surface::new(units(1), None).without_refresh();
+    let full = s.render(&e, 0).len();
+    let link = Link {
+        connected: true,
+        session: 1,
+        ..Link::default()
+    };
+    s.link_changed(0, Link::default(), link, &mut e, 0);
+    for after in RESEND_AFTER_MS {
+        s.tick(&mut e, after);
+    }
+    s.render(&e, 10_000);
+    let back = Link { resync: 1, ..link };
+    s.link_changed(0, link, back, &mut e, 20_000);
+    assert_eq!(s.render(&e, 20_000).len(), full, "at once");
+    for after in RESEND_AFTER_MS {
+        s.tick(&mut e, 20_000 + after);
+        assert_eq!(
+            s.render(&e, 20_000 + after).len(),
+            full,
+            "again after {after} ms"
+        );
+    }
+}

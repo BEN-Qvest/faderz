@@ -37,11 +37,20 @@ const FEEDBACK_INTERVAL: u64 = SECOND;
 /// A packet sent this long before the peer's feedback that does not
 /// cover it was lost.
 const FEEDBACK_GRACE: u64 = SECOND / 2;
+/// A peer heard again after a silence was cut off, by a pulled cable or
+/// a power cycle that kept the session: its state is sent again. The
+/// silence is at least this long and three times the peer's usual gap
+/// between packets: an X-Touch sends receiver feedback about every
+/// second, a Mac clock sync about every 10 s.
+const PEER_SILENT: u64 = 3 * SECOND;
+/// Packets from the peer before its usual gap is known well enough.
+const PEER_GAPS_KNOWN: u32 = 4;
+/// The most a silence raises the usual gap to, half of the silence: a
+/// peer that is often that quiet is not taken as cut off each time, and
+/// a long outage does not hide the next one for long.
+const PEER_GAP_MAX: u64 = 30 * SECOND;
 /// At most one [`Event::Lost`] per this.
 const LOST_HOLDOFF: u64 = 2 * SECOND;
-/// While packets go out and no receiver feedback says what arrived,
-/// the peer's whole state is sent again this often.
-const REFRESH_INTERVAL: u64 = 10 * SECOND;
 /// Invitations refused because their source is not allowed are logged
 /// in a summary at most this often.
 const REFUSED_REPORT: u64 = 60 * SECOND;
@@ -257,12 +266,11 @@ pub struct Session {
     feedback_due: bool,
     feedback_at: u64,
     lost_at: Option<u64>,
-    /// When the peer's state was last sent whole (a session start or a
-    /// loss), whether packets went out since, and when the peer's
-    /// feedback last came.
-    refreshed_at: u64,
-    sent_since_refresh: bool,
-    feedback_seen: Option<u64>,
+    /// When a packet from the peer last came, its usual gap between
+    /// packets, and how many gaps that mean is of.
+    heard_at: Option<u64>,
+    peer_gap: Option<u64>,
+    peer_gaps: u32,
     /// Invitations refused from sources not allowed since the last
     /// summary, the last of them, and when the summary was written.
     refused: u32,
@@ -288,9 +296,9 @@ impl Session {
             feedback_due: false,
             feedback_at: 0,
             lost_at: None,
-            refreshed_at: now,
-            sent_since_refresh: false,
-            feedback_seen: None,
+            heard_at: None,
+            peer_gap: None,
+            peer_gaps: 0,
             refused: 0,
             refused_from: None,
             refused_reported: None,
@@ -341,17 +349,35 @@ impl Session {
         } else {
             u64::MAX
         };
-        let refresh = if self.sent_since_refresh && self.is_up() {
-            self.refreshed_at + REFRESH_INTERVAL
-        } else {
-            u64::MAX
-        };
-        state.min(feedback).min(refresh)
+        state.min(feedback)
     }
 
     /// One datagram from `from` on `socket`.
     pub fn received(&mut self, socket: Socket, from: SocketAddr, bytes: &[u8], now: u64) {
         let from = SocketAddr::new(from.ip().to_canonical(), from.port());
+        if let State::Up { peer, .. } = &self.state
+            && peer.ip == from.ip()
+        {
+            if let Some(gap) = self.heard_at.map(|t| now.saturating_sub(t)) {
+                let usual = self.peer_gap.unwrap_or(gap);
+                if self.peer_gaps >= PEER_GAPS_KNOWN && gap >= PEER_SILENT.max(3 * usual) {
+                    tracing::info!(
+                        silent_ms = gap / 1000,
+                        "the surface is heard again: sending its state"
+                    );
+                    // A fader held when it went quiet may have been let go.
+                    self.events.push_back(Event::Missed);
+                    self.lost(now);
+                    self.peer_gap = Some(usual.max((gap / 2).min(PEER_GAP_MAX)));
+                } else {
+                    // The longest recent gap, slowly forgotten: short gaps
+                    // between the usual ones do not pull it down.
+                    self.peer_gap = Some(gap.max(usual - usual / 16));
+                    self.peer_gaps = self.peer_gaps.saturating_add(1);
+                }
+            }
+            self.heard_at = Some(now);
+        }
         match parse(bytes) {
             Some(Command::Invitation {
                 version,
@@ -508,9 +534,9 @@ impl Session {
         self.sent.clear();
         self.feedback_due = false;
         self.lost_at = None;
-        self.refreshed_at = now;
-        self.sent_since_refresh = false;
-        self.feedback_seen = None;
+        self.heard_at = Some(now);
+        self.peer_gap = None;
+        self.peer_gaps = 0;
         self.state = State::Up {
             peer,
             initiator,
@@ -651,7 +677,6 @@ impl Session {
 
     /// The peer received everything up to `seq`.
     fn feedback(&mut self, seq: u16, now: u64) {
-        self.feedback_seen = Some(now);
         let Some(at) = self.sent.iter().position(|(s, _)| *s == seq) else {
             return;
         };
@@ -671,8 +696,6 @@ impl Session {
     fn lost(&mut self, now: u64) {
         if self.lost_at.is_none_or(|t| now >= t + LOST_HOLDOFF) {
             self.lost_at = Some(now);
-            self.refreshed_at = now;
-            self.sent_since_refresh = false;
             self.events.push_back(Event::Lost);
         }
     }
@@ -714,7 +737,6 @@ impl Session {
             self.sent.pop_front();
         }
         self.sent.push_back((self.seq, now));
-        self.sent_since_refresh = true;
         self.seq = self.seq.wrapping_add(1);
         self.send(Socket::Data, to, payload::encode(header, commands));
         true
@@ -813,22 +835,6 @@ impl Session {
             self.feedback_due = false;
             self.feedback_at = now;
             self.send(Socket::Control, to, feedback(me, seq));
-        }
-        // No feedback said what arrived since the last refresh: send the
-        // whole state again, in case some of it did not.
-        if self.is_up()
-            && self.sent_since_refresh
-            && now >= self.refreshed_at + REFRESH_INTERVAL
-            && self.feedback_seen.is_none_or(|t| t < self.refreshed_at)
-        {
-            tracing::debug!("no feedback from the peer: refreshing its state");
-            self.lost_at = Some(now);
-            self.refreshed_at = now;
-            self.sent_since_refresh = false;
-            self.events.push_back(Event::Lost);
-        } else if self.is_up() && now >= self.refreshed_at + REFRESH_INTERVAL {
-            self.refreshed_at = now;
-            self.sent_since_refresh = false;
         }
     }
 }
