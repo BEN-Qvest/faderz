@@ -1418,3 +1418,34 @@ fn the_scribble_strips_take_the_channels_colours_white_past_the_last() {
     );
     assert!(sysex(s.render(&e, 2)).is_empty(), "only on a change");
 }
+
+#[test]
+fn a_bank_move_sends_the_new_banks_colours() {
+    let mut e = channels(10);
+    let mut s = Surface::new(units(1), None);
+    delta(
+        &mut e,
+        6,
+        json!([
+            { "path": "/channels/ch2/color", "value": "blue" },
+            { "path": "/channels/ch9/color", "value": "red" }
+        ]),
+        json!([]),
+    );
+    let sysex = |out: Vec<(usize, Vec<u8>)>| -> Vec<Vec<u8>> {
+        (out.into_iter())
+            .map(|(_, m)| m)
+            .filter(|m| m.get(5) == Some(&0x72))
+            .collect()
+    };
+    assert_eq!(
+        sysex(s.render(&e, 0)),
+        vec![mcu::colours(Device::Main, [7, 4, 7, 7, 7, 7, 7, 7])]
+    );
+    // BANK right: ch9 and ch10, then no channel.
+    key(&mut s, &mut e, 47, true, 10);
+    assert_eq!(
+        sysex(s.render(&e, 20)),
+        vec![mcu::colours(Device::Main, [1, 7, 7, 7, 7, 7, 7, 7])]
+    );
+}

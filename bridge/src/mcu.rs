@@ -235,7 +235,7 @@ pub fn led(key: Key, state: Led) -> Vec<u8> {
 
 /// The X-Touch display colour of a channel's `ScribbleColor`: bit 0 red,
 /// bit 1 green, bit 2 blue. An X-Touch has 7; orange shows as yellow, its
-/// nearest, and `none` or an unknown colour as white (7).
+/// nearest, and `none` or an unknown colour as [`WHITE`].
 pub fn colour(name: &str) -> u8 {
     match name {
         "red" => 1,
@@ -244,9 +244,12 @@ pub fn colour(name: &str) -> u8 {
         "blue" => 4,
         "purple" => 5,
         "cyan" => 6,
-        _ => 7,
+        _ => WHITE,
     }
 }
+
+/// The [`colour`] of a strip without a channel.
+pub const WHITE: u8 = 7;
 
 /// Sets the display colours of a unit's 8 scribble strips: an X-Touch
 /// SysEx outside the Mackie Control protocol, one [`colour`] per strip.

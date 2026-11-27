@@ -846,10 +846,7 @@ impl Surface {
                 }
             }
             u.shown.meter_frame = Some(engine.peaks().frames);
-            let mut colours = [0; 8];
-            for (c, v) in colours.iter_mut().zip(&view) {
-                *c = v.colour;
-            }
+            let colours = std::array::from_fn(|s| view[s].colour);
             if u.shown.colours != Some(colours) {
                 out.push((i, mcu::colours(u.spec.device, colours)));
                 u.shown.colours = Some(colours);
@@ -903,7 +900,7 @@ impl Surface {
             mute: Led::Off,
             solo: Led::Off,
             select: Led::Off,
-            colour: 7,
+            colour: mcu::WHITE,
             ring: 0,
             meter: 0,
             clip: false,

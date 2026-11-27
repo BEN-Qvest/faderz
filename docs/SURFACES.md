@@ -113,8 +113,8 @@ again until it is touched anew. A session that ends lets go of the
 faders it held.
 
 What goes to the surface is limited to `maxBytesPerSecond` and 512
-octets per packet; a newer motor position, LED, V-Pot ring or meter
-level replaces the queued one it supersedes. faderz shows a console connected while
+octets per packet; a newer motor position, LED, V-Pot ring, meter
+level or set of strip colours replaces the queued one it supersedes. faderz shows a console connected while
 the bridge's session holds it, not while its network surface is, so a
 unit whose peer left still shows as connected.
 
@@ -335,7 +335,9 @@ CC 16-23 with bit 6 anticlockwise, the push on notes 32-39, and the
 ring on CC 48-55 in mode 1 with LEDs 1 to 11.
 
 The scribble strip colours were tried on an X-Touch in MC mode over
-RTP-MIDI: every colour arrived, orange as yellow.
+RTP-MIDI: every colour arrived, orange as yellow. Every unit is sent
+the colour SysEx; the colours of an X-Touch Extender and what other
+MCU surfaces do with it are unverified.
 
 The strip meters and CLIP were tried on an X-Touch in MC mode over
 RTP-MIDI, with steady tones from -45 to -0.5 dBFS on eight channels:
