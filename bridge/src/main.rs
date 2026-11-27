@@ -220,8 +220,8 @@ fn show_lcd(code: &auth::DeviceCode, lcd: Option<&(UnboundedSender<Vec<u8>>, Dev
 /// The scribble strip's two lines for a sign-in, laid out on its 8 cells
 /// of 7 characters, each its own display: the code on the first two
 /// strips, split at its hyphen, "Sign in" on the third, and the URL
-/// without its scheme over both lines of the last five, broken after a
-/// slash where one fits. Text past the cells is cut; the log has it all.
+/// without "https://" over both lines of the last five, broken after a
+/// slash where the rest then fits. Text past the cells is cut; the log has it all.
 fn sign_in_lines(uri: &str, code: &str) -> [String; 2] {
     let w = mcu::STRIP_CHARS;
     let cell = |text: &str| format!("{text:<w$.w$}");
@@ -233,18 +233,22 @@ fn sign_in_lines(uri: &str, code: &str) -> [String; 2] {
         ),
     };
     let url: Vec<char> = uri
-        .split_once("://")
-        .map_or(uri, |(_, rest)| rest)
+        .strip_prefix("https://")
+        .unwrap_or(uri)
         .chars()
         .collect();
     let width = mcu::LINE_CHARS - 3 * w;
     let at = if url.len() <= width {
         url.len()
     } else {
-        url[..=width]
+        // A slash break that pushes the rest past the bottom line would
+        // cut a URL that fits.
+        url[..width]
             .iter()
             .rposition(|&c| c == '/')
-            .map_or(width, |i| i + 1)
+            .map(|i| i + 1)
+            .filter(|&at| url.len() - at <= width)
+            .unwrap_or(width)
     };
     let top: String = url[..at].iter().collect();
     let bottom: String = url[at..].iter().collect();
@@ -269,9 +273,17 @@ fn sign_in_lines(uri: &str, code: &str) -> [String; 2] {
 mod tests {
     use super::*;
 
-    /// The 7-character cells of a line, one per strip.
+    /// The cells of a line, one per strip.
     fn cells(line: &str) -> Vec<&str> {
-        (0..8).map(|s| &line[s * 7..s * 7 + 7]).collect()
+        let w = mcu::STRIP_CHARS;
+        (0..mcu::LINE_CHARS / w)
+            .map(|s| &line[s * w..s * w + w])
+            .collect()
+    }
+
+    /// The URL's part of a line: the last five strips.
+    fn url(line: &str) -> &str {
+        line[3 * mcu::STRIP_CHARS..].trim_end()
     }
 
     #[test]
@@ -285,20 +297,61 @@ mod tests {
         assert_eq!(&cells(&top)[..3], ["Code:  ", "       ", "Sign in"]);
         assert_eq!(&cells(&bottom)[..3], ["TTBL-  ", "FLPH   ", "       "]);
         // The URL over the last five strips, broken after a slash.
-        assert_eq!(top[21..].trim_end(), "idp.broadcast-facility.example.org/");
-        assert_eq!(bottom[21..].trim_end(), "realms/dmf/device");
+        assert_eq!(url(&top), "idp.broadcast-facility.example.org/");
+        assert_eq!(url(&bottom), "realms/mix/device");
+    }
+
+    #[test]
+    fn a_slash_just_past_the_top_line_goes_to_the_bottom_line() {
+        let host = "auth.broadcast-facility.example.org";
+        assert_eq!(host.len(), mcu::LINE_CHARS - 3 * mcu::STRIP_CHARS);
+        let [top, bottom] = sign_in_lines(&format!("https://{host}/device"), "AB-CD");
+        assert_eq!(url(&top), host);
+        assert_eq!(url(&bottom), "/device");
+    }
+
+    #[test]
+    fn a_url_that_fits_is_not_broken_at_a_slash_that_would_cut_it() {
+        let [top, bottom] = sign_in_lines(
+            "https://idp.example/device-authorization-for-the-console-bridge",
+            "AB-CD",
+        );
+        assert_eq!(url(&top), "idp.example/device-authorization-fo");
+        assert_eq!(url(&bottom), "r-the-console-bridge");
+    }
+
+    #[test]
+    fn a_plain_http_url_keeps_its_scheme() {
+        let [top, _] = sign_in_lines("http://127.0.0.1:8080/device", "AB-CD");
+        assert_eq!(url(&top), "http://127.0.0.1:8080/device");
+    }
+
+    #[test]
+    fn a_code_is_split_at_its_first_hyphen_only_where_both_halves_fit() {
+        let code = |code: &str| {
+            let [_, bottom] = sign_in_lines("https://idp.example/device", code);
+            [cells(&bottom)[0].to_owned(), cells(&bottom)[1].to_owned()]
+        };
+        assert_eq!(code("ABCDEF-GHI"), ["ABCDEF-", "GHI    "]);
+        // No room for the hyphen after a left half of 7: split by cell.
+        assert_eq!(code("ABCDEFG-HI"), ["ABCDEFG", "-HI    "]);
+        assert_eq!(code("ABCDEFGH-IJ"), ["ABCDEFG", "H-IJ   "]);
+        assert_eq!(code("AB-CD-EF"), ["AB-    ", "CD-EF  "]);
+        // Past two cells the code is cut; the log has it whole.
+        assert_eq!(code("ABCDEFGHIJKLMNOP"), ["ABCDEFG", "HIJKLMN"]);
     }
 
     #[test]
     fn a_code_or_url_that_does_not_fit_is_cut_rather_than_spilled() {
-        let [top, bottom] = sign_in_lines("http://a.example/x", "ABCDEFGHIJ");
+        let [top, bottom] = sign_in_lines("https://a.example/x", "ABCDEFGHIJ");
         assert_eq!(&cells(&bottom)[..2], ["ABCDEFG", "HIJ    "]);
-        assert_eq!(top[21..].trim_end(), "a.example/x");
-        assert_eq!(bottom[21..].trim_end(), "");
+        assert_eq!(url(&top), "a.example/x");
+        assert_eq!(url(&bottom), "");
+        let width = mcu::LINE_CHARS - 3 * mcu::STRIP_CHARS;
         let long = format!("https://{}", "x".repeat(80));
         let [top, bottom] = sign_in_lines(&long, "AB-CD");
-        assert_eq!(top[21..], "x".repeat(35));
-        assert_eq!(bottom[21..], "x".repeat(35));
+        assert_eq!(url(&top), "x".repeat(width));
+        assert_eq!(url(&bottom), "x".repeat(width));
         assert_eq!(&cells(&bottom)[..2], ["AB-    ", "CD     "]);
         // A character past ASCII is cut at a character, never in it.
         let [top, _] = sign_in_lines(&format!("https://{}", "\u{e9}".repeat(40)), "AB-CD");
