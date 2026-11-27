@@ -87,6 +87,7 @@ fn start(path: &std::path::Path) -> Result<(), String> {
             ports.push(open(u).map_err(|e| format!("unit {}: {e}", u.id))?);
         }
         let mut renewed = None;
+        let mut sign_in_lines = None;
         let credentials: Arc<dyn Credentials> = match &config.auth {
             Auth::None => Arc::new(Static(None)),
             Auth::Token { token: Some(t), .. } => Arc::new(Static(Some(t.clone()))),
@@ -141,8 +142,28 @@ fn start(path: &std::path::Path) -> Result<(), String> {
                 let tokens = tokens?;
                 tracing::info!("signed in");
                 let signed = auth::Signed::new(tokens);
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                renewed = Some(rx);
+                // While the bridge runs, a new sign-in goes through the
+                // surface, so that what it sends again keeps the code up;
+                // the next token takes it down.
+                let (lines, lines_rx) = watch::channel(None);
+                sign_in_lines = Some(lines_rx);
+                let lines = Arc::new(lines);
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let (fwd, fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+                renewed = Some(fwd_rx);
+                let shown = lines.clone();
+                tokio::spawn(async move {
+                    while rx.recv().await.is_some() {
+                        shown.send_replace(None);
+                        if fwd.send(()).is_err() {
+                            break;
+                        }
+                    }
+                });
+                let show = move |code: &auth::DeviceCode| {
+                    print_code(code);
+                    lines.send_replace(Some(sign_in_text(code)));
+                };
                 let keeper = signed.clone();
                 tokio::spawn(async move { sign_in.keep_fresh(keeper, tx, &show).await });
                 signed
@@ -156,6 +177,7 @@ fn start(path: &std::path::Path) -> Result<(), String> {
             master: config.master.clone(),
             keys: config.keys.clone(),
             renewed,
+            sign_in: sign_in_lines,
         };
         bridge::run(options, ports, async {
             let _ = tokio::signal::ctrl_c().await;
@@ -179,6 +201,12 @@ fn open(u: &Unit) -> Result<Port, String> {
 /// Shows where to sign in and the code: on stderr, and on the first
 /// unit's scribble strip.
 fn show_code(code: &auth::DeviceCode, lcd: Option<&(UnboundedSender<Vec<u8>>, Device)>) {
+    print_code(code);
+    show_lcd(code, lcd);
+}
+
+/// Prints where to sign in and the code on stderr.
+fn print_code(code: &auth::DeviceCode) {
     eprintln!(
         "faderz-bridge: to sign in, open {} and enter the code {}",
         code.verification_uri, code.user_code
@@ -186,7 +214,6 @@ fn show_code(code: &auth::DeviceCode, lcd: Option<&(UnboundedSender<Vec<u8>>, De
     if let Some(complete) = &code.verification_uri_complete {
         eprintln!("faderz-bridge: or open {complete}");
     }
-    show_lcd(code, lcd);
 }
 
 /// Shows the code in `shown` on `lcd` again whenever `link` connects: a
@@ -209,19 +236,20 @@ fn show_on_connect(
     })
 }
 
+/// The scribble strip's two lines for a sign-in.
+fn sign_in_text(code: &auth::DeviceCode) -> [String; 2] {
+    let line = |text: String| format!("{text:<width$.width$}", width = mcu::LINE_CHARS);
+    [
+        line(format!("Sign in: {}", code.verification_uri)),
+        line(format!("Code: {}", code.user_code)),
+    ]
+}
+
 fn show_lcd(code: &auth::DeviceCode, lcd: Option<&(UnboundedSender<Vec<u8>>, Device)>) {
     if let Some((out, device)) = lcd {
-        let line = |text: String| format!("{text:<width$.width$}", width = mcu::LINE_CHARS);
-        let _ = out.send(mcu::lcd(
-            *device,
-            0,
-            &line(format!("Sign in: {}", code.verification_uri)),
-        ));
-        let _ = out.send(mcu::lcd(
-            *device,
-            mcu::LINE_CHARS,
-            &line(format!("Code: {}", code.user_code)),
-        ));
+        let [top, bottom] = sign_in_text(code);
+        let _ = out.send(mcu::lcd(*device, 0, &top));
+        let _ = out.send(mcu::lcd(*device, mcu::LINE_CHARS, &bottom));
         let _ = out.send(mcu::colours(*device, [mcu::WHITE; 8]));
     }
 }

@@ -227,6 +227,7 @@ fn bridge(f: &Faderz, rtp: rtpmidi::Options) -> (String, oneshot::Sender<()>) {
         master: None,
         keys: None,
         renewed: None,
+        sign_in: None,
     };
     let (stop, stopped) = oneshot::channel::<()>();
     tokio::spawn(bridge::run(options, vec![port], async {
