@@ -35,6 +35,22 @@ pub const CLIP_DBFS: f64 = -1.0;
 /// The pan one V-Pot detent moves: 100 detents from full left to full
 /// right.
 pub const POT_STEP: f64 = 0.02;
+/// In this long every unit is sent all it shows again, a few messages
+/// at a time in `REFRESH_STEPS` even steps, so a surface that lost or
+/// garbled messages, such as right after it invited the bridge again,
+/// shows the state again without a burst it would drop part of.
+pub const REFRESH_CYCLE_MS: u64 = 5000;
+/// Per strip its fader, its key LEDs, its ring and meter, and each of its
+/// two cells; then the master fader with the duck key LEDs. Each step
+/// fits one packet.
+const STRIP_PARTS: usize = 5;
+pub const REFRESH_STEPS: usize = mcu::STRIPS as usize * STRIP_PARTS + 1;
+pub const REFRESH_STEP_MS: u64 = REFRESH_CYCLE_MS / REFRESH_STEPS as u64;
+/// After a unit's session starts, or the unit is heard again after a
+/// silence, it is sent all it shows again this long after the first full
+/// send: an X-Touch that just came back drops part of what comes while it
+/// settles, different parts each time.
+pub const RESEND_AFTER_MS: [u64; 3] = [300, 1000, 3000];
 
 /// What a duck key does with its group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -143,6 +159,38 @@ struct Shown {
     cells: [Option<String>; 16],
 }
 
+impl Shown {
+    /// Forgets refresh step `step` of what the unit shows, so the next
+    /// render sends that part again; `ducks` are the unit's duck keys.
+    fn forget(&mut self, step: usize, ducks: &[u8]) {
+        let strips = usize::from(mcu::STRIPS);
+        if step < strips * STRIP_PARTS {
+            let strip = step / STRIP_PARTS;
+            let s = strip as u8;
+            match step % STRIP_PARTS {
+                0 => self.faders[strip] = None,
+                1 => {
+                    for key in [Key::Rec(s), Key::Solo(s), Key::Mute(s), Key::Select(s)] {
+                        self.leds.remove(&key.note());
+                    }
+                }
+                2 => {
+                    self.rings[strip] = None;
+                    self.meters[strip] = None;
+                    self.clips[strip] = None;
+                }
+                3 => self.cells[strip] = None,
+                _ => self.cells[strips + strip] = None,
+            }
+            return;
+        }
+        self.faders[usize::from(mcu::MASTER)] = None;
+        for note in ducks {
+            self.leds.remove(note);
+        }
+    }
+}
+
 struct Unit {
     spec: UnitSpec,
     /// Index of its first strip among all strips, left to right.
@@ -152,6 +200,8 @@ struct Unit {
     presses: BTreeMap<u8, Press>,
     /// Whether ALT is down: a V-Pot pushed with it centres the pan.
     alt: bool,
+    /// When the unit is sent all it shows again while it settles.
+    resends: Vec<u64>,
     shown: Shown,
 }
 
@@ -167,6 +217,12 @@ pub struct Surface {
     screens: BTreeMap<String, String>,
     /// Duck keys of their own; else F1 to F8.
     keys: Option<DuckKeys>,
+    /// The sign-in's two lines, shown on the first unit's scribble strip
+    /// instead of the strips while a sign-in waits for the user.
+    sign_in: Option<[String; 2]>,
+    /// The next refresh step, and when.
+    refresh_step: usize,
+    refresh_at: u64,
 }
 
 /// A short name for the holder of a control: its principal, or its kind
@@ -193,6 +249,7 @@ impl Surface {
                 touches: Default::default(),
                 presses: BTreeMap::new(),
                 alt: false,
+                resends: Vec::new(),
                 shown: Shown::default(),
             })
             .collect();
@@ -203,7 +260,24 @@ impl Surface {
             selected: None,
             screens: BTreeMap::new(),
             keys: None,
+            sign_in: None,
+            refresh_step: 0,
+            refresh_at: 0,
         }
+    }
+
+    /// Shows `lines` on the first unit's scribble strip in place of the
+    /// strips, until `None`.
+    pub fn set_sign_in(&mut self, lines: Option<[String; 2]>) {
+        self.sign_in = lines;
+    }
+
+    /// Without the rolling refresh: a fixture checks that nothing more is
+    /// sent once the state is shown.
+    #[cfg(test)]
+    pub(crate) fn without_refresh(mut self) -> Surface {
+        self.refresh_at = u64::MAX;
+        self
     }
 
     /// Binds the X-Touch's duck keys by `keys` instead of F1 to F8.
@@ -399,6 +473,7 @@ impl Surface {
             self.let_go(p, engine, now);
         }
         self.units[unit].alt = false;
+        self.units[unit].resends = RESEND_AFTER_MS.iter().map(|d| now + d).collect();
         self.resend(unit);
     }
 
@@ -429,7 +504,10 @@ impl Surface {
         if is.missed != was.missed {
             self.missed(unit, now);
         }
+        // The surface lost what it was sent, or was cut off and is heard
+        // again: everything again now and while it settles.
         if is.resync != was.resync {
+            self.units[unit].resends = RESEND_AFTER_MS.iter().map(|d| now + d).collect();
             self.resend(unit);
         }
     }
@@ -700,6 +778,25 @@ impl Surface {
     /// control that went to another session.
     pub fn tick(&mut self, engine: &mut Engine, now: u64) {
         for u in &mut self.units {
+            if u.resends.iter().any(|&at| now >= at) {
+                u.resends.retain(|&at| now < at);
+                u.shown = Shown::default();
+            }
+        }
+        if now >= self.refresh_at {
+            for i in 0..self.units.len() {
+                let ducks = self.duck_notes(i);
+                self.units[i].shown.forget(self.refresh_step, &ducks);
+            }
+            self.refresh_step = (self.refresh_step + 1) % REFRESH_STEPS;
+            // Steps keep their pace when a tick is late, and a long pause
+            // starts it anew.
+            self.refresh_at += REFRESH_STEP_MS;
+            if self.refresh_at <= now {
+                self.refresh_at = now + REFRESH_STEP_MS;
+            }
+        }
+        for u in &mut self.units {
             for (strip, slot) in u.touches.iter_mut().enumerate() {
                 if slot
                     .as_ref()
@@ -781,6 +878,7 @@ impl Surface {
                 })
                 .collect();
             let notice = self.notice(engine, i);
+            let sign_in = self.sign_in.as_ref().filter(|_| i == 0);
             let u = &mut self.units[i];
             for (s, v) in view.iter().enumerate() {
                 if s == usize::from(mcu::MASTER) && u.spec.device != Device::Main {
@@ -831,11 +929,19 @@ impl Surface {
                         u.shown.leds.insert(key.note(), led);
                     }
                 }
+                // The cell of strip `s` in a line of text over the strips.
+                let cut = |line: &str| {
+                    mcu::cell(&line.chars().skip(s * mcu::STRIP_CHARS).collect::<String>())
+                };
                 let value = match &notice {
-                    Some(n) => mcu::cell(&n.chars().skip(s * mcu::STRIP_CHARS).collect::<String>()),
+                    Some(n) => cut(n),
                     None => v.value.clone(),
                 };
-                for (line, text) in [(0, &v.name), (1, &value)] {
+                let (name, value) = match sign_in {
+                    Some([top, bottom]) => (cut(top), cut(bottom)),
+                    None => (v.name.clone(), value),
+                };
+                for (line, text) in [(0, &name), (1, &value)] {
                     let cell = line * 8 + s;
                     if u.shown.cells[cell].as_ref() != Some(text) {
                         let offset = line * mcu::LINE_CHARS + s * mcu::STRIP_CHARS;
