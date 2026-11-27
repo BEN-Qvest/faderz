@@ -365,6 +365,7 @@ impl Bridge {
             master: None,
             keys: None,
             renewed,
+            sign_in: None,
         };
         let (stop, stopped) = oneshot::channel::<()>();
         tokio::spawn(bridge::run(

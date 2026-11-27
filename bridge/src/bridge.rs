@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -46,6 +47,9 @@ pub struct Options {
     /// A message here says the credentials changed: the session moves to
     /// a connection opened with the new ones.
     pub renewed: Option<UnboundedReceiver<()>>,
+    /// The two lines of a sign-in the user is asked for while the bridge
+    /// runs, shown on the first unit instead of its strips.
+    pub sign_in: Option<watch::Receiver<Option<[String; 2]>>>,
 }
 
 enum Net {
@@ -241,6 +245,9 @@ pub async fn run(options: Options, ports: Vec<Port>, shutdown: impl Future<Outpu
                     }
                 }
             }
+        }
+        if let Some(lines) = &options.sign_in {
+            surface.set_sign_in(lines.borrow().clone());
         }
         let t = now();
         for (unit, message) in surface.render(&engine, t) {
