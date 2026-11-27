@@ -364,7 +364,7 @@ impl Bridge {
             units,
             master: None,
             keys: None,
-            clock_offset: 0,
+            clock_offset: None,
             renewed,
         };
         let (stop, stopped) = oneshot::channel::<()>();

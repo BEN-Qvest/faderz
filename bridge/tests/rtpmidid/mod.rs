@@ -226,7 +226,7 @@ fn bridge(f: &Faderz, rtp: rtpmidi::Options) -> (String, oneshot::Sender<()>) {
         }],
         master: None,
         keys: None,
-        clock_offset: 0,
+        clock_offset: None,
         renewed: None,
     };
     let (stop, stopped) = oneshot::channel::<()>();

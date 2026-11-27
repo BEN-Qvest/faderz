@@ -1394,7 +1394,7 @@ fn select_waits_for_the_principal() {
 #[test]
 fn the_x_touch_shows_the_time_of_day_and_sends_only_the_digits_that_change() {
     let e = live(1);
-    let mut s = Surface::new(units(2), None).with_clock(60);
+    let mut s = Surface::new(units(2), None).with_clock(Some(60));
     let timecode = |out: &[(usize, Vec<u8>)], unit: usize| -> Vec<Vec<u8>> {
         (out.iter())
             .filter(|(u, m)| *u == unit && m[0] == 0xb0 && (0x40..0x4a).contains(&m[1]))
@@ -1419,5 +1419,17 @@ fn the_x_touch_shows_the_time_of_day_and_sends_only_the_digits_that_change() {
     assert_eq!(
         timecode(&s.render(&e, 2), 0),
         vec![mcu::timecode_digit(3, b'8', false)]
+    );
+    s.resend(0);
+    assert_eq!(
+        timecode(&s.render(&e, 3), 0).len(),
+        mcu::TIMECODE_DIGITS,
+        "a unit shown everything again gets the clock again"
+    );
+    let mut dark = Surface::new(units(1), None);
+    dark.set_time(1_795_683_907);
+    assert!(
+        timecode(&dark.render(&e, 0), 0).is_empty(),
+        "no clock unless one is configured"
     );
 }

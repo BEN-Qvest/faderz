@@ -66,7 +66,7 @@ power-on to choose it).
 | `units` | Left to right. `id` is the console id (`^[a-z][a-z0-9-]{0,31}$`), `name` its display name, `model` `x-touch` (default) or `x-touch-extender`, `transport` `midi` (default) or `rtp-midi`. With `midi`, `midiIn` and `midiOut` are parts of the port names (`midiOut` defaults to `midiIn`). |
 | `master` | The control the X-Touch master fader drives. Default: the fader of the shape's program bus. |
 | `keys` | The X-Touch's duck keys by MIDI note, replacing F1 to F8: `{"0": {"duck": "comm", "action": "hold"}}`. `duck` is a duck group's id; `action` is `holdOrLatch` (default), `hold` or `latch`. A note is a REC key (0 to 7), a V-Pot push (32 to 39), a function key (54 to 61), ALT (73) or another note below 104 the bridge does not map, each named once; a bound note does what `keys` says instead of its mapping; `{}` leaves the X-Touch without duck keys. The bridge warns of keys without an X-Touch unit and of a key whose group the shape lacks. |
-| `clock` | `{"utcOffset": "+01:00"}`: the offset east of UTC, `+HH:MM` or `-HH:MM`, of the time of day on the X-Touch's timecode display. A fixed offset that does not follow daylight saving time. Default UTC. |
+| `clock` | Shows the time of day on the X-Touch's timecode display, which stays dark without it. `{"utcOffset": "+01:00"}`: the offset east of UTC, `+HH:MM` or `-HH:MM`; `{}` is UTC. The offset is fixed: in a time zone with summer time it has to be changed by hand twice a year. |
 
 ## Network surfaces (RTP-MIDI)
 
@@ -251,7 +251,7 @@ console shows the bridge's controls as `<console> (<user>)`.
 | CHANNEL left/right | Moves by one channel |
 | Master fader (X-Touch) | `master`, or the program bus's fader |
 | Scribble strip | Line 1: the channel name, 7 characters. Line 2: the fader in dB, or the holder's name while another session holds it |
-| Timecode display (X-Touch) | The time of day at `clock.utcOffset`, `HH.MM.SS` on the hours, minutes and seconds digits |
+| Timecode display (X-Touch) | With `clock` configured, the time of day at `clock.utcOffset`, `HH.MM.SS` on the hours, minutes and seconds digits; dark otherwise |
 
 A touch refused because another session holds the fader shows the
 holder; held for a second, it asks the holder to give the control up.

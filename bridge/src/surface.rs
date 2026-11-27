@@ -168,8 +168,9 @@ pub struct Surface {
     screens: BTreeMap<String, String>,
     /// Duck keys of their own; else F1 to F8.
     keys: Option<DuckKeys>,
-    /// Minutes east of UTC of the time of day on the timecode display.
-    clock_offset: i32,
+    /// Minutes east of UTC of the time of day on the timecode display,
+    /// which stays dark without it.
+    clock_offset: Option<i32>,
     /// The wall clock, Unix seconds, once the driver has set it.
     time: Option<u64>,
 }
@@ -208,14 +209,14 @@ impl Surface {
             selected: None,
             screens: BTreeMap::new(),
             keys: None,
-            clock_offset: 0,
+            clock_offset: None,
             time: None,
         }
     }
 
     /// Shows the time of day `offset` minutes east of UTC on the X-Touch's
-    /// timecode display.
-    pub fn with_clock(mut self, offset: i32) -> Surface {
+    /// timecode display; `None` leaves it dark.
+    pub fn with_clock(mut self, offset: Option<i32>) -> Surface {
         self.clock_offset = offset;
         self
     }
@@ -866,8 +867,9 @@ impl Surface {
             u.shown.meter_frame = Some(engine.peaks().frames);
             if u.spec.device == Device::Main
                 && let Some(unix) = self.time
+                && let Some(offset) = self.clock_offset
             {
-                let digits = mcu::clock_digits(unix, self.clock_offset);
+                let digits = mcu::clock_digits(unix, offset);
                 for (p, &(ch, dot)) in digits.iter().enumerate() {
                     if u.shown.timecode[p] != Some((ch, dot)) {
                         out.push((i, mcu::timecode_digit(p as u8, ch, dot)));

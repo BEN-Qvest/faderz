@@ -31,13 +31,13 @@ pub struct Config {
     /// groups in order when absent.
     #[serde(default, deserialize_with = "duck_keys")]
     pub keys: Option<DuckKeys>,
-    /// The time of day on the X-Touch's timecode display.
+    /// The time of day on the X-Touch's timecode display; dark when absent.
     #[serde(default)]
-    pub clock: Clock,
+    pub clock: Option<Clock>,
 }
 
 /// The time of day an X-Touch shows.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Clock {
     /// Minutes east of UTC, written `+01:00` or `-05:30`; UTC when absent.
@@ -63,7 +63,8 @@ fn parse_offset(text: &str) -> Option<i32> {
         _ => return None,
     };
     let (h, m) = rest.split_once(':')?;
-    if h.len() != 2 || m.len() != 2 {
+    // i32::parse takes a sign of its own, so "+-1:00" would pass.
+    if h.len() != 2 || m.len() != 2 || !h.bytes().chain(m.bytes()).all(|b| b.is_ascii_digit()) {
         return None;
     }
     let (h, m): (i32, i32) = (h.parse().ok()?, m.parse().ok()?);
@@ -421,7 +422,10 @@ mod tests {
         assert_eq!(parse_offset("+01:00"), Some(60));
         assert_eq!(parse_offset("-05:30"), Some(-330));
         assert_eq!(parse_offset("+14:00"), Some(840));
-        for bad in ["01:00", "+1:00", "+01", "+15:00", "+01:60", "+aa:00", ""] {
+        for bad in [
+            "01:00", "+1:00", "+01", "+15:00", "+01:60", "+aa:00", "+-1:00", "++1:00", "+01:-1",
+            "-+1:00", "",
+        ] {
             assert_eq!(parse_offset(bad), None, "{bad}");
         }
         let unit = r#"{ "id": "xt", "name": "X", "model": "x-touch", "midiIn": "X" }"#;
@@ -429,12 +433,17 @@ mod tests {
             r#"{{ "endpoints": ["ws://x"], "units": [{unit}], "clock": {{ "utcOffset": "+02:00" }} }}"#
         ))
         .unwrap();
-        assert_eq!(c.clock.utc_offset, 120);
+        assert_eq!(c.clock, Some(Clock { utc_offset: 120 }));
         let c = Config::parse(&format!(
             r#"{{ "endpoints": ["ws://x"], "units": [{unit}] }}"#
         ))
         .unwrap();
-        assert_eq!(c.clock.utc_offset, 0, "UTC when absent");
+        assert_eq!(c.clock, None, "dark when absent");
+        let c = Config::parse(&format!(
+            r#"{{ "endpoints": ["ws://x"], "units": [{unit}], "clock": {{}} }}"#
+        ))
+        .unwrap();
+        assert_eq!(c.clock, Some(Clock { utc_offset: 0 }), "UTC by default");
         let err = Config::parse(&format!(
             r#"{{ "endpoints": ["ws://x"], "units": [{unit}], "clock": {{ "utcOffset": "+2" }} }}"#
         ))

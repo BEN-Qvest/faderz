@@ -155,7 +155,7 @@ fn start(path: &std::path::Path) -> Result<(), String> {
             units: config.unit_specs(),
             master: config.master.clone(),
             keys: config.keys.clone(),
-            clock_offset: config.clock.utc_offset,
+            clock_offset: config.clock.map(|c| c.utc_offset),
             renewed,
         };
         bridge::run(options, ports, async {

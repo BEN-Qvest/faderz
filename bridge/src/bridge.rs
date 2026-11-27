@@ -43,8 +43,9 @@ pub struct Options {
     pub master: Option<String>,
     /// Duck keys of their own instead of F1 to F8.
     pub keys: Option<DuckKeys>,
-    /// Minutes east of UTC of the time of day an X-Touch shows.
-    pub clock_offset: i32,
+    /// Minutes east of UTC of the time of day an X-Touch shows; no clock
+    /// when absent.
+    pub clock_offset: Option<i32>,
     /// A message here says the credentials changed: the session moves to
     /// a connection opened with the new ones.
     pub renewed: Option<UnboundedReceiver<()>>,
