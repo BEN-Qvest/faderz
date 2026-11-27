@@ -8,11 +8,9 @@ use std::collections::VecDeque;
 
 use super::payload;
 
-/// The most MIDI list octets in one packet. An X-Touch drops some of the
-/// messages of a larger packet, different ones each time: with 512 the
-/// full state after a connect came out with labels, values and rings
-/// missing on most strips, with 64 complete. A scribble strip line, 63
-/// octets as SysEx, still fits in one.
+/// The most MIDI list octets in one packet, and the burst the rate
+/// allows: an X-Touch drops some of the messages of larger packets. A
+/// scribble strip line, 64 octets as SysEx, still fits in one.
 pub const MAX_PAYLOAD: usize = 64;
 
 /// What makes a queued message stale once a newer one comes.
@@ -76,8 +74,10 @@ impl Pacer {
             });
             if message.len() <= MAX_PAYLOAD {
                 self.queue.push_back((k, message));
-                return;
+            } else {
+                self.push_segments(&message);
             }
+            return;
         }
         // A meter message goes last, so a level never ends up before the
         // overload it follows: an X-Touch reads 15, the overload off, as a
@@ -94,14 +94,20 @@ impl Pacer {
             return;
         }
         if message.first() == Some(&0xf0) && message.len() > MAX_PAYLOAD {
-            self.queue.extend(
-                payload::segments(&message, MAX_PAYLOAD)
-                    .into_iter()
-                    .map(|s| (None, s)),
-            );
+            self.push_segments(&message);
         } else {
             self.queue.push_back((k, message));
         }
+    }
+
+    /// Queues a SysEx longer than a packet in segments, none of which a
+    /// newer message replaces.
+    fn push_segments(&mut self, sysex: &[u8]) {
+        self.queue.extend(
+            payload::segments(sysex, MAX_PAYLOAD)
+                .into_iter()
+                .map(|s| (None, s)),
+        );
     }
 
     /// Drops everything queued: the surface gets the whole state again
@@ -155,6 +161,21 @@ impl Pacer {
 mod tests {
     use super::*;
     use crate::mcu::{self, Device, Key as McuKey, Led};
+
+    /// What a receiver makes of the packets, in order.
+    fn decode(packets: &[Vec<Vec<u8>>]) -> Vec<Vec<u8>> {
+        let mut d = payload::Decoder::default();
+        let mut got = Vec::new();
+        for (i, packet) in packets.iter().enumerate() {
+            let h = payload::Header {
+                seq: i as u16,
+                timestamp: 0,
+                ssrc: 1,
+            };
+            got.extend(d.decode(&payload::encode(h, packet)).unwrap().1);
+        }
+        got
+    }
 
     #[test]
     fn newer_faders_leds_rings_meters_and_cells_replace_queued_ones() {
@@ -218,9 +239,9 @@ mod tests {
     #[test]
     fn overlapping_scribble_strip_writes_keep_their_order() {
         let mut p = Pacer::new(1_000_000);
-        // A line of 56 characters, 63 octets, still fits one packet.
+        // A line of 56 characters, 64 octets, still fits one packet.
         let line = |c: &str| mcu::lcd(Device::Main, 0, &c.repeat(56));
-        assert!(line("x").len() <= MAX_PAYLOAD);
+        assert_eq!(line("x").len(), MAX_PAYLOAD);
         // Every packet, the rate allowing, in order.
         let packets = |p: &mut Pacer| -> Vec<Vec<Vec<u8>>> {
             let mut t = p.at;
@@ -248,22 +269,44 @@ mod tests {
             all(&mut p),
             vec![line("z"), mcu::lcd(Device::Main, 7, "Chan 3 ")]
         );
-        // Both lines in one write, 119 octets, go in segments, after the
+        // One character more, 65 octets, goes in two segments.
+        let long = mcu::lcd(Device::Main, 0, &"v".repeat(57));
+        p.push(long.clone());
+        let sent = packets(&mut p);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0][0].len(), MAX_PAYLOAD);
+        assert_eq!(sent[1], vec![vec![0xf7, 0x76, 0xf7]]);
+        assert_eq!(decode(&sent), vec![long]);
+        // Both lines in one write, 120 octets, go in segments, after the
         // cells they cover are dropped.
         let both = mcu::lcd(Device::Main, 0, &"w".repeat(112));
         p.push(mcu::lcd(Device::Main, 0, "Chan 4 "));
         p.push(both.clone());
-        let mut d = payload::Decoder::default();
-        let mut got = Vec::new();
-        for (i, packet) in packets(&mut p).into_iter().enumerate() {
-            let h = payload::Header {
-                seq: i as u16,
-                timestamp: 0,
-                ssrc: 1,
-            };
-            got.extend(d.decode(&payload::encode(h, &packet)).unwrap().1);
+        assert_eq!(decode(&packets(&mut p)), vec![both]);
+    }
+
+    #[test]
+    fn every_message_the_bridge_builds_queues_in_items_that_fit_a_packet() {
+        // A queue head longer than a packet would never go: take() would
+        // find nothing to send while ready_at() kept saying now.
+        for message in [
+            mcu::lcd(Device::Main, 0, &"a".repeat(56)),
+            mcu::lcd(Device::Main, 0, &"a".repeat(57)),
+            mcu::lcd(Device::Main, 0, &"a".repeat(112)),
+            mcu::lcd(Device::Extender, 7, &"a".repeat(105)),
+            mcu::meter(3, 11),
+            mcu::meter_clip(3, true),
+            mcu::fader(8, 0x3fff),
+            mcu::ring(7, 0x16),
+            mcu::led(McuKey::Mute(7), Led::On),
+        ] {
+            let mut p = Pacer::new(1_000_000);
+            p.push(message.clone());
+            assert!(
+                p.queue.iter().all(|(_, m)| m.len() <= MAX_PAYLOAD),
+                "{message:?}"
+            );
         }
-        assert_eq!(got, vec![both]);
     }
 
     #[test]
@@ -278,7 +321,8 @@ mod tests {
         let first = p.take(0).unwrap();
         assert_eq!(first.len(), 16);
         assert_eq!(p.take(0), None);
-        assert!(p.ready_at(0).is_some());
+        // One octet left, two missing at 10 per millisecond.
+        assert_eq!(p.ready_at(0), Some(200));
         // After 10 ms, 100 octets more, but never more than a packet.
         assert_eq!(p.take(10_000).unwrap().len(), 16);
         // The rest goes out as the rate allows: 600 octets in about 60 ms.
@@ -307,17 +351,8 @@ mod tests {
             packets.push(packet);
             t += 1_000;
         }
-        assert_eq!(packets.len(), long.len().div_ceil(MAX_PAYLOAD - 2));
-        let mut d = payload::Decoder::default();
-        let mut got = Vec::new();
-        for (i, packet) in packets.iter().enumerate() {
-            let h = payload::Header {
-                seq: i as u16,
-                timestamp: 0,
-                ssrc: 1,
-            };
-            got.extend(d.decode(&payload::encode(h, packet)).unwrap().1);
-        }
-        assert_eq!(got, vec![long]);
+        // 1200 data octets, 62 per segment.
+        assert_eq!(packets.len(), 20);
+        assert_eq!(decode(&packets), vec![long]);
     }
 }
